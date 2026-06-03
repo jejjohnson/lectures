@@ -29,6 +29,8 @@ jupytext = ">=1.16"
 
 [feature.dev.pypi-dependencies]
 ty = ">=0.0.1a6"
+# Test-time only: tests/test_gaussianization.py exercises the real RBIG package.
+rbig = { git = "https://github.com/jejjohnson/rbig.git" }
 
 # --- Docs/site/slides: Quarto (renders the website AND the reveal.js decks) ---
 [feature.docs.dependencies]
