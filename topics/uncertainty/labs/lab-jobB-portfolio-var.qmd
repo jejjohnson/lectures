@@ -1,0 +1,103 @@
+---
+title: "Job B — Portfolio VaR"
+subtitle: "Propagate returns to a 1% VaR, three ways"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
+from rbig import AnnealedRBIG
+plotting.set_style("notes")
+import numpy as np, matplotlib.pyplot as plt
+```
+
+*Do-the-job track · Job B of 3.*
+
+::: {.callout-note appearance="simple" icon=false}
+**See the data first** — [Risk Measures](../../data/05-risk-measures.qmd) introduces
+VaR, the market factor, and beta in the real basket before we propagate them here.
+:::
+
+Propagate real return uncertainty to a portfolio's **1% VaR** by three methods and
+compare them to the empirical answer.  Deliverable: a VaR table that shows which
+generators are safe.
+
+---
+
+## 1 · An Equal-Weight Book
+
+```{python}
+R = datasets.load_returns()
+assets = ["JPM", "BAC", "XOM", "CVX", "KO"]
+X = R[assets].to_numpy()
+w = np.ones(len(assets)) / len(assets)
+
+emp_loss = X @ w                                   # realized portfolio returns
+emp_var = np.quantile(emp_loss, 0.01)
+print(f"empirical 1% VaR (the truth): {emp_var:+.4f}")
+```
+
+## 2 · Three Generators, Three VaRs
+
+```{python}
+rng = np.random.default_rng(0)
+Xs = (X - X.mean(0)) / X.std(0)
+m = 20000
+
+# independent: shuffle each column
+indep = np.column_stack([rng.permutation(X[:, k]) for k in range(X.shape[1])])
+# gaussian MC: covariance of raw returns
+gmc = rng.multivariate_normal(X.mean(0), np.cov(X.T), size=m)
+# RBIG: fit on standardized, sample, de-standardize
+gen = AnnealedRBIG(n_layers=30, random_state=0).fit(Xs).sample(m)
+gen = gen * X.std(0) + X.mean(0)
+
+def var1(sample):
+    return np.quantile(sample @ w, 0.01)
+
+print(f"{'method':<16}{'1% VaR':>10}{'error vs empirical':>20}")
+print("-" * 46)
+print(f"{'empirical':<16}{emp_var:>+10.4f}{0.0:>20.4f}")
+for name, s in [("independent", indep), ("Gaussian MC", gmc), ("RBIG", gen)]:
+    v = var1(s)
+    print(f"{name:<16}{v:>+10.4f}{v - emp_var:>+20.4f}")
+```
+
+```{python}
+#| label: fig-jobB-var
+#| fig-cap: "Portfolio-loss tail by generator. Independent and Gaussian understate the loss; RBIG sits closest to the empirical 1% VaR (dashed)."
+fig, ax = plt.subplots(figsize=(8, 4.4))
+bins = np.linspace(min(emp_loss.min(), (gen @ w).min()), emp_loss.max(), 70)
+ax.hist(emp_loss, bins=bins, density=True, color=INK, alpha=0.35, label="empirical")
+ax.hist(indep @ w, bins=bins, density=True, histtype="step", lw=2, color=CRASH,
+        label="independent")
+ax.hist(gmc @ w, bins=bins, density=True, histtype="step", lw=2, color=WARM,
+        label="Gaussian MC")
+ax.hist(gen @ w, bins=bins, density=True, histtype="step", lw=2,
+        color=plotting.PALETTE["green"], label="RBIG")
+ax.axvline(emp_var, color=INK, ls="--", lw=2)
+ax.set_xlim(bins[0], np.quantile(emp_loss, 0.5))
+ax.set_xlabel("portfolio return"); ax.set_ylabel("density")
+ax.set_title("The loss tail, four ways", fontsize=12)
+ax.legend(fontsize=9, frameon=False); despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+::: {.callout-tip}
+## The Deliverable
+The VaR table is the report.  The lesson it carries: a risk number is only as
+honest as the joint generator behind it — independent and Gaussian both flatter
+the book; the Gaussianization-based generator keeps the tail.
+:::
+
+---
+
+## Your Turn
+
+- Switch to a bank-heavy book (drop KO).  Does the gap between Gaussian and RBIG
+  VaR widen (more tail-dependent names)?
+- Report 0.5% VaR too — the deeper the quantile, the larger the method gap.

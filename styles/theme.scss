@@ -1,0 +1,23 @@
+/*-- scss:defaults --*/
+// Shared brand tokens (kept in sync with src/lectures/plotting.py PALETTE)
+$primary: #2563eb;
+$body-color: #1e293b;
+$link-color: #2563eb;
+$font-family-sans-serif: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+$font-family-monospace: "JetBrains Mono", ui-monospace, monospace;
+$h1-font-size: 2.1rem;
+
+/*-- scss:rules --*/
+.navbar-title { font-weight: 700; letter-spacing: -0.01em; }
+
+// Tighten tables used for the topic/through-line overviews
+table { font-size: 0.95rem; }
+
+// Callout-style "ELI5" boxes reused in notes
+.eli5 {
+  border-left: 4px solid #{$primary};
+  background: rgba(37, 99, 235, 0.06);
+  padding: 0.75rem 1rem;
+  border-radius: 0 6px 6px 0;
+  margin: 1rem 0;
+}

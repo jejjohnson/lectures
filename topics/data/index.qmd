@@ -1,0 +1,72 @@
+---
+title: "Markets for Data People"
+subtitle: "The finance background a data-minded reader needs — every term shown first in the data"
+---
+
+Before we *measure*, *remove*, or *propagate* dependence, we should look at the
+data those verbs act on.  Every later chapter quotes finance words —
+**return**, **crash**, **co-crash**, **fat tail**, **VaR**, **beta** — as if they
+were already understood.  This chapter earns them: each term is **shown in the
+actual data** first, with the preprocessing laid bare, so that when a lab prints
+"co-crash = 56%" you know exactly which numbers produced it.
+
+::: {.callout-note icon=false}
+## The Two Datasets
+
+1. **A market basket** — daily returns of 14 S&P 500 stocks across five sectors
+   (2013–2018), derived from public price data.  This drives every *dependence*,
+   *gaussianization*, and *uncertainty* example.  Real data.
+2. **A credit table** — an Adult-census-*shaped* dataset: a protected attribute,
+   a high-income target, and proxy features that leak the attribute.  This drives
+   the *fairness* module.  Synthetic, by necessity (the real mirrors are
+   network-blocked), but built to behave like the real thing.
+:::
+
+## Why Show the Data First?
+
+A statistic is only as trustworthy as the picture behind it.  "These banks crash
+together" is a claim about a **scatter plot**; "returns have fat tails" is a claim
+about a **histogram**; "the strategy carries market beta" is a claim about a
+**regression line**.  When we can see the picture, we can sanity-check the number
+— and spot when a single definition choice (which tail? which threshold?) moves a
+headline figure from 3% to 72%.
+
+## What Each Page Grounds
+
+| Term you'll meet later | Shown first in |
+|---|---|
+| return, volatility, fat / heavy tail | [Returns & Volatility](02-returns-and-volatility.qmd) |
+| crash, drawdown, left tail, *nameable events* | [Crashes & Drawdowns](03-crashes-and-drawdowns.qmd) |
+| co-crash, tail dependence, contagion | [Co-Movement & Co-Crashes](04-co-movement-and-co-crashes.qmd) |
+| VaR, market factor, beta, beta-neutral | [Risk Measures](05-risk-measures.qmd) |
+| group gap, proxy leakage, protected attribute | [The Credit Dataset](06-the-credit-dataset.qmd) |
+
+## Provenance & Reproducibility
+
+The data is built by two small, committed scripts — nothing is hand-edited:
+
+- [`scripts/download_market_data.py`](../../scripts/download_market_data.py) pulls
+  the public S&P "5yr" price file, derives log-returns for the curated basket, and
+  writes `data/processed/returns_basket.csv` + `basket_meta.csv`.
+- [`scripts/make_credit_data.py`](../../scripts/make_credit_data.py) synthesises
+  the credit table to `data/processed/adult_like.csv`.
+
+The first page walks through that pipeline step by step.
+
+## Pages in This Chapter
+
+1. **[From Raw Prices to a Clean Panel](01-downloading-and-parsing.qmd)** — the
+   source, the curated basket, and prices → log-returns.
+2. **[Returns, Volatility & Fat Tails](02-returns-and-volatility.qmd)** — what a
+   return is, how much it wobbles, and why the tails are heavier than a bell curve.
+3. **[Crashes, Drawdowns & Nameable Events](03-crashes-and-drawdowns.qmd)** — the
+   worst days, the events behind them, and the underwater curve.
+4. **[Co-Movement & Co-Crashes](04-co-movement-and-co-crashes.qmd)** — sectors,
+   the correlation block, and the conditional co-crash that headlines the course.
+5. **[Risk: VaR, the Market Factor & Beta](05-risk-measures.qmd)** — the loss you
+   plan for, the market everything loads on, and how much each name loads.
+6. **[The Credit & Fairness Dataset](06-the-credit-dataset.qmd)** — columns, the
+   group gap, the proxy channels, and how it's generated.
+7. **[Patching & Windowing](07-patching-and-windowing.qmd)** — a hands-on tutorial:
+   cut a series into windows, visualize the patch matrix, and see what becomes
+   measurable (within a window, between two blocks, across variables).

@@ -1,0 +1,153 @@
+---
+title: "Job B — Neutralize a Credit Model"
+subtitle: "Fairness on the Adult-shaped credit data"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
+from lectures.measures import cka_rbf
+from lectures.neutralize import fair_fit
+plotting.set_style("notes")
+import numpy as np, matplotlib.pyplot as plt
+```
+
+*Do-the-job track · Job B of 3.*
+
+::: {.callout-note appearance="simple" icon=false}
+**See the data first** — [The Credit & Fairness
+Dataset](../../data/06-the-credit-dataset.qmd) shows this table's group gap and the
+proxy channels that leak `sex` even when it's dropped.
+:::
+
+The real deliverable: take a credit-scoring model that *drops* the protected
+attribute, show it still leaks, then neutralize it and report the group gap
+before and after.  Data is the Adult-census-shaped set (`sex` protected,
+`income_high` target, plus proxy features).
+
+---
+
+## 1 · The Gap, and the Proxy Channels
+
+```{python}
+adult = datasets.load_adult_like()
+print(f"loaded {len(adult)} rows")
+m, f = adult[adult.sex == 1], adult[adult.sex == 0]
+print(f"P(high income | sex=1) = {m.income_high.mean():.2f}")
+print(f"P(high income | sex=0) = {f.income_high.mean():.2f}   ← the gap to neutralize")
+print()
+for c in ["age", "education_num", "hours_per_week", "occupation_prestige"]:
+    print(f"corr({c:<20}, sex) = {adult[c].corr(adult.sex):+.2f}   (a proxy channel)")
+```
+
+## 2 · Baseline: Drop `sex`, and Watch It Leak
+
+Train a scorecard on the proxy features only — `sex` is never an input — then
+audit the score against `sex` with CKA.
+
+::: {.callout-note icon=false}
+CKA builds an $n \times n$ kernel matrix, so we work on a representative 2 000-row
+sample (the group gap above is computed on the full data).  The fair-kernel
+library does this with mini-batches during training.
+:::
+
+```{python}
+sample = adult.sample(n=2000, random_state=0).reset_index(drop=True)
+feat = ["age", "education_num", "hours_per_week", "occupation_prestige"]
+X = sample[feat].to_numpy(dtype=float)
+X = (X - X.mean(0)) / X.std(0)
+y = sample["income_high"].to_numpy(dtype=float)
+S = sample["sex"].to_numpy(dtype=float)
+
+# Composite baseline score from the legitimate features (sex excluded).
+w, *_ = np.linalg.lstsq(np.column_stack([X, np.ones(len(X))]), y, rcond=None)
+score = np.column_stack([X, np.ones(len(X))]) @ w
+
+print(f"baseline (sex dropped):  CKA(score, sex) = {cka_rbf(score, S):.2f}   ← still leaks")
+```
+
+The leak is visible: the two groups get systematically different scores even
+though `sex` was never an input.
+
+```{python}
+#| label: fig-jobB-leak
+#| fig-cap: "Baseline score distribution by group. Despite dropping `sex`, the groups get systematically different scores — the proxies carried it through."
+fig, ax = plt.subplots(figsize=(7.5, 4.0))
+for g, col, name in [(0, COOL, "sex = 0"), (1, WARM, "sex = 1")]:
+    ax.hist(score[S == g], bins=30, density=True, alpha=0.55, color=col, label=name)
+    ax.axvline(score[S == g].mean(), color=col, lw=2, ls="--")
+ax.set_xlabel("baseline score"); ax.set_ylabel("density")
+ax.set_title(f"Score leaks the dropped attribute · CKA = {cka_rbf(score, S):.2f}",
+             fontsize=12)
+ax.legend(fontsize=9, frameon=False); despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+## 3 · Neutralize, and Sweep the Trade-Off
+
+`fair_fit` re-fits `income_high` from the baseline score while penalizing
+dependence on `sex`.
+
+```{python}
+def group_gap(pred):
+    return pred[S == 1].mean() - pred[S == 0].mean()
+
+def utility(pred):
+    return float(np.corrcoef(pred, y)[0, 1])  # rank-ish utility vs the target
+
+sweep = [0.0, 0.5, 2.0, 8.0, 20.0]
+print(f"{'μ':>6}{'CKA(score,sex)':>16}{'group gap':>12}{'utility':>10}")
+print("-" * 44)
+cka_s, gaps, utils = [], [], []
+for mu in sweep:
+    p = fair_fit(score, y, S, mu=mu)
+    cs, g, u = cka_rbf(p, S), group_gap(p), utility(p)
+    cka_s.append(cs); gaps.append(g); utils.append(u)
+    print(f"{mu:>6g}{cs:>16.3f}{g:>+12.3f}{u:>10.3f}")
+```
+
+```{python}
+#| label: fig-jobB-neutralize
+#| fig-cap: "Left: the group gap in mean score shrinks as μ grows. Right: utility vs neutrality — the frontier on real credit data."
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11.5, 4.3))
+
+axL.plot(sweep, np.abs(gaps), "-o", c=CRASH, lw=2.2)
+axL.set_xlabel("neutrality weight μ"); axL.set_ylabel("|group gap| in mean score")
+axL.set_title("The group gap closes", fontsize=12)
+despine(axL)
+
+axR.plot(cka_s, utils, "-o", c=COOL, lw=2.2)
+for mu, cx, uy in zip(sweep, cka_s, utils):
+    axR.annotate(f"μ={mu:g}", (cx, uy), textcoords="offset points",
+                 xytext=(6, 5), fontsize=9, color=INK)
+axR.set_xlabel("CKA(score, sex)  →  less neutral")
+axR.set_ylabel("utility (corr with income)")
+axR.set_title("Utility vs neutrality", fontsize=12)
+despine(axR)
+
+fig.tight_layout()
+plt.show()
+```
+
+::: {.callout-tip}
+## The Deliverable
+Report the *operating point*, not a single model: "at μ = … we cut CKA from
+its baseline to … and the group gap from … to …, keeping … of baseline utility."
+The choice of μ is a policy decision — the maths only gives you the frontier.
+:::
+
+---
+
+## Your Turn
+
+- Add a hard-threshold view: approve where `score >= 0.5`, and tabulate approval
+  and false-decline rates per group at μ = 0 vs μ = 8.
+- Which proxy feature leaks the most?  Drop it too — does CKA fall without any
+  penalty?  (It should fall only a little: the leak is distributed.)
+
+Next: the same operation, other name — [Job C,
+beta-neutrality](lab-jobC-beta-neutral.qmd).

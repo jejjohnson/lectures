@@ -1,0 +1,121 @@
+---
+title: "Bias and Proxies"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
+from lectures.measures import cka_rbf
+plotting.set_style("notes")
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import pearsonr
+```
+
+## Rung 1 · Drop the Feature — And Watch It Fail
+
+The naive fix: remove $S$ from the inputs.  It fails, because other features
+*proxy* for $S$ — zip code for a protected attribute, a sector dummy for market
+beta — so the dependence walks right back in.  **Removing the column is not
+removing the dependence.**
+
+```{python}
+#| label: fig-drop-fail
+#| fig-cap: "We dropped S from the model, yet a kept proxy feature tracks it (left), so the predictions stay strongly dependent on S (right)."
+rng = np.random.default_rng(1)
+n = 600
+S = rng.normal(0, 1, n)                       # sensitive — to be "dropped"
+proxy = S + 0.4 * rng.normal(0, 1, n)          # correlated feature — kept
+x_legit = rng.normal(0, 1, n)                  # legitimate, S-independent
+y = 0.7 * x_legit + 0.8 * S + 0.3 * rng.normal(0, 1, n)
+
+# Train on [x_legit, proxy] only — S is NOT a feature.
+X = np.column_stack([x_legit, proxy, np.ones(n)])
+beta, *_ = np.linalg.lstsq(X, y, rcond=None)
+y_hat = X @ beta
+ck = cka_rbf(y_hat, S)
+
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.2))
+
+axL.scatter(proxy, S, s=12, c=WARM, alpha=0.5, edgecolors="none")
+axL.set_title("The proxy still carries S", fontsize=12)
+annotate_box(axL, 0.5, -0.10, f"corr(proxy, S) = {pearsonr(proxy, S)[0]:+.2f}")
+axL.set_xlabel("kept feature (proxy)"); axL.set_ylabel("dropped S")
+despine(axL)
+
+axR.scatter(S, y_hat, s=12, c=COOL, alpha=0.5, edgecolors="none")
+axR.set_title("So predictions still track S", fontsize=12)
+annotate_box(axR, 0.5, -0.10, f"CKA(ŷ, S) = {ck:.2f}   (far from 0)")
+axR.set_xlabel("dropped S"); axR.set_ylabel("prediction ŷ")
+despine(axR)
+
+fig.tight_layout()
+plt.show()
+```
+
+::: {.callout-tip}
+## The Lesson in One Line
+You cannot remove a dependence you refuse to look at.  Neutrality has to be
+*measured against $S$* and optimized — which means $S$ must be available at
+training time, even though it is never a model input.
+:::
+
+## Algorithmic Bias — Balancing Errors *Within* Groups
+
+"Don't use $S$" is not the only notion of fairness, and the failure above shows
+why a second view matters: bias often shows up as **unequal error rates across
+groups**.  A score can have the same average for two groups yet be far more
+*wrong* for one of them.
+
+```{python}
+#| label: fig-group-errors
+#| fig-cap: "A scorecard with a group gap: the same threshold yields different approval and error rates per group."
+data = datasets.credit_scores_by_group(n=1500, gap=0.9, seed=0)
+score, group, repaid = data["score"], data["group"], data["repaid"]
+thr = 0.5
+
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.0))
+
+for g, col, name in [(0, COOL, "Group A"), (1, WARM, "Group B")]:
+    axL.hist(score[group == g], bins=24, alpha=0.55, color=col, density=True,
+             label=name)
+axL.axvline(thr, color=INK, ls="--", lw=1.5, label="threshold")
+axL.set_title("Score distribution by group", fontsize=12)
+axL.set_xlabel("model score"); axL.set_ylabel("density")
+axL.legend(fontsize=9, frameon=False)
+despine(axL)
+
+names, approval, fnr = [], [], []
+for g, name in [(0, "Group A"), (1, "Group B")]:
+    m = group == g
+    approve = score[m] >= thr
+    names.append(name)
+    approval.append(approve.mean())
+    # false-negative rate: creditworthy applicants wrongly declined
+    good = repaid[m] == 1
+    fnr.append((~approve[good]).mean() if good.any() else 0.0)
+
+xpos = np.arange(len(names))
+axR.bar(xpos - 0.18, approval, width=0.36, color=COOL, label="approval rate")
+axR.bar(xpos + 0.18, fnr, width=0.36, color=CRASH,
+        label="false-decline rate (creditworthy)")
+axR.set_xticks(xpos); axR.set_xticklabels(names)
+axR.set_title("Same threshold, different outcomes", fontsize=12)
+axR.set_ylabel("rate")
+axR.legend(fontsize=9, frameon=False)
+despine(axR)
+
+fig.tight_layout()
+plt.show()
+```
+
+The two views connect: a prediction that is independent of $S$
+($\operatorname{Dep}(\hat y, S)=0$) cannot, by construction, carry a systematic
+group gap.  Driving the dependence term to zero is the lever; the group-rate
+table is how you *report* the result.
+
+Next: the methods that actually remove the dependence —
+[fair kernel learning](03-fair-kernel-learning.qmd).

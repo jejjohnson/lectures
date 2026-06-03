@@ -1,0 +1,195 @@
+---
+title: "Tool 1 — The Model-Free Ladder"
+subtitle: "Pearson · Spearman · Distance Correlation"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
+from lectures.measures import distance_correlation, measure_trio
+plotting.set_style("notes")
+import numpy as np, matplotlib.pyplot as plt
+from scipy.stats import pearsonr, spearmanr
+```
+
+*Learn-the-tool track · Lab 1 of 3.*
+
+This lab walks the **no-density road**: the measures that compare $X$ and $Y$
+directly from samples, never needing a probability distribution.  By the end
+you will have computed all three on the real basket, seen where they agree and
+where they split, and felt the `compare(transform(x), transform(y))` template
+through your own hands.
+
+**What you will produce:** a ranked table of every pair in the basket by each
+measure, and a clear answer to "when does the cheap tool suffice, and when does
+it lie?"
+
+---
+
+## Setup — Load the Real Basket
+
+```{python}
+R = datasets.load_returns()
+META = datasets.load_basket_meta()
+label = dict(zip(META["ticker"], META["label"]))
+sector = dict(zip(META["ticker"], META["sector"]))
+tickers = list(R.columns)
+print(f"Loaded {len(R)} trading days × {len(tickers)} stocks")
+print(f"  {R.index.min().date()}  →  {R.index.max().date()}")
+R.head(3)
+```
+
+---
+
+## 1 · The Template, Made Literal
+
+Every measure on this road has the same shape:
+
+```
+Pearson       = corr( x , y )                   # transform = identity
+Spearman      = corr( rank(x) , rank(y) )       # transform = rank
+distance corr = dcor( x , y )                   # distance-matrix association
+```
+
+Let's run all three on the two running characters from the lecture.
+
+```{python}
+def trio_print(ticker_a, ticker_b):
+    x, y = R[ticker_a].values, R[ticker_b].values
+    t = measure_trio(x, y)
+    la, lb = label.get(ticker_a, ticker_a), label.get(ticker_b, ticker_b)
+    print(f"{la:>15s} & {lb:<15s}  "
+          f"Pearson={t['pearson']:+.3f}  "
+          f"Spearman={t['spearman']:+.3f}  "
+          f"distance={t['distance']:.3f}")
+    return t
+
+print("Pair                                    Pearson  Spearman  distance")
+print("-" * 68)
+_ = trio_print("JPM", "BAC")    # two banks
+_ = trio_print("JPM", "KO")     # bank vs. staple
+_ = trio_print("XOM", "CVX")    # two energy majors
+```
+
+For roughly elliptical daily equity returns the three measures land close
+together — which is exactly what we expect when the relationship is nearly
+linear.  That agreement is *informative*: it says the no-density road already
+tells you most of the story.
+
+---
+
+## 2 · When Do They Disagree?
+
+Three measures agree on the bulk.  They split on **tails** and
+**non-monotone** structure.  Manufacture those two cases:
+
+```{python}
+rng = np.random.default_rng(42)
+n = 500
+
+# U-shape: strong dependence, zero Pearson and Spearman
+x_u = rng.uniform(-2.5, 2.5, n)
+y_u = x_u**2 + 0.4 * rng.normal(size=n)
+
+# Tail-crash injection on a real pair
+x_real = R["JPM"].values.copy()
+y_real = R["BAC"].values.copy()
+crash_mask = (x_real < np.percentile(x_real, 5)) & (y_real < np.percentile(y_real, 5))
+# Amplify the crash tail 2×
+x_amp, y_amp = x_real.copy(), y_real.copy()
+x_amp[crash_mask] *= 2.0
+y_amp[crash_mask] *= 2.0
+
+print("Case                    Pearson   Spearman   distance")
+print("-" * 55)
+for (name, x, y) in [
+    ("U-shape (synthetic)",    x_u, y_u),
+    ("JPM/BAC real",           x_real, y_real),
+    ("JPM/BAC tail-amplified", x_amp, y_amp),
+]:
+    t = measure_trio(x, y)
+    print(f"  {name:<24s}  {t['pearson']:+.3f}    {t['spearman']:+.3f}    {t['distance']:.3f}")
+```
+
+```{python}
+#| label: fig-disagreement
+#| fig-cap: "U-shape and tail-amplified pair: where the measures split."
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.2))
+
+axL.scatter(x_u, y_u, s=10, c=WARM, alpha=0.5, edgecolors="none")
+tu = measure_trio(x_u, y_u)
+axL.set_title("U-shape (strong dep, Pearson≈0)", fontsize=11)
+annotate_box(axL, 0.5, -0.10,
+             f"P={tu['pearson']:+.3f}  S={tu['spearman']:+.3f}  d={tu['distance']:.3f}")
+despine(axL)
+
+axR.scatter(x_real[~crash_mask], y_real[~crash_mask], s=10, c=COOL,
+            alpha=0.4, edgecolors="none", label="bulk")
+axR.scatter(x_real[crash_mask], y_real[crash_mask], s=18, c=CRASH,
+            alpha=0.9, edgecolors="none", label="crash days")
+tr = measure_trio(x_real, y_real)
+axR.set_title("JPM / BAC — crash days highlighted", fontsize=11)
+annotate_box(axR, 0.5, -0.10,
+             f"P={tr['pearson']:+.3f}  S={tr['spearman']:+.3f}  d={tr['distance']:.3f}")
+axR.legend(fontsize=9, frameon=False)
+despine(axR)
+
+for ax in (axL, axR):
+    ax.set_xlabel("X"); ax.set_ylabel("Y")
+fig.tight_layout()
+plt.show()
+```
+
+---
+
+## 3 · Full Basket Ranking
+
+Compute all three measures for every pair; rank by distance correlation.
+
+```{python}
+import itertools
+
+rows = []
+for a, b in itertools.combinations(tickers, 2):
+    t = measure_trio(R[a].values, R[b].values)
+    s_a, s_b = sector.get(a, "?"), sector.get(b, "?")
+    rows.append(dict(
+        pair=f"{a}/{b}",
+        sector_match=(s_a == s_b),
+        **t,
+    ))
+
+rows.sort(key=lambda r: r["distance"], reverse=True)
+
+print(f"{'Pair':<12s}  {'Pearson':>8s}  {'Spearman':>9s}  {'distance':>9s}  same sector")
+print("-" * 60)
+for r in rows[:10]:
+    print(f"  {r['pair']:<10s}  {r['pearson']:+8.3f}  {r['spearman']:+9.3f}  "
+          f"{r['distance']:9.3f}  {'✓' if r['sector_match'] else ''}")
+```
+
+::: {.callout-tip}
+## What to Look for
+Within-sector pairs dominate the top.  Cross-sector pairs where distance
+correlation *exceeds* Spearman by more than 0.05 are your candidates for
+non-linear or tail dependence — worth investigating with mutual information
+(Tool 2) or a tail-crash analysis (Job C).
+:::
+
+---
+
+## 4 · Your Turn — The Cheapest Tool That Suffices
+
+For each pair below, decide: does Pearson already tell the story, or do you
+need to climb the ladder?
+
+| Pair | Pearson | Spearman | distance | Verdict |
+|------|---------|----------|----------|---------|
+| (fill in from your ranking) | | | | |
+
+**Rule of thumb:** if $|P - S| < 0.05$ and $|S - d| < 0.05$, the relationship
+is close to linear/elliptical and Pearson is fine.  Any larger gap signals
+something the cheap tool is missing.

@@ -1,0 +1,221 @@
+---
+title: "Tool 2.5 — The Gaussianize-First Trap"
+subtitle: "Does making the data Gaussian buy fairness for free?"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets  # noqa: F401
+from lectures.plotting import INK, COOL, WARM, CRASH, despine
+from lectures.measures import cka_rbf, mutual_information_xy
+from lectures.gaussianization import gaussianize_1d
+import rbig
+from rbig import AnnealedRBIG
+plotting.set_style("notes")
+import numpy as np, matplotlib.pyplot as plt
+from scipy.stats import pearsonr, norm
+```
+
+*Learn-the-tool track · the shortcut between Tools 2 and 3.*
+
+A tempting idea: dependence is hard to remove because the data is non-Gaussian, so
+why not **Gaussianize the data first**, then train on the "nice" representation?
+The logic is sound — if the features were truly **independent of $S$**, any model
+built on them would be fair *for free*, because a function of an $S$-independent
+input is itself $S$-independent.
+
+This lab tests that hope head-on.  The principle holds; the catch is *which*
+Gaussianization actually makes the features independent of $S$.
+
+---
+
+## 1 · A Feature That Leaks S Nonlinearly
+
+`x_leg` is a legitimate feature (independent of $S$).  `proxy` carries $S$ through
+its **magnitude** ($\propto S^2$), so it is *linearly* uncorrelated with $S$ yet
+fully dependent on it.  The target genuinely depends on $S$, so using the proxy
+both pays off **and** leaks.
+
+```{python}
+rng = np.random.default_rng(0)
+n = 1200
+S = rng.normal(0, 1, n)                          # sensitive attribute
+x_leg = rng.normal(0, 1, n)                       # legitimate feature, independent of S
+proxy = (S**2 - 1) + 0.5 * rng.normal(0, 1, n)    # leaks S nonlinearly: cov(S^2, S) = 0
+y = 0.7 * x_leg + 1.0 * (S**2 - 1) + 0.3 * rng.normal(0, 1, n)
+print(f"corr(proxy, S) = {pearsonr(proxy, S)[0]:+.3f}   (the leak is linearly invisible)")
+```
+
+## 2 · A Flexible Model and Three Ways to "Gaussianize"
+
+The auditor is a random-Fourier-feature ridge — flexible enough to **re-discover
+any leak** left in the inputs.  Then three feature transforms, from cheap to
+correct.
+
+```{python}
+def model_predict(Z):
+    """RBF-feature ridge: flexible enough to exploit any residual S-leak."""
+    Z = Z.reshape(-1, 1) if Z.ndim == 1 else Z
+    r = np.random.default_rng(1)
+    W = r.normal(0, 1.0, (Z.shape[1], 400))
+    b = r.uniform(0, 2 * np.pi, 400)
+    phi = np.cos(Z @ W + b) * np.sqrt(2 / 400)
+    w = np.linalg.solve(phi.T @ phi + 1e-2 * np.eye(phi.shape[1]), phi.T @ y)
+    return phi @ w
+
+
+def cond_gaussianize(f, s, nbins=15):
+    """Gaussianize ``f`` *given* ``s``: rank within S-bins, then Phi^-1 -> independent of S."""
+    edges = np.quantile(s, np.linspace(0, 1, nbins + 1))
+    edges[0] -= 1.0
+    edges[-1] += 1.0
+    idx = np.digitize(s, edges[1:-1])
+    u = np.empty_like(f, dtype=float)
+    for b in np.unique(idx):
+        m = idx == b
+        u[m] = (f[m].argsort().argsort() + 0.5) / m.sum()  # empirical conditional CDF
+    return norm.ppf(np.clip(u, 1e-3, 1 - 1e-3))
+
+
+def score(Z):
+    """Train, then audit with a trio of independence metrics + accuracy."""
+    yh = model_predict(Z)
+    return (
+        pearsonr(yh, y)[0] ** 2,   # accuracy: R^2 for the target
+        pearsonr(yh, S)[0],        # Pearson: linear dependence on S
+        cka_rbf(yh, S),            # CKA: nonlinear dependence (bounded [0, 1])
+        mutual_information_xy(yh, S),  # MI in nats (histogram)
+    )
+```
+
+Three independence metrics, because each is blind to something: **Pearson** sees
+only straight lines, **CKA** catches any one-vs-one shape, **MI** reports the same
+in nats.  (For *many* dimensions you would switch the information metric to RBIG —
+§4.)
+
+## 3 · Train on Each Representation, Then Audit
+
+```{python}
+results = {}
+results["fair ceiling (x_leg only)"] = score(x_leg)
+results["naive: drop S, keep proxy"] = score(np.column_stack([x_leg, proxy]))
+
+b = np.cov(proxy, S)[0, 1] / np.var(S)
+results["linear-residualize vs S"] = score(np.column_stack([x_leg, proxy - b * S]))
+
+gp, gs = gaussianize_1d(proxy), gaussianize_1d(S)
+bg = np.cov(gp, gs)[0, 1] / np.var(gs)
+results["marginal-Gaussianize + remove"] = score(
+    np.column_stack([gaussianize_1d(x_leg), gp - bg * gs])
+)
+
+XYS = np.column_stack([x_leg, proxy, S])
+XYS = (XYS - XYS.mean(0)) / XYS.std(0)
+Zl = AnnealedRBIG(n_layers=30, random_state=0).fit_transform(XYS)
+k_s = int(np.argmax([abs(pearsonr(Zl[:, j], S)[0]) for j in range(3)]))
+results["joint RBIG, drop S-latent"] = score(Zl[:, [j for j in range(3) if j != k_s]])
+
+results["conditional Gaussianize proxy|S"] = score(
+    np.column_stack([x_leg, cond_gaussianize(proxy, S)])
+)
+
+print(f"{'representation':34s}{'acc R²':>8}{'|Pearson|':>10}{'CKA':>6}{'MI nats':>9}")
+print("-" * 67)
+for name, (acc, pear, cka, mi) in results.items():
+    flag = "  ← fair" if cka < 0.03 else ""
+    print(f"{name:34s}{acc:>8.2f}{abs(pear):>10.2f}{cka:>6.2f}{mi:>9.2f}{flag}")
+```
+
+Read the audit columns: **Pearson is ~0 for every model** — the leak is symmetric
+($\propto S^2$), so the linear check would wave the leaky ones through.  **CKA and
+MI both flag it** (0.13 / 0.40), and both fall only for the conditional transform.
+The accuracy column shows the price: neutrality costs the $S$-derived signal.
+
+```{python}
+#| label: fig-gauss-first-trap
+#| fig-cap: "Only conditional Gaussianization drives the prediction's dependence on S to zero. Marginal and joint Gaussianization leave a leak the flexible model re-extracts; the conditional transform buys neutrality by giving up the S-derived accuracy (it collapses toward the fair ceiling)."
+labels = list(results)
+accs = [results[k][0] for k in labels]
+ckas = [results[k][2] for k in labels]
+ypos = np.arange(len(labels))[::-1]
+fig, (axA, axC) = plt.subplots(1, 2, figsize=(11, 4.0), sharey=True)
+axA.barh(ypos, accs, color=WARM)
+axA.set_title("accuracy  R²(ŷ, y)", fontsize=12)
+axA.set_yticks(ypos)
+axA.set_yticklabels(labels, fontsize=10)
+axC.barh(ypos, ckas, color=[COOL if c < 0.03 else CRASH for c in ckas])
+axC.axvline(0.03, color=INK, ls="--", lw=1)
+axC.set_title("dependence  CKA(ŷ, S)  ·  lower = fairer", fontsize=12)
+for ax in (axA, axC):
+    despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+::: {.callout-important}
+## The Lesson
+"Gaussianize then train" *can* be fair — but only if the transform makes the
+features **independent of $S$**, and that takes a **conditional** map
+($F_{\hat y \mid S}$).  Marginal Gaussianization preserves the curve; joint RBIG
+decorrelates the latent axes but leaves each one a function of $S$ — so a flexible
+model re-extracts the leak.  Note the price too: the only truly neutral
+representation collapses toward the **fair ceiling**; you cannot keep the accuracy
+that rode on $S$.  The trainable shortcut to the same place is the
+[CKA penalty](lab-tool2-cka-penalty.qmd).
+:::
+
+---
+
+## 4 · Which Metric, Which Regime?
+
+The audit above is **one prediction vs one attribute** — 1-D vs 1-D.  Real
+fairness is sometimes wider: *several* protected attributes at once, or a *block*
+of predictions.  Each metric has a regime, and reaching for the wrong one hides
+the leak.
+
+```{python}
+rng2 = np.random.default_rng(0)
+m, dim, k = 2000, 5, 3
+Zf = rng2.normal(size=(m, k))
+A, B = rng2.normal(size=(k, dim)), rng2.normal(size=(k, dim))
+Xblk = Zf @ A + 0.5 * rng2.normal(size=(m, dim))                      # a 5-D feature block
+Sdep = Zf @ B + 0.5 * rng2.normal(size=(m, dim))                      # shares factors -> dependent
+Sind = rng2.normal(size=(m, k)) @ B + 0.5 * rng2.normal(size=(m, dim))  # independent
+
+print("5-D feature block  vs  5-D sensitive block  (Pearson / our CKA / histogram-MI can't go here):")
+print(f"  dependent   : RBIG-MI = {rbig.estimate_mi(Xblk, Sdep, random_state=0):.2f} nats")
+print(f"  independent : RBIG-MI = {rbig.estimate_mi(Xblk, Sind, random_state=0):.2f} nats")
+```
+
+RBIG estimates mutual information by Gaussianizing each block and measuring the
+leftover total correlation — exactly the high-dimensional case where a kernel
+matrix or a histogram falls apart.  Note the flip side: on the **1-D vs 1-D** audit
+above it is the *degenerate* case (its layer-wise entropy diffs are noisy and
+symmetric structure underflows to ~0), so there CKA and histogram-MI are the
+sharper readers.
+
+::: {.callout-note}
+## The Cheat Sheet — Validating ŷ ⟂ S
+- *a line you can see* → **Pearson** (cheap; blind to curves — it cleared every
+  leaky model above)
+- *any shape, one-vs-one* → **CKA** (bounded $[0,1]$, differentiable — also the
+  penalty you train with)
+- *information in nats, one-vs-one* → **histogram MI**
+- *blocks / many dimensions* → **RBIG total correlation** (its home turf; don't
+  trust it on 1-D vs 1-D)
+:::
+
+---
+
+## 5 · Your Turn
+
+- Raise the proxy's noise so it leaks $S$ more weakly.  At what point does even the
+  naive model look "fair" by CKA?
+- Swap the RBF auditor for a plain linear model.  Which leaks vanish — and which
+  remain — once it can no longer see curvature?
+- Increase `nbins` in `cond_gaussianize`.  How fine must the conditioning be
+  before CKA hits zero, and what does that cost in variance?
+
+Back to the hero: [Tool 2 — the CKA penalty](lab-tool2-cka-penalty.qmd).

@@ -1,0 +1,104 @@
+---
+title: "Probability Under Transformation"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting
+from lectures.plotting import INK, COOL, WARM, CRASH, BAND, despine, annotate_box
+plotting.set_style("notes")
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import norm
+```
+
+Push a distribution through a function and it is **reshaped** — by the function's
+derivative.  This is the same [change-of-variables](../gaussianization/01-change-of-variables.qmd)
+rule that powers Gaussianization, now read as *uncertainty propagation*.
+
+## The Rule
+
+For an invertible $y = f(x)$,
+
+$$
+p_Y(y) = p_X(x)\,\left|\frac{dx}{dy}\right| = \frac{p_X(x)}{\lvert f'(x)\rvert}.
+$$
+
+Where $f$ is **steep**, it spreads probability out (the output is more
+uncertain); where it is **flat**, it concentrates it.  The Jacobian
+$\lvert f'\rvert$ is the exact bookkeeping.
+
+```{python}
+#| label: fig-pushforward
+#| fig-cap: "A Gaussian input pushed through a convex function. The output is skewed and stretched in the steep region — uncertainty is reshaped, not merely shifted."
+rng = np.random.default_rng(0)
+f = lambda x: np.exp(0.55 * x)           # convex, option-like
+x = rng.normal(0.0, 1.0, 40000)
+y = f(x)
+
+fig, ax = plt.subplots(figsize=(7.5, 5.2))
+# function curve
+xs = np.linspace(-3, 3, 300)
+ax.plot(xs, f(xs), c=INK, lw=2.2)
+ax.set_xlabel("input x"); ax.set_ylabel("output y = f(x)")
+# input density along the bottom
+xb = np.linspace(-3, 3, 200)
+ax.fill_between(xb, -0.3 + 2.0 * norm.pdf(xb), -0.3, color=COOL, alpha=0.5)
+ax.text(-2.6, 0.5, "input p(x)", color=COOL, fontsize=10)
+# output density along the left (rotated)
+yb = np.linspace(y.min(), np.quantile(y, 0.999), 200)
+hist, edges = np.histogram(y, bins=80, density=True)
+cen = 0.5 * (edges[:-1] + edges[1:])
+ax.fill_betweenx(cen, -3 + 2.5 * hist, -3, color=WARM, alpha=0.5)
+ax.text(-2.9, np.quantile(y, 0.85), "output p(y)\n(skewed, heavy)",
+        color=WARM, fontsize=10)
+ax.set_xlim(-3, 3); ax.set_ylim(-0.4, np.quantile(y, 0.999))
+ax.set_title("A distribution reshaped by its transform", fontsize=12)
+despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+## Small-Noise Propagation
+
+Linearize and the rule becomes the familiar engineering formula: a small input
+noise $\sigma_x$ produces output noise
+
+$$
+\sigma_y \approx \lvert f'(x)\rvert\,\sigma_x.
+$$
+
+Error scales with the **slope of the system** — the steeper the response, the more
+your input uncertainty is amplified.
+
+```{python}
+#| label: fig-error-propagation
+#| fig-cap: "Same input noise, two operating points. Where f is steep the output band is wide; where f is flat it is narrow."
+f = lambda x: np.tanh(1.5 * x)
+fp = lambda x: 1.5 * (1 - np.tanh(1.5 * x) ** 2)
+xs = np.linspace(-2.5, 2.5, 300)
+sig_x = 0.3
+fig, ax = plt.subplots(figsize=(7.5, 4.4))
+ax.plot(xs, f(xs), c=INK, lw=2.2)
+for x0, name in [(-0.1, "steep"), (1.6, "flat")]:
+    sy = abs(fp(x0)) * sig_x
+    ax.errorbar(x0, f(x0), yerr=sy, xerr=sig_x, fmt="o", color=CRASH,
+                capsize=4, lw=2)
+    ax.annotate(f"{name}: σ_y≈{sy:.2f}", (x0, f(x0)),
+                textcoords="offset points", xytext=(10, -18), fontsize=10)
+ax.set_xlabel("input x"); ax.set_ylabel("output f(x)")
+ax.set_title("σ_y ≈ |f'(x)| · σ_x", fontsize=12)
+despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+::: {.callout-note icon=false}
+## Why This Matters for Risk
+Portfolio P&L is a *function* of returns.  Propagating return uncertainty to P&L
+is exactly this push-forward — and because the function is multivariate, the
+**joint** dependence of the inputs controls the joint tail of the output.  Keeping
+that dependence is what the [next page](03-noise-and-propagation.qmd) is about.
+:::

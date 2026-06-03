@@ -1,0 +1,291 @@
+---
+title: "Kernel Measures, Gaussianization, and the Two-Roads Synthesis"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, BAND, despine, annotate_box
+from lectures.measures import hsic_rbf, distance_correlation, mutual_information_bits
+plotting.set_style("notes")
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import pearsonr, spearmanr
+```
+
+The density estimator is the most expensive part of mutual information.  This
+page shows two ways around that problem — one that skips the density entirely
+(HSIC), and one that *learns* a density by transforming the data to Gaussian
+(Gaussianization) — then steps back to show why every tool in the chapter was
+one of two roads all along.
+
+---
+
+## Rung 7 · HSIC — Dependence Without a Density
+
+The kernel idea: embed the data in a richer feature space, then test for
+dependence *there*.  In pseudocode:
+
+```
+HSIC(X, Y) = dependence( kernel(X) , kernel(Y) )
+```
+
+With a characteristic kernel (e.g. RBF / Gaussian), HSIC is zero *exactly*
+under independence — and it never estimates a density.
+
+$$
+\operatorname{HSIC}(X, Y)
+  = \frac{1}{(n-1)^2}\operatorname{tr}(K_X H K_Y H)
+$$
+
+where $K_X$, $K_Y$ are the kernel matrices and $H$ is the centring matrix
+$I - \frac{1}{n}\mathbf{1}\mathbf{1}^\top$.
+
+```{python}
+#| label: fig-hsic-demo
+#| fig-cap: "HSIC on three pairs: strongly dependent (banks), weakly linked, and shuffled (independent). Shuffling destroys the signal."
+rng = np.random.default_rng(5)
+
+a, b, _ = datasets.two_banks(n=600)
+u, v = datasets.convex_payoff(n=600)
+ind_x, ind_y = rng.normal(size=600), rng.permutation(a)
+
+pairs = [
+    ("Banks (dependent)", a, b),
+    ("Convex payoff (non-linear)", u, v),
+    ("Shuffled banks (independent)", a, ind_y),
+]
+
+fig, axes = plt.subplots(1, 3, figsize=(13, 4))
+colors = [CRASH, WARM, COOL]
+for ax, (title, x, y), col in zip(axes, pairs, colors):
+    h = hsic_rbf(x, y)
+    ax.scatter(x, y, s=10, c=col, alpha=0.4, edgecolors="none")
+    ax.set_title(title, fontsize=11)
+    annotate_box(ax, 0.5, -0.10, f"HSIC = {h:.4f}")
+    ax.set_xticks([]); ax.set_yticks([])
+    despine(ax)
+
+fig.suptitle("HSIC: zero only under independence, no density required",
+             fontsize=12, fontweight="bold", y=1.02)
+fig.tight_layout()
+plt.show()
+```
+
+**Why HSIC matters beyond this lecture.**  HSIC is differentiable with respect
+to model parameters.  That makes it usable as a *penalty* — you can train a
+model to minimise HSIC between its predictions and a sensitive attribute.
+This is exactly the **fairness penalty** in Lecture 2:
+
+$$
+\mathcal{L} = \text{fit loss} + \mu \cdot \operatorname{HSIC}(\hat{y}, S).
+$$
+
+Measuring a dependence and *forbidding* it are the same idea, just with the
+sign flipped.
+
+---
+
+## Rung 8 · Gaussianization — Learn the Density, Then Measure
+
+The mutual information estimator on the [previous page](02-mutual-information.qmd)
+used a coarse histogram.  Rotation-Based Iterative Gaussianization (RBIG) does
+better: it iteratively reshapes each marginal to a standard normal and rotates
+to mix axes, repeating until the joint *is* a plain Gaussian.  Because every
+step is invertible, it gives exact log-likelihoods; the dependence it removes
+is the data's total correlation.
+
+```{python}
+#| label: fig-gaussianization-sketch
+#| fig-cap: "Conceptual sketch: the iterative transform drives each marginal toward a bell curve while rotating axes to mix residual dependence. After convergence the joint is Gaussian and independent."
+rng = np.random.default_rng(3)
+n = 600
+
+# Simulate a non-Gaussian, dependent cloud
+t = rng.normal(0, 1, n)
+x = t + rng.normal(0, 0.3, n)
+y = 0.9 * t + 0.6 * (t**2 - 1) + rng.normal(0, 0.3, n)
+X_raw = np.column_stack([x, y])
+X_raw = (X_raw - X_raw.mean(0)) / X_raw.std(0)
+
+# Toy Gaussianization: rank-transform + PCA whitening (not real RBIG, but illustrates the idea)
+from scipy.stats import norm as sp_norm
+
+def marginal_gaussianise(col):
+    ranks = (np.argsort(np.argsort(col)) + 0.5) / len(col)
+    return sp_norm.ppf(ranks)
+
+Xg = np.column_stack([marginal_gaussianise(X_raw[:, 0]),
+                      marginal_gaussianise(X_raw[:, 1])])
+cov = np.cov(Xg.T)
+L = np.linalg.cholesky(cov)
+Xg = np.linalg.solve(L.T, Xg.T).T  # whiten
+
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.8))
+
+axL.scatter(X_raw[:, 0], X_raw[:, 1], s=10, c=COOL, alpha=0.5, edgecolors="none")
+axL.set_title("Before: non-Gaussian, dependent cloud", fontsize=12)
+mi_before = mutual_information_bits(
+    np.histogram2d(X_raw[:, 0], X_raw[:, 1], bins=25)[0]
+)
+annotate_box(axL, 0.5, -0.10, f"MI ≈ {mi_before:.2f} bits  (histogram estimate)")
+despine(axL)
+
+axR.scatter(Xg[:, 0], Xg[:, 1], s=10, c=CRASH, alpha=0.5, edgecolors="none")
+axR.set_title("After Gaussianization (sketch)", fontsize=12)
+mi_after = mutual_information_bits(
+    np.histogram2d(Xg[:, 0], Xg[:, 1], bins=25)[0]
+)
+annotate_box(axR, 0.5, -0.10, f"MI ≈ {mi_after:.2f} bits  (dependence removed)")
+despine(axR)
+
+for ax in (axL, axR):
+    ax.set_xlim(-4, 4); ax.set_ylim(-4, 4)
+    ax.set_xticks([]); ax.set_yticks([])
+
+fig.suptitle("Gaussianization removes dependence — what it removes IS the dependence",
+             fontsize=12, fontweight="bold", y=1.0)
+fig.tight_layout()
+plt.show()
+```
+
+::: {.callout-note}
+The sketch above uses a rank-transform + PCA whitening to illustrate the
+principle.  The real RBIG (available via the `rbig` package) iterates many
+such layers and yields exact mutual information estimates.
+:::
+
+### The Idea Underneath
+
+A Gaussian is the *least-committal* distribution consistent with a given
+covariance — it assumes nothing beyond the correlations measured.  So whatever
+Gaussianization must *work* to remove is exactly the structure that correlation
+never implied: the nonlinear, tail-driven dependence.
+
+This is the first appearance of the principle the whole course turns on:
+**claim only what your evidence justifies.**  The same invertible machine —
+re-implemented in JAX as `gauss_flows` — runs *backward* in Lecture 3 to
+generate scenarios and propagate risk.
+
+---
+
+## Synthesis — The Two Roads, Grown
+
+Look back at the ladder.  Every tool was one of two roads:
+
+**Road 1 — no density needed:**
+```
+measure = compare( transform(x) , transform(y) )
+```
+Pearson, Spearman, distance correlation, and HSIC all fit this template.
+They differ only in the transform and the distance/kernel used.
+
+**Road 2 — through the density:**
+```
+measure = D_KL( p(x,y) || p(x)·p(y) )
+```
+Mutual information, total correlation.  The density must come from somewhere:
+*assume* its shape (parametric — cheap, wrong in tails) or *learn* it
+(generative — Gaussianization, flows).
+
+The *transform* is the thread: a fixed, hand-picked map on Road 1; a learned,
+invertible map on the generative branch of Road 2.  An invertible transform
+that simplifies the data hands you the density for free.
+
+```{python}
+#| label: fig-two-roads
+#| fig-cap: "The two-roads decision tree. Both branches end at a measure; only the right branch needs a density."
+fig, ax = plt.subplots(figsize=(11, 5))
+ax.axis("off")
+
+# Draw a simple text-based tree
+nodes = {
+    "q":   (0.50, 0.90, "How much do these move together?",  14, INK),
+    "q1":  (0.50, 0.68, "Do you need the distribution?",     12, INK),
+    "r1a": (0.18, 0.46, "NO → compare directly\n"
+                        "compare(T(x), T(y))",                11, COOL),
+    "r1b": (0.82, 0.46, "YES → go through p(x,y)\n"
+                        "= KL-divergence",                     11, WARM),
+    "r2a": (0.18, 0.20, "Pearson   Spearman\n"
+                        "dist corr   HSIC\n"
+                        "(differ only in T and metric)",       10, COOL),
+    "r2b": (0.58, 0.20, "Assume shape\n(parametric, fast,\n"
+                        "wrong in tails)",                     10, WARM),
+    "r2c": (0.90, 0.20, "Learn shape\n(Gaussianization,\n"
+                        "flows — exact)",                      10, CRASH),
+}
+
+for key, (x, y, text, fs, col) in nodes.items():
+    ax.text(x, y, text, ha="center", va="center", fontsize=fs, color=col,
+            fontweight="bold" if key in ("q", "q1") else "normal",
+            bbox=dict(boxstyle="round,pad=0.4", fc="white", ec=col, lw=1.4))
+
+# Arrows
+arrow_kw = dict(arrowstyle="->", lw=1.4, color=INK)
+for (x0, y0), (x1, y1) in [
+    ((0.50, 0.85), (0.50, 0.74)),
+    ((0.50, 0.63), (0.22, 0.52)),
+    ((0.50, 0.63), (0.78, 0.52)),
+    ((0.18, 0.40), (0.18, 0.26)),
+    ((0.82, 0.40), (0.62, 0.26)),
+    ((0.82, 0.40), (0.88, 0.26)),
+]:
+    ax.annotate("", xy=(x1, y1), xytext=(x0, y0),
+                xycoords="axes fraction", textcoords="axes fraction",
+                arrowprops=arrow_kw)
+
+fig.tight_layout()
+plt.show()
+```
+
+---
+
+## Final Scorecard — All Measures on Both Characters
+
+```{python}
+#| label: tbl-final-scorecard
+#| tbl-cap: "Every measure we met, applied to both running characters."
+a, b, crash = datasets.two_banks(n=1000)
+u, v = datasets.convex_payoff(n=1000)
+
+def full_score(x, y, label):
+    p = pearsonr(x, y)[0]
+    s = spearmanr(x, y)[0]
+    dc = distance_correlation(x, y)
+    H = np.histogram2d(x, y, bins=25)[0]
+    mi = mutual_information_bits(H)
+    h = hsic_rbf(x[:300], y[:300])
+    print(f"\n{label}")
+    print(f"  Pearson          {p:+.3f}")
+    print(f"  Spearman         {s:+.3f}")
+    print(f"  distance corr    {dc:.3f}")
+    print(f"  MI (bits, hist)  {mi:.3f}")
+    print(f"  HSIC (RBF)       {h:.4f}")
+
+full_score(a, b, "Banks")
+full_score(u, v, "Convex payoff")
+```
+
+**Opposite blind spots, made concrete.**  The banks score high on every
+measure; the convex pair is invisible to Pearson yet obvious once we leave the
+no-distribution road.  No single number is the whole truth — the right tool
+depends on the relationship you fear.
+
+---
+
+## The Punchline — For the Lab
+
+With the ladder in hand, the hands-on lab points these tools at real S&P 500
+returns.  The running characters return as their real selves (JPMorgan, Bank of
+America, ...).  You will find that two banks share roughly **1 bit** of
+information and fall into their worst days together roughly **7× more often**
+than independence allows — the dependence that correlation cannot see, and the
+one that actually threatens a portfolio.
+
+*Next: [Causality](04-causality.qmd) — when does dependence imply direction?*
+
+*And in Lecture 2: we stop **measuring** dependence and start **removing** it —
+the HSIC above becomes a penalty that forces a model to be blind to a chosen
+variable.*

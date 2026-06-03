@@ -1,0 +1,108 @@
+---
+title: "Tool 1 — Drop & Orthogonalize"
+subtitle: "Why dropping S leaks · linear neutrality and its hole"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
+from lectures.measures import cka_rbf, cka_linear
+plotting.set_style("notes")
+import numpy as np, matplotlib.pyplot as plt
+from scipy.stats import pearsonr
+```
+
+*Learn-the-tool track · Lab 1 of 3.*
+
+The two failure modes you must feel before you trust a fix: **dropping** the
+sensitive feature (proxies leak it back) and **linear** neutrality (the curve
+survives).  By the end you will have measured both with CKA.
+
+---
+
+## 1 · Drop the Feature — Measure the Leak
+
+Build a model that never sees $S$, only a proxy correlated with it, and check
+whether the predictions are actually independent of $S$.
+
+```{python}
+rng = np.random.default_rng(1)
+n = 600
+S = rng.normal(0, 1, n)
+proxy = S + 0.4 * rng.normal(0, 1, n)
+x_legit = rng.normal(0, 1, n)
+y = 0.7 * x_legit + 0.8 * S + 0.3 * rng.normal(0, 1, n)
+
+X = np.column_stack([x_legit, proxy, np.ones(n)])      # S deliberately excluded
+beta, *_ = np.linalg.lstsq(X, y, rcond=None)
+y_hat = X @ beta
+
+print(f"corr(proxy, S)      = {pearsonr(proxy, S)[0]:+.2f}")
+print(f"Pearson(y_hat, S)   = {pearsonr(y_hat, S)[0]:+.2f}   (the standard check)")
+print(f"CKA(y_hat, S)       = {cka_rbf(y_hat, S):.2f}   (the honest audit)")
+```
+
+The model dropped $S$, yet the dependence is plainly there.  **You cannot remove
+a dependence you refuse to look at.**
+
+---
+
+## 2 · Linear Neutrality — And the Hole
+
+Now give the model a target that bends with $S$, fit it, and orthogonalize the
+predictions against $S$.  Measure CKA before and after.
+
+```{python}
+d = datasets.fair_regression(n=1000, seed=0)
+x, S2, yt = d["x"], d["s"], d["y"]
+
+# Plain least-squares model that can see the curve.
+Phi = np.column_stack([np.ones(len(x)), x, S2, S2**2 - 1])
+theta, *_ = np.linalg.lstsq(Phi, yt, rcond=None)
+yh = Phi @ theta
+
+# Linear removal: subtract the S-projection.
+b = np.cov(yh, S2)[0, 1] / np.var(S2)
+resid = yh - b * S2
+
+print(f"            Pearson(·,S)   CKA(·,S)")
+print(f"plain        {pearsonr(yh, S2)[0]:+.3f}        {cka_rbf(yh, S2):.3f}")
+print(f"linear-rm    {pearsonr(resid, S2)[0]:+.3f}        {cka_rbf(resid, S2):.3f}")
+```
+
+```{python}
+#| label: fig-tool1-hole
+#| fig-cap: "Linear removal zeroes the correlation but the curve — and the CKA — survives."
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.2))
+axL.scatter(S2, yh, s=10, c=COOL, alpha=0.5, edgecolors="none")
+axL.set_title(f"plain · CKA={cka_rbf(yh, S2):.2f}", fontsize=11)
+despine(axL)
+axR.scatter(S2, resid, s=10, c=CRASH, alpha=0.5, edgecolors="none")
+axR.set_title(f"after linear removal · CKA={cka_rbf(resid, S2):.2f}", fontsize=11)
+despine(axR)
+for ax in (axL, axR):
+    ax.set_xlabel("S"); ax.set_ylabel("prediction")
+fig.tight_layout()
+plt.show()
+```
+
+::: {.callout-tip}
+## What to Look for
+Pearson drops to ~0 after linear removal, but CKA barely moves.  The gap between
+them *is* the nonlinear dependence — exactly what Tool 2's kernel penalty
+removes.
+:::
+
+---
+
+## 3 · Your Turn
+
+- Increase the noise on `proxy`.  How weak must the proxy be before dropping $S$
+  is "good enough" by CKA?
+- Replace the quadratic term with $\sin(2S)$.  Does linear removal do any better?
+  (It should not.)  Compare `cka_linear` vs `cka_rbf` on the residual.
+
+Next: [Tool 2 — the CKA penalty](lab-tool2-cka-penalty.qmd) closes the hole.

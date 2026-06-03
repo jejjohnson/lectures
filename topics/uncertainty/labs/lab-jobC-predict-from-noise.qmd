@@ -1,0 +1,112 @@
+---
+title: "Job C — Predict From Noise"
+subtitle: "A calibrated, time-varying interval from forecast volatility"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box, mark_event  # noqa: F401
+plotting.set_style("notes")
+import numpy as np, pandas as pd, matplotlib.pyplot as plt
+```
+
+*Do-the-job track · Job C of 3.*
+
+A daily return is ~unpredictable in its **mean** — but its **noise** is not.
+Volatility *clusters*: turbulent days follow turbulent days.  So the move is to
+**predict the noise** — forecast tomorrow's volatility from the past — and band
+with it.  Deliverable: an interval that stays honest **in a crisis**, where a
+single constant error bar fails.
+
+---
+
+## 1 · Forecast the Noise (Volatility)
+
+The RiskMetrics EWMA forecast uses only the past, so it is a real one-step-ahead
+prediction: $\sigma_t^2 = \lambda\,\sigma_{t-1}^2 + (1-\lambda)\,r_{t-1}^2$.
+
+```{python}
+R = datasets.load_returns()
+r = R["JPM"].to_numpy(); dates = R.index
+
+lam = 0.94
+v = np.empty_like(r); v[0] = np.var(r[:20])
+for t in range(1, len(r)):
+    v[t] = lam * v[t - 1] + (1 - lam) * r[t - 1] ** 2   # causal: only the past
+sigma_t = np.sqrt(v)
+
+split = int(0.5 * len(r))                 # evaluate out of sample (second half)
+const = r[:split].std()                   # the one-number alternative
+print(f"constant σ (train)  : {const:.3f}")
+print(f"forecast σ_t (test) : {sigma_t[split:].min():.3f} (calm) .. {sigma_t[split:].max():.3f} (crisis)")
+```
+
+## 2 · Calibration — Where Each Band Holds
+
+Returns are ~zero-mean, so the 95% interval is $\pm 1.96\,\sigma$.  Split the
+out-of-sample days into calm and turbulent thirds and check coverage of each band.
+
+```{python}
+te = np.arange(split, len(r))
+z = 1.96
+st = sigma_t[te]
+calm = te[st <= np.quantile(st, 1 / 3)]
+turb = te[st >= np.quantile(st, 2 / 3)]
+
+print(f"{'days':>16}  {'constant σ':>11}  {'forecast σ_t':>13}   (target 95%)")
+for name, idx in [("all test", te), ("calm", calm), ("turbulent", turb)]:
+    cov_c = np.mean(np.abs(r[idx]) <= z * const)
+    cov_f = np.mean(np.abs(r[idx]) <= z * sigma_t[idx])
+    print(f"{name:>16}  {cov_c:>11.0%}  {cov_f:>13.0%}")
+```
+
+The headline is the last row: on **turbulent days the constant band covers ~84%**
+when it promises 95% — it gets pierced exactly in a crisis — while the
+**forecast-σ band stays ~94%**.  Predicting the noise keeps the interval honest
+when it matters most.
+
+```{python}
+#| label: fig-jobC-vol-band
+#| fig-cap: "Out-of-sample JPM returns. The forecast +/- 2 sigma_t band (blue) breathes with volatility and contains the crisis days; the constant +/- 2 sigma band (dashed) is too wide in calm 2017 and is repeatedly pierced in the 2015-16 and 2018 stress."
+te_dates = dates[split:]
+rt = r[split:]; sg = sigma_t[split:]
+fig, ax = plt.subplots(figsize=(10, 3.8))
+ax.fill_between(te_dates, -z * sg, z * sg, color=COOL, alpha=0.35,
+                label="±1.96 σ̂$_t$  (forecast)")
+ax.axhline(z * const, color=CRASH, lw=1.6, ls="--", label="±1.96 σ  (constant)")
+ax.axhline(-z * const, color=CRASH, lw=1.6, ls="--")
+ax.plot(te_dates, rt, c=INK, lw=0.5, alpha=0.8)
+breach = np.abs(rt) > z * const
+ax.scatter(te_dates[breach], rt[breach], s=14, c=CRASH, zorder=5,
+           label="pierces constant band")
+mark_event(ax, pd.Timestamp("2018-02-05"), "Volmageddon")
+ax.set_ylim(-0.09, 0.09); ax.set_ylabel("JPM daily return")
+ax.legend(loc="lower left", fontsize=9, frameon=False); despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+::: {.callout-tip}
+## The Deliverable
+The calibration table is the report: a constant bar can look fine *on average* yet
+fail in the tail, while a volatility forecast holds across regimes.  Even the
+forecast band misses a touch more than nominal — fat tails; Gaussianize the
+standardized residuals $r_t/\sigma_t$ (the Chapter-2 callback) to recover the last
+points.
+:::
+
+---
+
+## Your Turn
+
+- Change `lam` (try 0.97 and 0.85).  A slower decay is smoother but lags the crisis
+  — does turbulent-day coverage drop?
+- Standardize $r_t/\sigma_t$ and histogram it: still fat-tailed?  Gaussianize and
+  re-band, then re-check the table.
+- Add **epistemic** uncertainty: forecast σ from several windows and widen the band
+  by their spread; re-check calibration.
+
+Back to the chapter: [Uncertainty overview](../index.qmd).

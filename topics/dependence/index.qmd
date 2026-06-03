@@ -1,0 +1,68 @@
+---
+title: "Measuring Dependence"
+---
+
+How do we put a *number* on the statement "these two variables move together"?
+This chapter climbs a ladder from the most familiar measure to the most
+general, and at the top we look back and see that every rung was one of just
+**two roads**.
+
+::: {.callout-note icon=false}
+## The Spine — Two Roads
+
+There are really only two ways to ask "how much do these move together?"
+
+1. **Without the distribution** — compare the data directly via a *transform*
+   and a *distance*.  One template covers Pearson, Spearman, distance
+   correlation, and kernels:
+
+   ```
+   measure = compare( transform(x) , transform(y) )
+   ```
+
+2. **Through the distribution** — read the dependence out of $p(x,y)$ as
+   *information*.  This needs a density, which forces a choice: *assume* its
+   shape (parametric, fast, wrong in tails) or *learn* it (generative —
+   Gaussianization, flows).
+
+The *transform* is the thread running through both: a hand-picked map on the
+first road; a learned, invertible map on the generative branch of the second.
+:::
+
+## Why This Matters for Finance
+
+A correlation matrix is the beating heart of portfolio risk — but it only sees
+**straight lines**.  Tail co-movements, regime switches, and non-linear
+contagion are exactly the dependence that Pearson misses and that mutual
+information and kernel measures are built to catch.
+
+The motivating failure: a book your risk report called *diversified* — low
+correlations everywhere — falls all at once when one shock arrives.  **What did
+the number miss?**  That question drives the whole chapter.
+
+## The Ladder
+
+| Rung | Measure | Road | Sees |
+|------|---------|------|------|
+| 1 | Pearson $r$ | no density | linear only |
+| 2 | Spearman $\rho$ | no density | monotonic |
+| 3 | Distance correlation | no density | any dependence |
+| 4 | Mutual information | via density | any dependence |
+| 5 | Linfoot R | via density | any (on $[-1,1]$ scale) |
+| 6 | HSIC | no density | any (kernel test) |
+| 7 | Gaussianization | via learned density | all of the above + generation |
+
+## Pages in This Chapter
+
+1. **[Correlation: Pearson and Spearman](01-correlation.qmd)** — the
+   comfortable defaults and their blind spots.  Includes the *running
+   characters* (two banks; a convex payoff) and the independence reference.
+2. **[Mutual Information](02-mutual-information.qmd)** — entropy, surprise, and
+   the honest measure.  Linfoot's bridge back to the correlation scale.
+3. **[Kernel Measures: HSIC](03-kernels-hsic.qmd)** — independence without a
+   density, and the synthesis of the two roads.
+4. **[Causality](04-causality.qmd)** — correlation ≠ causation; directed
+   information and Granger causality.
+
+The hands-on [labs](labs/index.qmd) build each rung in isolation, then hunt the
+**hidden risk** in a book the correlation matrix called *diversified*.

@@ -1,0 +1,12 @@
+{
+  "hash": "579366c5bbf4a1362793168a2d8030ea",
+  "result": {
+    "engine": "jupyter",
+    "markdown": "---\ntitle: Exploratory Data Analysis\n---\n\n\n\nThis notebook provides an initial exploration of the dataset.\n\n> **Note**: This file is a [Jupytext](https://jupytext.readthedocs.io) percent-format\n> script. To open it as a Jupyter notebook, run:\n> ```bash\n> pixi run notebooks-to-ipynb\n> ```\n> or convert a single file with:\n> ```bash\n> pixi run jupytext --to notebook notebooks/01_eda.py\n> ```\n\n## Imports\n\n\n::: {#cf0eedaa .cell execution_count=1}\n``` {.python .cell-code}\nimport matplotlib.pyplot as plt\nimport numpy as np\n```\n:::\n\n\n## Load Data\n\n::: {#e85a7349 .cell execution_count=2}\n``` {.python .cell-code}\n# Placeholder: replace with actual data loading\nrng = np.random.default_rng(42)\ndata = rng.normal(loc=0, scale=1, size=500)\nlabels = (data > 0).astype(int)\n\nprint(f\"Loaded {len(data)} samples\")\nprint(f\"Class balance: {labels.mean():.2%} positive\")\n```\n\n::: {.cell-output .cell-output-stdout}\n```\nLoaded 500 samples\nClass balance: 50.20% positive\n```\n:::\n:::\n\n\n## Distribution Overview\n\n::: {#337b26a9 .cell execution_count=3}\n``` {.python .cell-code}\nfig, axes = plt.subplots(1, 2, figsize=(10, 4))\n\naxes[0].hist(data, bins=30, edgecolor=\"white\")\naxes[0].set_title(\"Feature Distribution\")\naxes[0].set_xlabel(\"Value\")\naxes[0].set_ylabel(\"Count\")\n\naxes[1].bar([\"Negative\", \"Positive\"], [(labels == 0).sum(), (labels == 1).sum()])\naxes[1].set_title(\"Class Balance\")\naxes[1].set_ylabel(\"Count\")\n\nplt.tight_layout()\nplt.show()\n```\n\n::: {.cell-output .cell-output-display}\n![](01_eda_files/figure-html/cell-4-output-1.png){width=949 height=372}\n:::\n:::\n\n\n## Summary Statistics\n\n::: {#c5c61f4a .cell execution_count=4}\n``` {.python .cell-code}\nprint(f\"Mean:   {np.mean(data):.4f}\")\nprint(f\"Std:    {np.std(data):.4f}\")\nprint(f\"Min:    {np.min(data):.4f}\")\nprint(f\"Max:    {np.max(data):.4f}\")\nprint(f\"Median: {np.median(data):.4f}\")\n```\n\n::: {.cell-output .cell-output-stdout}\n```\nMean:   -0.0131\nStd:    0.9590\nMin:    -2.5667\nMax:    2.9139\nMedian: 0.0032\n```\n:::\n:::\n\n\n",
+    "supporting": [
+      "01_eda_files"
+    ],
+    "filters": [],
+    "includes": {}
+  }
+}

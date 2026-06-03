@@ -1,0 +1,188 @@
+project:
+  type: website
+  output-dir: _site
+  execute-dir: project # run code cells from repo root so `src/lectures` imports resolve
+  # Execute notebooks/code once and cache; CI re-renders only what changed.
+  preview:
+    port: 4848
+
+execute:
+  freeze: auto # cache computed figures under _freeze/ so CI stays fast & reproducible
+  warning: false
+
+bibliography: references.bib
+
+website:
+  title: "Lectures"
+  description: "Lecture notes, slide decks, and hands-on labs."
+  repo-url: https://github.com/jejjohnson/lectures
+  repo-actions: [edit, issue]
+  page-navigation: true
+  navbar:
+    left:
+      - text: Home
+        href: index.qmd
+      - text: Topics
+        menu:
+          - text: "Markets for Data People"
+            href: topics/data/index.qmd
+          - text: "Measures of Dependence"
+            href: topics/dependence/index.qmd
+          - text: "Gaussianization"
+            href: topics/gaussianization/index.qmd
+          - text: "Uncertainty"
+            href: topics/uncertainty/index.qmd
+          - text: "Fair Learning"
+            href: topics/fairness/index.qmd
+      - text: Courses
+        menu:
+          - text: "2025 — Finance MSc (10h)"
+            href: courses/2025-finance-msc/index.qmd
+    right:
+      - icon: github
+        href: https://github.com/jejjohnson/lectures
+  sidebar:
+    style: docked
+    contents:
+      - section: "Markets for Data People"
+        contents:
+          - text: "Overview"
+            href: topics/data/index.qmd
+          - text: "Download & Parse"
+            href: topics/data/01-downloading-and-parsing.qmd
+          - text: "Returns & Volatility"
+            href: topics/data/02-returns-and-volatility.qmd
+          - text: "Crashes & Drawdowns"
+            href: topics/data/03-crashes-and-drawdowns.qmd
+          - text: "Co-Movement"
+            href: topics/data/04-co-movement-and-co-crashes.qmd
+          - text: "Risk Measures"
+            href: topics/data/05-risk-measures.qmd
+          - text: "Credit Data"
+            href: topics/data/06-the-credit-dataset.qmd
+          - text: "Patching & Windowing"
+            href: topics/data/07-patching-and-windowing.qmd
+      - section: "Dependence"
+        contents:
+          - text: "Overview"
+            href: topics/dependence/index.qmd
+          - text: "Correlation"
+            href: topics/dependence/01-correlation.qmd
+          - text: "Mutual Information"
+            href: topics/dependence/02-mutual-information.qmd
+          - text: "Kernels & HSIC"
+            href: topics/dependence/03-kernels-hsic.qmd
+          - text: "Causality"
+            href: topics/dependence/04-causality.qmd
+          - section: "Labs"
+            contents:
+              - text: "Overview"
+                href: topics/dependence/labs/index.qmd
+              - text: "Tool 1 · Ladder"
+                href: topics/dependence/labs/lab-tool1-ladder.qmd
+              - text: "Tool 2 · Information"
+                href: topics/dependence/labs/lab-tool2-information.qmd
+              - text: "Tool 3 · Windows"
+                href: topics/dependence/labs/lab-tool3-windows.qmd
+              - text: "Job A · Validate"
+                href: topics/dependence/labs/lab-jobA-validate.qmd
+              - text: "Job B · Measure Book"
+                href: topics/dependence/labs/lab-jobB-measure-book.qmd
+              - text: "Job C · Hidden Risk"
+                href: topics/dependence/labs/lab-jobC-hidden-risk.qmd
+      - section: "Gaussianization"
+        contents:
+          - text: "Overview"
+            href: topics/gaussianization/index.qmd
+          - text: "Change of Variables"
+            href: topics/gaussianization/01-change-of-variables.qmd
+          - text: "RBIG"
+            href: topics/gaussianization/02-rbig.qmd
+          - text: "Mutual Information"
+            href: topics/gaussianization/03-mutual-information.qmd
+          - text: "Flows"
+            href: topics/gaussianization/04-flows.qmd
+          - section: "Labs"
+            contents:
+              - text: "Overview"
+                href: topics/gaussianization/labs/index.qmd
+              - text: "Tool 1 · 1-D Transform"
+                href: topics/gaussianization/labs/lab-tool1-change-of-variables.qmd
+              - text: "Tool 2 · RBIG"
+                href: topics/gaussianization/labs/lab-tool2-rbig.qmd
+              - text: "Tool 3 · MI"
+                href: topics/gaussianization/labs/lab-tool3-mutual-information.qmd
+              - text: "Job A · Validate"
+                href: topics/gaussianization/labs/lab-jobA-validate.qmd
+              - text: "Job B · Basket"
+                href: topics/gaussianization/labs/lab-jobB-gaussianize-basket.qmd
+              - text: "Job C · Scenarios"
+                href: topics/gaussianization/labs/lab-jobC-scenarios.qmd
+      - section: "Uncertainty"
+        contents:
+          - text: "Overview"
+            href: topics/uncertainty/index.qmd
+          - text: "Uncertainty = Probability"
+            href: topics/uncertainty/01-uncertainty-is-probability.qmd
+          - text: "Under Transformation"
+            href: topics/uncertainty/02-probability-under-transformation.qmd
+          - text: "Noise & Propagation"
+            href: topics/uncertainty/03-noise-and-propagation.qmd
+          - text: "Predictive Bands"
+            href: topics/uncertainty/04-predictive-bands.qmd
+          - section: "Labs"
+            contents:
+              - text: "Overview"
+                href: topics/uncertainty/labs/index.qmd
+              - text: "Tool 1 · Independent"
+                href: topics/uncertainty/labs/lab-tool1-independent-fail.qmd
+              - text: "Tool 2 · Gaussian MC"
+                href: topics/uncertainty/labs/lab-tool2-gaussian-mc.qmd
+              - text: "Tool 3 · Bands"
+                href: topics/uncertainty/labs/lab-tool3-bands.qmd
+              - text: "Job A · Scenarios"
+                href: topics/uncertainty/labs/lab-jobA-stress-scenarios.qmd
+              - text: "Job B · VaR"
+                href: topics/uncertainty/labs/lab-jobB-portfolio-var.qmd
+              - text: "Job C · Predict"
+                href: topics/uncertainty/labs/lab-jobC-predict-from-noise.qmd
+      - section: "Fair Learning"
+        contents:
+          - text: "Overview"
+            href: topics/fairness/index.qmd
+          - text: "What Is Fair?"
+            href: topics/fairness/01-what-is-fair.qmd
+          - text: "Bias & Proxies"
+            href: topics/fairness/02-bias-and-proxies.qmd
+          - text: "Fair Kernel Learning"
+            href: topics/fairness/03-fair-kernel-learning.qmd
+          - text: "Tie-back"
+            href: topics/fairness/04-tie-back.qmd
+          - section: "Labs"
+            contents:
+              - text: "Overview"
+                href: topics/fairness/labs/index.qmd
+              - text: "Tool 1 · Drop"
+                href: topics/fairness/labs/lab-tool1-drop.qmd
+              - text: "Tool 2 · CKA Penalty"
+                href: topics/fairness/labs/lab-tool2-cka-penalty.qmd
+              - text: "Tool 2.5 · Gaussianize-First"
+                href: topics/fairness/labs/lab-tool2.5-gaussianize-first.qmd
+              - text: "Tool 3 · Adversarial"
+                href: topics/fairness/labs/lab-tool3-adversarial.qmd
+              - text: "Job A · Validate"
+                href: topics/fairness/labs/lab-jobA-validate.qmd
+              - text: "Job B · Credit"
+                href: topics/fairness/labs/lab-jobB-neutralize-credit.qmd
+              - text: "Job C · Beta-neutral"
+                href: topics/fairness/labs/lab-jobC-beta-neutral.qmd
+
+format:
+  html:
+    theme:
+      - cosmo
+      - styles/theme.scss
+    toc: true
+    code-fold: true # executable cells start collapsed behind a "Code" button
+    code-tools: true
+    fig-align: center

@@ -1,0 +1,106 @@
+---
+title: "Tool 2 — Gaussian Monte-Carlo"
+subtitle: "Right correlation, thin tails; the VaR gap"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
+from lectures.measures import cocrash_fraction
+plotting.set_style("notes")
+import numpy as np, matplotlib.pyplot as plt
+```
+
+*Learn-the-tool track · Lab 2 of 3.*
+
+Gaussian Monte-Carlo matches the covariance — and still understates joint risk,
+because Gaussian tails are thin and tail-independent.  You will measure the VaR
+gap it leaves.
+
+---
+
+## 1 · A Tail-Dependent Pair, and Its Gaussian Twin
+
+```{python}
+rng = np.random.default_rng(2)
+n = 4000
+z = rng.normal(0, 1, n)
+a = 0.5 * z + 0.5 * rng.normal(0, 1, n)
+b = 0.5 * z + 0.5 * rng.normal(0, 1, n)
+crash = rng.random(n) < 0.05
+shock = np.abs(rng.standard_t(2.5, n) * 3.0)
+a, b = np.where(crash, a - shock, a), np.where(crash, b - shock, b)
+D = np.column_stack([a, b]); D = (D - D.mean(0)) / D.std(0)
+
+gmc = rng.multivariate_normal(D.mean(0), np.cov(D.T), size=n)
+
+print(f"covariance matched? real corr {np.corrcoef(D.T)[0,1]:.2f} "
+      f"vs GMC {np.corrcoef(gmc.T)[0,1]:.2f}")
+print(f"co-crash:  real {cocrash_fraction(D[:,0], D[:,1], 0.02):.0%}  "
+      f"vs GMC {cocrash_fraction(gmc[:,0], gmc[:,1], 0.02):.0%}  (deep tail)")
+```
+
+The two clouds share a middle but not a tail — see where they part:
+
+```{python}
+#| label: fig-tool2-clouds
+#| fig-cap: "Real tail-dependent returns vs a Gaussian Monte-Carlo with the same covariance. The bulk matches; the Gaussian has no joint lower-tail (shaded)."
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.2), sharex=True, sharey=True)
+for ax, data, col, name in [
+    (axL, D, COOL, f"real · co-crash {cocrash_fraction(D[:,0], D[:,1], 0.02):.0%}"),
+    (axR, gmc, CRASH, f"Gaussian MC · co-crash {cocrash_fraction(gmc[:,0], gmc[:,1], 0.02):.0%}"),
+]:
+    ax.scatter(data[:, 0], data[:, 1], s=6, c=col, alpha=0.3, edgecolors="none")
+    ax.axvspan(-10, np.quantile(D[:, 0], 0.02), color=INK, alpha=0.05)
+    ax.axhspan(-10, np.quantile(D[:, 1], 0.02), color=INK, alpha=0.05)
+    ax.set_title(name, fontsize=11); ax.set_xlim(-8, 4); ax.set_ylim(-8, 4)
+    ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+## 2 · The VaR Gap
+
+```{python}
+port_real, port_gmc = D[:, 0] + D[:, 1], gmc[:, 0] + gmc[:, 1]
+for ql in [0.05, 0.01, 0.005]:
+    vr, vg = np.quantile(port_real, ql), np.quantile(port_gmc, ql)
+    print(f"{ql:>6.1%} VaR:  real {vr:+.2f}   GMC {vg:+.2f}   "
+          f"understated by {vr - vg:+.2f}")
+```
+
+```{python}
+#| label: fig-tool2-gmc
+#| fig-cap: "Portfolio loss distribution: the Gaussian MC misses the deep-loss tail and reports a too-optimistic 1% VaR."
+bins = np.linspace(min(port_real.min(), port_gmc.min()), 3, 60)
+fig, ax = plt.subplots(figsize=(7.5, 4.4))
+ax.hist(port_real, bins=bins, density=True, color=COOL, alpha=0.55, label="real")
+ax.hist(port_gmc, bins=bins, density=True, color=CRASH, alpha=0.45, label="Gaussian MC")
+ax.axvline(np.quantile(port_real, 0.01), color=COOL, lw=2, ls="--")
+ax.axvline(np.quantile(port_gmc, 0.01), color=CRASH, lw=2, ls="--")
+ax.set_xlabel("portfolio return"); ax.set_ylabel("density")
+ax.set_title("1% VaR: real vs Gaussian MC", fontsize=12)
+ax.legend(fontsize=9, frameon=False); despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+::: {.callout-tip}
+## What to Look for
+The deeper the quantile, the wider the gap — Gaussian tail-independence means the
+error *grows* exactly where it hurts.  Matching covariance is not matching tail
+risk.
+:::
+
+---
+
+## 3 · Your Turn
+
+- Push the crash fraction up and down; does the VaR gap track it?
+- Compare against an RBIG scenario set (next: [Job A](lab-jobA-stress-scenarios.qmd)) on the
+  same data — which VaR is closer to the empirical one?
+
+Next: predictive uncertainty by sampling — [Tool 3 — bands](lab-tool3-bands.qmd).

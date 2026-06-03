@@ -1,0 +1,115 @@
+---
+title: "Tool 3 — Adversarial Removal"
+subtitle: "The learned Dep and its instability"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
+from lectures.measures import cka_rbf
+from lectures.neutralize import fair_fit
+plotting.set_style("notes")
+import numpy as np, matplotlib.pyplot as plt
+```
+
+*Learn-the-tool track · Lab 3 of 3.*
+
+Instead of a *fixed* dependence measure, **learn** one: a probe tries to recover
+$S$ from the predictions, and "neutral" means the probe fails.  This lab measures
+that recoverability directly.
+
+---
+
+## 1 · The Adversary's View
+
+For a model neutralized at weight $\mu$, fit a probe $S \approx g(\hat y)$ and
+score how much of $S$ it recovers ($R^2$).  A fair model leaves nothing to
+recover.
+
+```{python}
+d = datasets.fair_regression(n=1000, seed=0)
+x, S, y = d["x"], d["s"], d["y"]
+
+def adversary_r2(pred, S, degree=2):
+    coef = np.polyfit(pred, S, degree)
+    S_hat = np.polyval(coef, pred)
+    return max(1 - np.mean((S_hat - S) ** 2) / np.var(S), 0.0)
+
+mus = [0.0, 0.5, 2.0, 8.0, 20.0]
+print(f"{'μ':>6}  {'CKA(ŷ,S)':>9}  {'adversary R²':>13}")
+print("-" * 32)
+r2 = []
+for mu in mus:
+    p = fair_fit(x, y, S, mu=mu)
+    rr = adversary_r2(p, S)
+    r2.append(rr)
+    print(f"{mu:>6g}  {cka_rbf(p, S):>9.3f}  {rr:>13.3f}")
+```
+
+```{python}
+#| label: fig-tool3-adv
+#| fig-cap: "Recoverability of S decays toward chance as μ grows."
+fig, ax = plt.subplots(figsize=(7.5, 4.2))
+ax.plot(mus, r2, "-o", c=CRASH, lw=2.2)
+ax.set_xlabel("neutrality weight μ")
+ax.set_ylabel("adversary R² (recoverability of S)")
+ax.set_title("S becomes unrecoverable from the predictions", fontsize=12)
+despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+---
+
+## 2 · Probe Capacity Matters
+
+A weak probe can be fooled while a stronger one still finds $S$.  Compare a
+linear probe with a quadratic one on the *plain* model.
+
+```{python}
+p0 = fair_fit(x, y, S, mu=0.0)
+print(f"linear probe R²    = {adversary_r2(p0, S, degree=1):.3f}")
+print(f"quadratic probe R² = {adversary_r2(p0, S, degree=2):.3f}   ← sees the curve")
+```
+
+You can see why: the plain model's predictions bend with $S$, so a straight-line
+probe slides off while a curved one locks on.
+
+```{python}
+#| label: fig-tool3-probes
+#| fig-cap: "S vs the plain model's predictions. The linear probe (straight) misses the bend that the quadratic probe (curved) recovers."
+order = np.argsort(p0)
+lin_fit = np.polyval(np.polyfit(p0, S, 1), p0)
+quad_fit = np.polyval(np.polyfit(p0, S, 2), p0)
+fig, ax = plt.subplots(figsize=(7, 4.2))
+ax.scatter(p0, S, s=10, c=COOL, alpha=0.3, edgecolors="none", label="data")
+ax.plot(p0[order], lin_fit[order], c=WARM, lw=2.4,
+        label=f"linear probe (R²={adversary_r2(p0, S, 1):.2f})")
+ax.plot(p0[order], quad_fit[order], c=CRASH, lw=2.4,
+        label=f"quadratic probe (R²={adversary_r2(p0, S, 2):.2f})")
+ax.set_xlabel("prediction ŷ"); ax.set_ylabel("sensitive S")
+ax.legend(fontsize=9, frameon=False); despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+::: {.callout-tip}
+## What to Look for
+"Fair against a weak probe" is not "fair." The adversarial method is only as
+strong as its probe — which is the same lesson as the measurement ladder: the
+*shape* you can detect bounds the shape you can remove.
+:::
+
+---
+
+## 3 · Your Turn
+
+- Raise the probe degree to 3–4.  Does the plain model leak more?  Does a
+  CKA-penalized model still hold up?
+- Adversarial training is a min-max game and can oscillate.  Sketch why a fixed
+  kernel penalty (Tool 2) trades flexibility for stability.
+
+Next, take these tools to real data: [Job A — validate](lab-jobA-validate.qmd).

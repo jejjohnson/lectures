@@ -1,0 +1,94 @@
+---
+title: "Tie-back: (In)dependence and Information"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting
+from lectures.plotting import INK, COOL, WARM, CRASH, despine
+plotting.set_style("notes")
+import numpy as np
+import matplotlib.pyplot as plt
+```
+
+## Removal Is Measurement, Run Backward
+
+Chapter 1 asked *how much* two variables move together.  This chapter asked how
+to *cancel* that movement.  They are the same object seen from two sides:
+
+| | [Measure](../dependence/index.qmd) (Ch. 1) | Remove (Ch. 4) |
+|---|---|---|
+| Question | how dependent are $X$ and $Y$? | make $\hat y$ independent of $S$ |
+| Tool | a dependence measure $\operatorname{Dep}$ | the *same* measure, as a penalty |
+| Output | a number | a model on the trade-off frontier |
+
+Every rung of the removal ladder is a measurement rung used as a loss:
+
+```
+loss = fit(y_hat, y) + mu * Dep(y_hat, S)
+                            └────────────┘
+                     a Chapter-1 measure, differentiated
+```
+
+## The Two Roads, Once More
+
+The dependence chapter's fork — *do you need the distribution?* — reappears,
+now about *removing* rather than measuring:
+
+```
+Do you need the density to remove the dependence?
+│
+├── NO  →  kernel removal:  Dep = CKA / HSIC(y_hat, S)
+│          no density, differentiable, bounded — the workhorse
+│
+└── YES →  information removal:  Dep = MI / total correlation
+           needs a learned density → Gaussianization / flows
+```
+
+The kernel road is the practical default; the information road reconnects
+fairness to [Gaussianization](../gaussianization/index.qmd) — but it must be
+**conditional** (Gaussianize $\hat y$ given $S$) to yield a fair model, as the
+[Gaussianize-first lab](labs/lab-tool2.5-gaussianize-first.qmd) shows; marginal
+or joint Gaussianization alone is not enough.
+
+```{python}
+#| label: fig-shape-removed
+#| fig-cap: "What each rung can cancel. Drop removes nothing; linear removes the line; CKA removes line and curve."
+fig, ax = plt.subplots(figsize=(8, 3.6))
+rungs = ["drop\nfeature", "linear\n(cka_linear)", "CKA\n(cka_rbf)",
+         "adversarial"]
+removes_line = [0, 1, 1, 1]
+removes_curve = [0, 0, 1, 1]
+xpos = np.arange(len(rungs))
+ax.bar(xpos - 0.18, removes_line, width=0.36, color=COOL, label="removes the line")
+ax.bar(xpos + 0.18, removes_curve, width=0.36, color=CRASH,
+       label="removes the curve")
+ax.set_xticks(xpos); ax.set_xticklabels(rungs, fontsize=10)
+ax.set_yticks([0, 1]); ax.set_yticklabels(["no", "yes"])
+ax.set_title("Pick the cheapest Dep that sees what you fear", fontsize=12)
+ax.legend(fontsize=9, frameon=False, loc="center right")
+despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+::: {.callout-note icon=false}
+## The Through-Line
+The **transform** that threads the measurement ladder threads this one too: a
+hand-picked map (ranks, kernels) on the no-density road, a learned invertible map
+(Gaussianization) on the density road.  Measuring it, removing it, and — next —
+*propagating* it are one operation seen three ways.
+:::
+
+## Hand-Off
+
+You can now force a model to be blind to a chosen variable — fairness and
+factor-neutrality, one operation.  The companion move is to stop *removing*
+dependence and start **propagating** it: carrying uncertainty and risk through a
+model, where the same Gaussianization machine runs *backward* to generate
+scenarios.  See [Uncertainty](../uncertainty/index.qmd).
+
+The hands-on [labs](labs/index.qmd) put all of this on real data: a credit model
+neutralized against `sex`, and a strategy neutralized against the market.

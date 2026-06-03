@@ -1,0 +1,129 @@
+---
+title: "Job C — Beta-Neutralize a Strategy"
+subtitle: "Factor-neutrality on the real S&P basket"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
+from lectures.measures import cka_rbf
+from lectures.neutralize import fair_fit
+plotting.set_style("notes")
+import numpy as np, matplotlib.pyplot as plt
+```
+
+*Do-the-job track · Job C of 3.*
+
+::: {.callout-note appearance="simple" icon=false}
+**See the data first** — [Risk Measures](../../data/05-risk-measures.qmd) defines
+the market factor and beta in the real basket; here we neutralise against them.
+:::
+
+Fairness and factor-neutrality are the same operation.  Here $S$ is the **market
+factor** and "neutral" means a strategy whose returns don't load on it — exactly
+the credit job, with `sex` swapped for beta.
+
+---
+
+## 1 · The Market Factor and a Loaded Signal
+
+Use the real 14-stock basket.  The market factor is the equal-weight average
+return; a naive signal predicts one bank from another — and inherits market beta.
+
+```{python}
+R = datasets.load_returns()
+market = R.mean(axis=1).to_numpy()              # the factor S
+y = R["JPM"].to_numpy()                          # what we trade
+x = R["BAC"].to_numpy()                          # the signal feature
+
+# Naive in-sample prediction of JPM from BAC.
+A = np.column_stack([x, np.ones(len(x))])
+coef, *_ = np.linalg.lstsq(A, y, rcond=None)
+pred = A @ coef
+
+def beta_to(p):
+    return np.cov(p, market)[0, 1] / np.var(market)
+
+print(f"naive signal:  beta to market = {beta_to(pred):+.2f}")
+print(f"               CKA(pred, market) = {cka_rbf(pred, market):.2f}   ← loads on the market")
+```
+
+You can see the exposure: the naive prediction rises with the market factor (a
+non-zero slope = beta).
+
+```{python}
+#| label: fig-jobC-loading
+#| fig-cap: "The naive signal's predictions vs the market factor. The upward slope is the market beta the strategy carries before neutralization."
+order = np.argsort(market)
+fit = np.polyval(np.polyfit(market, pred, 1), market)
+fig, ax = plt.subplots(figsize=(7, 4.2))
+ax.scatter(market, pred, s=10, c=COOL, alpha=0.35, edgecolors="none")
+ax.plot(market[order], fit[order], c=CRASH, lw=2.4,
+        label=f"beta = {beta_to(pred):+.2f}")
+ax.set_xlabel("market factor return"); ax.set_ylabel("naive prediction of JPM")
+ax.set_title(f"Loaded on the market · CKA = {cka_rbf(pred, market):.2f}", fontsize=12)
+ax.legend(fontsize=9, frameon=False); despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+## 2 · Neutralize Against the Market
+
+`fair_fit` re-fits JPM from the signal while penalizing dependence on the market
+factor — driving beta toward zero while keeping the idiosyncratic signal.
+
+```{python}
+sweep = [0.0, 0.5, 2.0, 8.0, 20.0]
+print(f"{'μ':>6}{'beta':>9}{'CKA(pred,mkt)':>15}{'corr(pred,JPM)':>16}")
+print("-" * 46)
+betas, ckas, utils = [], [], []
+for mu in sweep:
+    p = fair_fit(x, y, market, mu=mu)
+    b, c, u = beta_to(p), cka_rbf(p, market), float(np.corrcoef(p, y)[0, 1])
+    betas.append(b); ckas.append(c); utils.append(u)
+    print(f"{mu:>6g}{b:>+9.2f}{c:>15.3f}{u:>16.3f}")
+```
+
+```{python}
+#| label: fig-jobC-beta
+#| fig-cap: "Left: market beta of the strategy drops toward zero as μ grows. Right: the same accuracy–neutrality frontier as the credit job."
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11.5, 4.3))
+
+axL.plot(sweep, np.abs(betas), "-o", c=CRASH, lw=2.2)
+axL.set_xlabel("neutrality weight μ"); axL.set_ylabel("|beta to market|")
+axL.set_title("The strategy goes market-neutral", fontsize=12)
+despine(axL)
+
+axR.plot(ckas, utils, "-o", c=COOL, lw=2.2)
+for mu, cx, uy in zip(sweep, ckas, utils):
+    axR.annotate(f"μ={mu:g}", (cx, uy), textcoords="offset points",
+                 xytext=(6, 5), fontsize=9, color=INK)
+axR.set_xlabel("CKA(pred, market)  →  less neutral")
+axR.set_ylabel("utility (corr with JPM)")
+axR.set_title("Utility vs neutrality", fontsize=12)
+despine(axR)
+
+fig.tight_layout()
+plt.show()
+```
+
+::: {.callout-tip}
+## What to Look for
+The figure is the *same* as the credit job — only the axis labels changed.
+Beta-neutrality and fairness are one penalized objective; "don't load on the
+market" and "don't depend on the protected attribute" are the same maths.
+:::
+
+---
+
+## Your Turn
+
+- Swap the factor for a single sector index (e.g. the mean of the energy names)
+  and neutralize JPM against it.
+- Compare the residual strategy's Sharpe-like ratio (mean / std) before and after
+  neutralization: does removing market beta cost or improve risk-adjusted return?
+
+Back to the chapter: [fair learning overview](../index.qmd).

@@ -1,0 +1,123 @@
+---
+title: "What Is Fair Learning?"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
+from lectures.measures import cka_rbf
+plotting.set_style("notes")
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import pearsonr
+```
+
+## The Itch — Neutral on Paper, Not in Fact
+
+A model gets signed off as *neutral* because it passes the usual check:
+near-zero correlation with the sensitive variable $S$.  But correlation only
+sees straight lines.  An honest audit — a measure that catches *any* shape —
+shows the score bending with $S$ all along.
+
+This is the fairness mirror of the dependence chapter's [bad
+morning](../dependence/01-correlation.qmd): **the number said safe, the
+dependence was there.**
+
+```{python}
+#| label: fig-fair-hook
+#| fig-cap: "Left: predictions look neutral — Pearson ≈ 0 against S. Right: binned, the score bends with S all along, and CKA reports strong dependence."
+rng = np.random.default_rng(7)
+n = 700
+S = rng.normal(0, 1, n)
+score = (S**2 - 1) + 0.4 * rng.normal(0, 1, n)  # nonlinear, ~zero correlation
+
+pear = pearsonr(score, S)[0]
+ck = cka_rbf(score, S)
+
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.2))
+
+axL.scatter(S, score, s=12, c=COOL, alpha=0.5, edgecolors="none")
+axL.set_title("The standard check", fontsize=12)
+annotate_box(axL, 0.5, -0.10, f"Pearson(score, S) = {pear:+.2f}   ← looks neutral")
+despine(axL)
+
+bins = np.linspace(S.min(), S.max(), 11)
+idx = np.digitize(S, bins)
+centers = 0.5 * (bins[:-1] + bins[1:])
+means = [score[idx == k].mean() for k in range(1, len(bins))]
+axR.scatter(S, score, s=10, c=COOL, alpha=0.18, edgecolors="none")
+axR.plot(centers, means, "-o", c=CRASH, lw=2.2, label="mean score per bin")
+axR.set_title("The honest audit", fontsize=12)
+annotate_box(axR, 0.5, -0.10, f"CKA(score, S) = {ck:.2f}   ← strongly dependent")
+axR.legend(fontsize=9, frameon=False)
+despine(axR)
+
+for ax in (axL, axR):
+    ax.set_xlabel("sensitive variable S"); ax.set_ylabel("model score")
+fig.tight_layout()
+plt.show()
+```
+
+## The Objective — The Whole Chapter in One Line
+
+```
+loss = fit(y_hat, y) + mu * Dep(y_hat, S)
+```
+
+`fit` is your usual prediction error.  $\operatorname{Dep}$ is any dependence
+measure from [Chapter 1](../dependence/index.qmd), now applied between the
+*predictions* and $S$.  The weight $\mu$ trades accuracy against neutrality.
+The [ladder](03-fair-kernel-learning.qmd) is just a sequence of choices for
+$\operatorname{Dep}$, from cheap-and-blind to flexible-and-expensive.
+
+::: {.callout-note icon=false}
+## Background — The Penalty Is a Lagrangian
+
+What we actually want is a *constrained* problem: minimize prediction error
+subject to "no dependence on $S$,"
+
+$$
+\min_{\theta}\; \mathbb{E}\,[\,\ell(\hat y_\theta, y)\,]
+\quad\text{s.t.}\quad \operatorname{Dep}(\hat y_\theta, S) = 0.
+$$
+
+Forming the Lagrangian turns the constraint into the additive penalty we train
+with,
+
+$$
+\mathcal{L}(\theta) = \mathbb{E}\,[\,\ell(\hat y_\theta, y)\,]
++ \mu\,\operatorname{Dep}(\hat y_\theta, S),
+$$
+
+where $\mu$ is the Lagrange multiplier.  Sweeping $\mu$ from $0$ to $\infty$
+traces the **Pareto frontier** between accuracy and neutrality — exactly the
+[trade-off curve](03-fair-kernel-learning.qmd) this chapter builds to.  There is
+no single "fair model"; there is a curve, and $\mu$ chooses your operating point.
+:::
+
+## Two Framings, One Operation
+
+The same objective wears two names in finance:
+
+- **Fairness.** $S$ is a protected attribute (sex, race, age).  Regulation —
+  the EU's [GDPR](https://gdpr.eu/) Art. 22 on automated decisions, and the
+  **EU AI Act**, which classes credit scoring and CV screening as *high-risk* —
+  requires that decisions not depend on such attributes.  A credit model must
+  approve on ability to repay, not on group membership.
+- **Factor-neutrality.** $S$ is a market or sector factor (beta).  A strategy
+  that must be *market-neutral* should produce returns that don't load on the
+  factor it is hedging.
+
+"Don't discriminate" and "don't load on the factor I'm hedging" are the same
+maths: drive $\operatorname{Dep}(\hat y, S)$ to zero.
+
+::: {.eli5}
+**One-liner.**  Fair learning doesn't *hide* the sensitive variable — it adds
+"depend on $S$" to the bill, so the optimizer chooses to stop using it.
+:::
+
+Next: why the obvious fix — just delete $S$ — [doesn't
+work](02-bias-and-proxies.qmd).

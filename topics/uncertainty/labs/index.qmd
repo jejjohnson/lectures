@@ -1,0 +1,36 @@
+---
+title: "Uncertainty — Labs"
+---
+
+Six hands-on notebooks in two tracks, mirroring the
+[dependence labs](../../dependence/labs/index.qmd).  The verb is **propagate**:
+sample the joint, push it through, and report honest uncertainty.
+
+## Learn-the-Tool Track
+
+| Lab | Topic |
+|-----|-------|
+| [Tool 1 — Independent fails](lab-tool1-independent-fail.qmd) | why per-marginal sampling destroys the joint |
+| [Tool 2 — Gaussian Monte-Carlo](lab-tool2-gaussian-mc.qmd) | right correlation, thin tails; the VaR gap |
+| [Tool 3 — Predictive bands](lab-tool3-bands.qmd) | aleatoric vs epistemic by sampling |
+
+## Do-the-Job Track
+
+| Lab | Deliverable |
+|-----|-------------|
+| [Job A — Stress scenarios](lab-jobA-stress-scenarios.qmd) | RBIG scenarios with the real joint tail |
+| [Job B — Portfolio VaR](lab-jobB-portfolio-var.qmd) | propagate returns to a 1% VaR, three ways |
+| [Job C — Predict from noise](lab-jobC-predict-from-noise.qmd) | a calibrated, regime-aware interval from forecast volatility |
+
+## Shared Setup
+
+```python
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from rbig import AnnealedRBIG
+from lectures.measures import cocrash_fraction
+plotting.set_style("notes")
+```
+
+The do-the-job labs load real returns with `datasets.load_returns()`.

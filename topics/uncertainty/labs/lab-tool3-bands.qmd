@@ -1,0 +1,111 @@
+---
+title: "Tool 3 — Predictive Bands"
+subtitle: "Aleatoric vs epistemic by sampling"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box  # noqa: F401
+plotting.set_style("notes")
+import numpy as np, matplotlib.pyplot as plt
+```
+
+*Learn-the-tool track · Lab 3 of 3.*
+
+Predictive uncertainty without posteriors.  Two questions, two tools: **predict the
+noise** for the aleatoric part, **resample-and-refit** for the epistemic part.
+
+---
+
+## 1 · Aleatoric — Predict the Noise
+
+When the noise level varies with `x`, one global error bar is wrong everywhere —
+too wide where the world is calm, too narrow where it is loud.  Fit the mean, then
+fit a *second* model to the **squared residuals** → a noise level `σ(x)`.
+
+```{python}
+x, y = datasets.heteroscedastic_noise(n=250, seed=0)
+mu = np.polyval(np.polyfit(x, y, 5), x)        # mean model
+resid = y - mu                                  # residuals = the noise
+sigma = np.sqrt(np.clip(np.polyval(np.polyfit(x, resid**2, 2), x), 1e-6, None))
+const = resid.std()
+
+print(f"constant band : 2σ coverage {np.mean(np.abs(resid) <= 2 * const):.2f}")
+print(f"σ(x) band     : 2σ coverage {np.mean(np.abs(resid) <= 2 * sigma):.2f}")
+print(f"σ(x) ranges {sigma.min():.2f} (calm)  ..  {sigma.max():.2f} (noisy)")
+```
+
+```{python}
+#| label: fig-tool3-aleatoric
+#| fig-cap: "Constant error bar (left) vs predicted sigma(x) (right). Both reach ~95% coverage, but only sigma(x) puts the band where the noise actually is."
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 3.8), sharey=True)
+axL.fill_between(x, mu - 2 * const, mu + 2 * const, color=CRASH, alpha=0.18)
+axL.scatter(x, y, s=12, c=INK, alpha=0.6); axL.plot(x, mu, c=INK, lw=2)
+axL.set_title("constant noise — one bar", fontsize=12); despine(axL)
+axR.fill_between(x, mu - 2 * sigma, mu + 2 * sigma, color=COOL, alpha=0.30)
+axR.scatter(x, y, s=12, c=INK, alpha=0.6); axR.plot(x, mu, c=INK, lw=2)
+axR.set_title("predicted σ(x) — breathes", fontsize=12); despine(axR)
+for ax in (axL, axR):
+    ax.set_xlabel("x"); ax.set_xticks([]); ax.set_yticks([])
+axL.set_ylabel("y")
+fig.tight_layout()
+plt.show()
+```
+
+## 2 · Epistemic — Ensemble of Refits
+
+A different question — *has the model seen data here?* — needs a different tool.
+Refit on bootstrap resamples; the members' spread is the epistemic band.
+
+```{python}
+xg, yg = datasets.heteroscedastic_gap(n=60, seed=0)
+xs = np.linspace(-5, 5, 300)
+rng = np.random.default_rng(0)
+ens = np.array([
+    np.polyval(np.polyfit(xg[i], yg[i], 5), xs)
+    for i in (rng.integers(0, xg.size, xg.size) for _ in range(40))
+])
+e_mean, e_sd = ens.mean(0), ens.std(0)
+gap = (xs > -1) & (xs < 1)
+print(f"epistemic sd in data  : {e_sd[~gap & (np.abs(xs) < 3)].mean():.2f}")
+print(f"epistemic sd in gap   : {e_sd[gap].mean():.2f}   ← wider where data is sparse")
+```
+
+```{python}
+#| label: fig-tool3-epistemic
+#| fig-cap: "Ensemble spread is tight where data is dense and balloons over the gap and the extrapolation edges."
+fig, ax = plt.subplots(figsize=(9, 3.8))
+ax.fill_between(xs, e_mean - 2 * e_sd, e_mean + 2 * e_sd,
+                color=plotting.PALETTE["green"], alpha=0.25)
+for member in ens[:12]:
+    ax.plot(xs, member, c=plotting.PALETTE["green"], lw=0.6, alpha=0.4)
+ax.plot(xs, e_mean, c=INK, lw=2); ax.scatter(xg, yg, s=18, c=INK, zorder=5)
+ax.axvspan(-1, 1, color=CRASH, alpha=0.06)
+ax.set_ylim(-2.2, 2.2); ax.set_xlabel("x"); ax.set_ylabel("y")
+ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+::: {.callout-tip}
+## What to Look for
+The two bands answer different questions.  **Aleatoric** `σ(x)` follows the noise
+and *will not* shrink with more data.  **Epistemic** spread collapses where data is
+dense and balloons where you have none — add data and it shrinks.  The honest total
+is `σ²(x) = σ²_aleatoric(x) + σ²_epistemic(x)`.
+:::
+
+---
+
+## 3 · Your Turn
+
+- Swap `σ(x)` for the constant bar on the heteroscedastic data: where does it
+  over-cover, and where does it under-cover?
+- Add 30 points in the gap and re-run §2: the epistemic band should shrink there.
+- Fat-tailed residuals?  Gaussianize them before banding (the Chapter-2 callback)
+  and compare interval coverage.
+
+Next, the do-the-job track: [Job A — stress scenarios](lab-jobA-stress-scenarios.qmd).

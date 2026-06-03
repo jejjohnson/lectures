@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-A scientific research project template combining Hydra configs, DVC pipelines, MyST documentation, and notebooks. The template supports two environment managers: [uv](https://github.com/astral-sh/uv) (via `Makefile`) and [pixi](https://pixi.sh) (via `pixi.toml`).
+A general **lectures** repo built with Quarto: a deep reference site under `topics/` and curated reveal.js slide decks under `courses/`, meant to hold many courses over time. Keep the top-level framing (home page, README, site title) **subject-agnostic** — individual courses are subject-specific. The first/current course is *Probabilistic ML for Finance* (dependence, Gaussianization, uncertainty, fair learning); new courses get their own `courses/<id>/` folder. Retains the research-template bones (pixi/uv, DVC, Hydra) for heavy demos. The template supports two environment managers: [uv](https://github.com/astral-sh/uv) (via `Makefile`) and [pixi](https://pixi.sh) (via `pixi.toml`).
 
 ## Common Commands
 
@@ -14,9 +14,10 @@ make test                 # Run tests: uv run pytest -v -o addopts=
 make test-cov             # Tests with coverage
 make format               # Auto-fix: ruff format . && ruff check --fix .
 make lint                 # Lint code: ruff check .
-make typecheck            # Type check: ty check src/myproject
+make typecheck            # Type check: ty check src/lectures
 make precommit            # Run pre-commit on all files
-make docs-serve           # Local MyST docs server
+make docs-serve           # Local Quarto preview (site + slides)
+make docs                 # Render site + slides -> _site/
 ```
 
 ### Running a single test
@@ -31,7 +32,7 @@ uv run pytest tests/test_example.py::test_case -v
 pixi run test
 pixi run lint
 pixi run typecheck
-pixi run -e docs docs-serve
+pixi run -e docs preview
 ```
 
 ### Pre-commit checklist (all four must pass)
@@ -40,7 +41,7 @@ pixi run -e docs docs-serve
 uv run pytest -v
 uv run --group lint ruff check .
 uv run --group lint ruff format --check .
-uv run --group typecheck ty check src/myproject
+uv run --group typecheck ty check src/lectures
 ```
 
 **Critical**: Always lint the entire repo with `.` from the root. The template includes tests, configs, scripts, and docs glue outside the package directory.
@@ -49,34 +50,41 @@ uv run --group typecheck ty check src/myproject
 
 ### Package structure
 
-The installable package lives in [src/myproject](src/myproject/).
+The installable package lives in [src/lectures](src/lectures/).
 
 ### Key directories
 
 | Path | Purpose |
 |------|---------|
-| `src/myproject/` | Installable library and public exports |
-| `src/myproject/data/` | Data loading utilities |
-| `src/myproject/models/` | Model implementations |
-| `src/myproject/trainers/` | Training loops |
-| `src/myproject/utils/` | Utility functions |
+| `src/lectures/` | Installable library and public exports |
+| `src/lectures/data/` | Data loading utilities |
+| `src/lectures/models/` | Model implementations |
+| `src/lectures/trainers/` | Training loops |
+| `src/lectures/utils/` | Utility functions |
 | `configs/` | Hydra configuration hierarchy |
 | `data/` | DVC-managed data directories |
 | `results/` | DVC-managed experiment results |
 | `scripts/` | Entry-point scripts (train, evaluate, preprocess) |
-| `docs/` | MyST documentation source |
+| `topics/` | Deep evergreen lecture content (Quarto) |
+| `courses/` | Curated courses: slides + demos |
+| `styles/` | Site + slide SCSS themes |
 | `notebooks/` | Jupytext percent-format `.py` notebooks |
 | `marimo_notebooks/` | Marimo reactive notebooks |
 | `tests/` | Test suite |
 
-## Documentation Examples
+## Content authoring
 
-Docs pages live in [docs](docs/). Notebooks may live in [notebooks](notebooks/) as jupytext percent-format `.py` files. When notebooks produce figures for docs pages:
+Two layers (see README): deep evergreen material in `topics/` (Quarto `.qmd` with
+executable Python cells that generate figures at render time), and curated reveal.js
+decks in `courses/<id>/slides/` that reuse the same figures/helpers.
 
-1. Run them locally
-2. Save figures under `docs/images/{notebook_name}/`
-3. Reference those assets from the relevant MyST page in `docs/`
-4. Commit the notebook source and generated assets together
+- Author deep material + figures **once** in `topics/`; courses reference them.
+- Figure styling + toy datasets live in `src/lectures/` (`plotting.py`, `datasets.py`)
+  so notes and slides look identical. Import via `from lectures import plotting, datasets`.
+- Quarto caches executed cells under `_freeze/` (committed) so CI re-renders only what changed.
+- Slides override format per-file with `format: revealjs` in the front matter.
+- Demos in `courses/*/demos/` are Jupytext percent-format `.py`; they `import` the
+  library repos (rbig, gauss_flows, pyrox, keras-fairkl) from the opt-in `demos` env.
 
 ## Coding Conventions
 

@@ -1,0 +1,86 @@
+---
+title: "Normalizing Flows"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
+from rbig import AnnealedRBIG
+from lectures.measures import cocrash_fraction
+plotting.set_style("notes")
+import numpy as np
+import matplotlib.pyplot as plt
+```
+
+[RBIG](02-rbig.qmd) builds the map $T$ from a *fixed* recipe — rank-Gaussianize,
+then rotate.  A **normalizing flow** instead *learns* $T$: it composes many simple
+invertible layers whose parameters are trained by maximum likelihood, so the map
+can bend to dependence too rich for RBIG's fixed rotations.
+
+## Same Spine, Learned Map
+
+A flow is a chain of invertible transforms $T = T_K \circ \cdots \circ T_1$, each
+with an easy Jacobian, trained so that $z = T(x)$ is standard Gaussian.  The
+[change-of-variables](01-change-of-variables.qmd) formula gives the exact training
+loss (the log-likelihood), and the *same* chain run backward, $x = T^{-1}(z)$,
+generates samples — exactly the forward/backward spine, now with a flexible $T$.
+
+| | RBIG | Normalizing flow |
+|---|---|---|
+| Map $T$ | fixed: rank-Gaussianize + rotate | learned invertible layers |
+| Training | none (closed-form per layer) | maximum likelihood (gradient descent) |
+| Capacity | limited by rotations | high; bends to rich dependence |
+| Cost | cheap | training-heavy (GPU/JAX) |
+
+## The Generative Direction, Illustrated
+
+The render below uses `rbig`'s `AnnealedRBIG` as the stand-in generator — the
+*behaviour* is what matters: draw a simple Gaussian sample, push it through the
+learned inverse, and recover the data's joint tail.  A production flow
+([gauss_flows](https://github.com/jejjohnson/gauss_flows), JAX/FlowJax) replaces
+the stand-in but tells the same story.
+
+```{python}
+#| label: fig-flow-samples
+#| fig-cap: "A learned generator: real data (left) and samples drawn backward through the map (right) share the joint tail dependence."
+a, b = datasets.tail_dependent_pair(n=1500, seed=2)
+X = np.column_stack([a, b])
+gen = AnnealedRBIG(n_layers=30, random_state=1).fit(X).sample(len(X))
+
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.4))
+for ax, data, col, title in [
+    (axL, X, COOL, f"real data · co-crash {cocrash_fraction(X[:,0], X[:,1]):.0%}"),
+    (axR, gen, plotting.PALETTE["purple"],
+     f"learned generator · co-crash {cocrash_fraction(gen[:,0], gen[:,1]):.0%}"),
+]:
+    ax.scatter(data[:, 0], data[:, 1], s=8, c=col, alpha=0.35, edgecolors="none")
+    ax.axvspan(-6, np.quantile(data[:, 0], 0.1), color=CRASH, alpha=0.06)
+    ax.axhspan(-6, np.quantile(data[:, 1], 0.1), color=CRASH, alpha=0.06)
+    ax.set_title(title, fontsize=11)
+    ax.set_xlim(-5, 5); ax.set_ylim(-5, 5)
+    ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+::: {.callout-note icon=false}
+## When to Reach for a Flow
+Use RBIG when its rotation-and-marginal structure already captures the
+dependence — it is cheap and needs no training.  Reach for a flow when the
+dependence is too intricate (sharp, multimodal, high-curvature) for fixed
+rotations to disentangle, and you can afford to train.  Both are the same
+invertible-map idea; the flow just buys capacity.
+:::
+
+::: {.callout-tip}
+## Demo Hook
+The course demo trains a real flow with `gauss_flows` (JAX) and compares its
+samples and log-likelihoods to RBIG's — run it in the opt-in `demos` environment,
+where the heavy libraries live.
+:::
+
+This closes the forward direction.  The same map, run **backward** as a risk
+engine, is the subject of [Uncertainty](../uncertainty/index.qmd).

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from myproject.models.baseline import BaselineModel
+from lectures.models.baseline import BaselineModel
 
 
 def test_baseline_model_init() -> None:

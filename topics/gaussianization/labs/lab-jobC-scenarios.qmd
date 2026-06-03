@@ -1,0 +1,88 @@
+---
+title: "Job C — Generate Scenarios"
+subtitle: "RBIG backward to sample joint return scenarios"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
+from rbig import AnnealedRBIG
+from lectures.measures import cocrash_fraction
+plotting.set_style("notes")
+import numpy as np, matplotlib.pyplot as plt
+```
+
+*Do-the-job track · Job C of 3.*
+
+Fit RBIG to real returns and run it **backward** to generate scenarios.  The
+deliverable is a synthetic scenario set whose **joint tail** matches the real
+data — the input every risk calculation needs.  (This is the bridge to
+[Uncertainty](../../uncertainty/index.qmd).)
+
+---
+
+## 1 · Fit on a Real Sub-Basket
+
+```{python}
+R = datasets.load_returns()
+assets = ["JPM", "BAC", "XOM"]
+X = R[assets].to_numpy()
+X = (X - X.mean(0)) / X.std(0)
+print(f"fitting RBIG on {assets}, {len(X)} days")
+
+rbig = AnnealedRBIG(n_layers=30, random_state=0).fit(X)
+gen = rbig.sample(4000)
+```
+
+## 2 · Do the Scenarios Match the Real Tail?
+
+```{python}
+print(f"{'pair':<10}{'real co-crash':>14}{'generated':>11}")
+print("-" * 35)
+pairs = [(0, 1), (0, 2), (1, 2)]
+for i, j in pairs:
+    cr = cocrash_fraction(X[:, i], X[:, j])
+    cg = cocrash_fraction(gen[:, i], gen[:, j])
+    print(f"{assets[i]}/{assets[j]:<6}{cr:>14.0%}{cg:>11.0%}")
+```
+
+```{python}
+#| label: fig-jobC-scenarios
+#| fig-cap: "Real returns (left) and RBIG-generated scenarios (right) for the JPM/BAC pair — same bulk and same lower-tail co-crash."
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.4), sharex=True, sharey=True)
+for ax, data, col, title in [
+    (axL, X, COOL, f"real · co-crash {cocrash_fraction(X[:,0], X[:,1]):.0%}"),
+    (axR, gen, WARM, f"generated · co-crash {cocrash_fraction(gen[:,0], gen[:,1]):.0%}"),
+]:
+    ax.scatter(data[:, 0], data[:, 1], s=7, c=col, alpha=0.3, edgecolors="none")
+    ax.axvspan(-8, np.quantile(data[:, 0], 0.1), color=CRASH, alpha=0.06)
+    ax.axhspan(-8, np.quantile(data[:, 1], 0.1), color=CRASH, alpha=0.06)
+    ax.set_title(title, fontsize=11)
+    ax.set_xlim(-6, 5); ax.set_ylim(-6, 5)
+    ax.set_xlabel("JPM (z)"); ax.set_ylabel("BAC (z)")
+    despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+::: {.callout-tip}
+## The Deliverable
+A scenario matrix you can feed to any portfolio function.  Unlike independent
+resampling (which destroys the co-crash) or a Gaussian Monte-Carlo (which thins
+the tail), these scenarios carry the *real* joint extremes — see
+[Uncertainty · noise and propagation](../../uncertainty/03-noise-and-propagation.qmd).
+:::
+
+---
+
+## Your Turn
+
+- Generate 10 000 scenarios and estimate a 1% portfolio VaR for an equal-weight
+  JPM/BAC/XOM book; compare to a Gaussian Monte-Carlo VaR on the same covariance.
+- Add a fourth asset from another sector — does RBIG still match every pairwise
+  co-crash?
+
+Back to the chapter: [Gaussianization overview](../index.qmd).

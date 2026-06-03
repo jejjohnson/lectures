@@ -1,0 +1,132 @@
+---
+title: "From Raw Prices to a Clean Panel"
+subtitle: "Download, parse, and turn prices into returns"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, despine
+plotting.set_style("notes")
+import numpy as np, matplotlib.pyplot as plt
+```
+
+Every market example in this course runs on one small table: daily **returns**
+for 14 stocks.  This page shows where that table comes from and how it's built —
+the download, the parse, and the one transformation (prices → log-returns) that
+turns raw quotes into something we can do statistics on.
+
+---
+
+## 1 · The Source and the Basket
+
+The prices come from the public **S&P 500 "5yr"** file in the
+[`plotly/datasets`](https://github.com/plotly/datasets) repository: ~500 names of
+daily close prices from **2013-02-11 to 2018-02-07**.  We keep a curated
+**14-stock basket** spanning five sectors — chosen so the dependence lessons are
+visible to the naked eye: five banks that crash together, two mega-cap tech names,
+energy, and defensive utilities/staples that march to a different drum.
+
+```{python}
+#| label: tbl-basket
+meta = datasets.load_basket_meta()
+print(meta.to_string(index=False))
+```
+
+::: {.callout-note icon=false}
+## Why These 14?
+
+The **sector** column is the story.  Banks (JPM, BAC, C, WFC, GS) share a risk
+factor and move almost as one; utilities (DUK, SO) and staples (PG, KO) are
+defensive and barely co-move with the banks.  That spread of behaviour is exactly
+what makes correlation, co-crashes, and tail dependence *legible* later.
+:::
+
+## 2 · The Pipeline
+
+The download script does four things: fetch the long-format price file, pivot it
+to a wide *price panel* (one column per ticker), drop days with any missing
+quote, and convert prices to **log-returns**.  The committed script is
+[`scripts/download_market_data.py`](../../scripts/download_market_data.py); its
+core is just:
+
+```python
+# scripts/download_market_data.py (excerpt — runs once, needs network)
+df   = pd.read_csv(SP500_5YR_URL, parse_dates=["date"])      # long format
+wide = df.pivot(index="date", columns="Name", values="close")
+prices = wide[BASKET].dropna(how="any")                      # price panel
+rets   = np.log(prices / prices.shift(1)).dropna(how="any")  # log-returns
+rets.to_csv("data/processed/returns_basket.csv")
+```
+
+We don't re-download at page-render time (CI has no network); the result is
+committed as `data/processed/returns_basket.csv` and loaded with
+`datasets.load_returns()`.
+
+```{python}
+R = datasets.load_returns()
+print(f"panel shape : {R.shape[0]} trading days x {R.shape[1]} assets")
+print(f"date range  : {R.index.min().date()} -> {R.index.max().date()}")
+print()
+print(R.iloc[:3, :6].round(4).to_string())   # a corner of the table
+```
+
+## 3 · Why Log-Returns?
+
+A **return** answers "how much did one dollar grow today?"  We use the *log*
+return $r_t = \log(P_t / P_{t-1})$ rather than the simple percentage change for
+two reasons: log-returns **add up over time** (a week's return is the sum of its
+days), and they're roughly symmetric, which keeps the statistics well-behaved.
+
+Because they add up, we can run the transformation **backward** to recover a price
+path from returns — a cumulative sum inside an exponential.  We don't ship prices,
+so we reconstruct an illustrative path here (starting every name at 100) purely to
+*see* what the returns encode:
+
+```{python}
+#| label: fig-price-paths
+#| fig-cap: "Reconstructed price paths (each name indexed to 100 at the start), coloured by sector. Banks move as a tight bundle; utilities and staples drift more calmly. This is the cumulative story the daily returns table encodes."
+meta = datasets.load_basket_meta().set_index("ticker")
+prices = 100 * np.exp(R.cumsum())            # P_t = 100 * exp(sum of log-returns)
+
+sector_color = {
+    "Banks": plotting.CRASH, "Tech": plotting.COOL, "Energy": "#b08968",
+    "Utilities": plotting.PALETTE["green"], "Staples": plotting.PALETTE["purple"],
+}
+fig, ax = plt.subplots(figsize=(9, 4.6))
+seen = set()
+for t in prices.columns:
+    sec = meta.loc[t, "sector"]
+    ax.plot(prices.index, prices[t], color=sector_color[sec], lw=1.2, alpha=0.8,
+            label=sec if sec not in seen else None)
+    seen.add(sec)
+ax.set_ylabel("price (indexed to 100)"); ax.set_xlabel("date")
+ax.set_title("Five years, 14 names, coloured by sector", fontsize=12)
+ax.legend(fontsize=9, frameon=False, ncol=5, loc="upper left")
+despine(ax); fig.tight_layout(); plt.show()
+```
+
+And the round-trip confirms the formula: re-deriving log-returns from the
+reconstructed prices reproduces the original table exactly.
+
+```{python}
+back = np.log(prices / prices.shift(1)).dropna(how="any")
+print(f"max |reconstructed return - original| = {np.abs(back - R.loc[back.index]).to_numpy().max():.2e}")
+```
+
+::: {.callout-tip}
+## The Takeaway
+One table, two views: the **returns** are what we do statistics on (stationary,
+additive); the **prices** are the cumulative story they tell.  Everything in the
+market chapters starts from `datasets.load_returns()`.
+:::
+
+---
+
+## Where This Goes Next
+
+With the panel in hand, the next page asks the first statistical question:
+how big is a typical day, and how big are the *unusual* ones? →
+[Returns, Volatility & Fat Tails](02-returns-and-volatility.qmd).

@@ -1,0 +1,93 @@
+---
+title: "Tool 2 — RBIG Forward & Backward"
+subtitle: "marginal + rotation, iterated · sampling"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
+from rbig import AnnealedRBIG
+from lectures.measures import cocrash_fraction
+plotting.set_style("notes")
+import numpy as np, matplotlib.pyplot as plt
+```
+
+*Learn-the-tool track · Lab 2 of 3.*
+
+Run the full machine: forward to a spherical Gaussian, backward to new samples.
+You will check both directions on a controlled co-crashing pair.
+
+---
+
+## 1 · Forward — Does It Gaussianize?
+
+```{python}
+a, b = datasets.tail_dependent_pair(n=2000, seed=1)
+X = np.column_stack([a, b])
+rbig = AnnealedRBIG(n_layers=30, random_state=0).fit(X)
+Z = rbig.transform(X)
+
+print(f"data  |corr| = {abs(np.corrcoef(a, b)[0,1]):.3f}   co-crash = {cocrash_fraction(a,b):.0%}")
+print(f"RBIG  |corr| = {abs(np.corrcoef(Z[:,0], Z[:,1])[0,1]):.3f}   "
+      f"marginal std = {Z.std(0).round(2)}")
+```
+
+---
+
+## 2 · Backward — Does It Generate?
+
+```{python}
+gen = rbig.sample(2000)
+print(f"real co-crash      = {cocrash_fraction(a, b):.0%}")
+print(f"generated co-crash = {cocrash_fraction(gen[:,0], gen[:,1]):.0%}   ← tail dependence regenerated")
+```
+
+```{python}
+#| label: fig-tool2-rbig
+#| fig-cap: "Data → spherical Gaussian (forward) → fresh samples with the same joint tail (backward)."
+fig, axes = plt.subplots(1, 3, figsize=(13, 4.2))
+for ax, data, col, title in [
+    (axes[0], X, COOL, "data"),
+    (axes[1], Z, plotting.PALETTE["green"], "RBIG forward"),
+    (axes[2], gen, WARM, "RBIG sample"),
+]:
+    ax.scatter(data[:, 0], data[:, 1], s=7, c=col, alpha=0.35, edgecolors="none")
+    ax.set_title(title, fontsize=11)
+    ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+---
+
+## 3 · How Many Layers?
+
+```{python}
+print("layers   |corr| after forward")
+for L in [1, 2, 5, 15, 30]:
+    Zl = AnnealedRBIG(n_layers=L, random_state=0).fit_transform(X)
+    print(f"  {L:>3d}      {abs(np.corrcoef(Zl[:,0], Zl[:,1])[0,1]):.3f}")
+```
+
+::: {.callout-tip}
+## What to Look for
+For a 2-D pair, PCA rotation decorrelates fast — but *decorrelated is not
+independent*.  The co-crash check (a tail-dependence probe) is the honest test of
+whether the joint is truly Gaussian, and it is what the backward pass must
+reproduce.
+:::
+
+---
+
+## 4 · Your Turn
+
+- Switch `rotation="random"` in `AnnealedRBIG`.  How many more layers do you need to
+  reach the same decorrelation?
+- Run RBIG on a *3-asset* slice of `datasets.load_returns()` and sample — the same
+  code scales past two dimensions.
+
+Next: turn the forward pass into a number — [Tool 3,
+mutual information](lab-tool3-mutual-information.qmd).

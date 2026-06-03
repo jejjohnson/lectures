@@ -1,0 +1,175 @@
+---
+title: "Tool 3 — Windows and Total Correlation"
+subtitle: "Scalar → Vector → Block"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
+from lectures.measures import mutual_information_bits, nats_to_bits
+plotting.set_style("notes")
+import numpy as np, matplotlib.pyplot as plt
+from scipy.stats import pearsonr
+```
+
+*Learn-the-tool track · Lab 3 of 3.*
+
+Real portfolios are not scalar pairs — each stock is a *time series*, and the
+dependence between two windows of 5, 10, or 20 days is a different question
+from day-by-day correlation.
+
+This lab climbs the data-shape ladder:
+
+| Data shape | Manipulation | Measure |
+|------------|-------------|---------|
+| Two scalar columns | day-by-day comparison | Pearson / MI |
+| One series, $w$-day windows | redundancy within each window | Total correlation |
+| Two series, $w$-day patches | shared info between the two blocks | $I(X; Y)$ |
+
+**What you will produce:** rolling dependence curves and a picture of whether
+dependence is stable or regime-switching.
+
+---
+
+## Setup
+
+```{python}
+R = datasets.load_returns()
+META = datasets.load_basket_meta()
+label = dict(zip(META["ticker"], META["label"]))
+```
+
+---
+
+## 1 · Rolling Pearson — A Baseline
+
+Dependence changes over time.  Start with the simplest diagnostic.
+
+```{python}
+#| label: fig-rolling-pearson
+#| fig-cap: "60-day rolling Pearson correlation between JPM and BAC. Dependence is not constant."
+window = 60
+r_roll = R["JPM"].rolling(window).corr(R["BAC"]).dropna()
+
+fig, ax = plt.subplots(figsize=(12, 3.8))
+ax.plot(r_roll.index, r_roll.values, color=COOL, lw=1.2)
+ax.axhline(r_roll.mean(), color=INK, lw=1, ls="--",
+           label=f"mean = {r_roll.mean():.3f}")
+ax.set_title("60-day rolling Pearson: JPM / BAC", fontsize=12)
+ax.set_ylabel("Pearson r"); ax.set_xlabel("")
+ax.legend(frameon=False)
+despine(ax)
+plt.tight_layout()
+plt.show()
+```
+
+---
+
+## 2 · Windowed MI — Does the Tail Co-Move?
+
+Rolling Pearson misses non-linear time-varying dependence.  Chunked MI does
+not.  For each 60-day window, compute MI from the joint histogram.
+
+```{python}
+def mi_histogram_bits(x, y, bins=12):
+    H, _, _ = np.histogram2d(x, y, bins=bins)
+    return mutual_information_bits(H)
+
+x = R["JPM"].values
+y = R["BAC"].values
+
+win = 60
+idx = R.index[win - 1:]
+mi_roll = []
+for i in range(len(x) - win + 1):
+    xi, yi = x[i:i+win], y[i:i+win]
+    mi_roll.append(mi_histogram_bits(xi, yi))
+
+mi_roll = np.array(mi_roll)
+```
+
+```{python}
+#| label: fig-rolling-mi
+#| fig-cap: "60-day rolling MI (bits) vs rolling Pearson. Spikes in MI not matched by Pearson signal non-linear co-movement."
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 6), sharex=True)
+
+ax1.plot(idx, mi_roll, color=WARM, lw=1.2)
+ax1.set_ylabel("MI  (bits)")
+ax1.set_title("Rolling MI: JPM / BAC — spikes = tail co-movement", fontsize=12)
+despine(ax1)
+
+r_roll_aligned = R["JPM"].rolling(win).corr(R["BAC"]).values[win-1:]
+ax2.plot(idx, r_roll_aligned, color=COOL, lw=1.2)
+ax2.set_ylabel("Pearson r"); ax2.set_xlabel("")
+ax2.set_title("Rolling Pearson (same window)", fontsize=12)
+despine(ax2)
+
+fig.tight_layout()
+plt.show()
+```
+
+---
+
+## 3 · Multi-Variate: Total Correlation of the Full Basket
+
+Total correlation $T(\mathbf{X})$ extends MI to many variables at once:
+
+$$
+T(X_1,\ldots,X_d) = \sum_i H(X_i) - H(X_1,\ldots,X_d)
+$$
+
+It measures the redundancy shared across the *whole* basket.  We approximate
+it by summing pairwise MIs (a lower bound, not exact).
+
+```{python}
+import itertools
+
+tickers = list(R.columns)
+sector = dict(zip(META["ticker"], META["sector"]))
+
+# Pairwise MI matrix
+n_t = len(tickers)
+MI_mat = np.zeros((n_t, n_t))
+for i, a in enumerate(tickers):
+    for j, b in enumerate(tickers):
+        if i < j:
+            mi = mi_histogram_bits(R[a].values, R[b].values)
+            MI_mat[i, j] = MI_mat[j, i] = mi
+
+# Approximate total correlation: sum of upper triangle
+tc_approx = MI_mat[np.triu_indices(n_t, k=1)].sum()
+print(f"Approx total correlation (pairwise sum): {tc_approx:.2f} bits")
+print(f"Average pairwise MI:                     {tc_approx / (n_t*(n_t-1)/2):.3f} bits")
+```
+
+```{python}
+#| label: fig-mi-heatmap
+#| fig-cap: "Pairwise MI heatmap for the full basket. Within-sector blocks stand out."
+labs = [label.get(t, t) for t in tickers]
+fig, ax = plt.subplots(figsize=(9, 7))
+im = ax.imshow(MI_mat, cmap="YlOrRd", aspect="auto")
+ax.set_xticks(range(n_t)); ax.set_xticklabels(labs, rotation=45, ha="right", fontsize=9)
+ax.set_yticks(range(n_t)); ax.set_yticklabels(labs, fontsize=9)
+plt.colorbar(im, ax=ax, label="MI (bits)")
+ax.set_title("Pairwise mutual information — 14-stock basket", fontsize=12)
+plt.tight_layout()
+plt.show()
+```
+
+---
+
+## 4 · Your Turn — Does Windowed MI Add Information?
+
+1. Find a window length (try 30, 60, 120 days) where rolling MI and rolling
+   Pearson *disagree* most strongly.  What was happening in the market at
+   that time?
+
+2. Which sector block in the heatmap has the highest average pairwise MI?
+   Does this match your intuition?
+
+3. Is the approximate total correlation higher in 2008–2009 than in
+   calmer periods?  (Hint: compute `MI_mat` on the first 500 and last 500
+   rows of `R` separately.)

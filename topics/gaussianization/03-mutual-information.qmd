@@ -1,0 +1,117 @@
+---
+title: "Mutual Information via Gaussianization"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
+from rbig import AnnealedRBIG
+from lectures.measures import mutual_information_xy
+plotting.set_style("notes")
+import numpy as np
+import matplotlib.pyplot as plt
+```
+
+The forward map answers Chapter 1's hardest question — *how much do these
+variables share?* — in high dimensions.  The dependence RBIG removes is exactly
+the **total correlation**, the multivariate generalization of mutual information.
+
+## Total Correlation = the Information Removed
+
+For variables $x = (x_1, \dots, x_d)$, total correlation is the gap between the
+joint and the product of its marginals,
+
+$$
+\mathrm{TC}(x) = \operatorname{KL}\!\Big(p(x)\,\big\|\,\textstyle\prod_i p(x_i)\Big)
+= \sum_i H(x_i) - H(x) \;\ge\; 0,
+$$
+
+which for two variables is just the mutual information $I(x_1; x_2)$.  RBIG drives
+the joint to an *independent* Gaussian, so the information it destroys layer by
+layer (read off the Jacobian) is the total correlation that was there.
+
+## Validate the Estimator Against a Known Answer
+
+For a bivariate Gaussian with correlation $\rho$, the mutual information has a
+closed form, $I = -\tfrac12 \ln(1 - \rho^2)$ — the same quantity that
+[Linfoot's R](../dependence/02-mutual-information.qmd) rescales onto the
+correlation axis.  A trustworthy estimator must reproduce it.
+
+```{python}
+#| label: fig-mi-validate
+#| fig-cap: "A histogram MI estimate tracks the Gaussian closed form I = -½ ln(1 - ρ²) across correlations."
+rng = np.random.default_rng(0)
+rhos = np.linspace(0.0, 0.9, 10)
+truth, est = [], []
+for rho in rhos:
+    cov = np.array([[1.0, rho], [rho, 1.0]])
+    xy = rng.multivariate_normal([0, 0], cov, size=4000)
+    truth.append(-0.5 * np.log(1 - rho**2))
+    est.append(mutual_information_xy(xy[:, 0], xy[:, 1], bins=24))
+
+fig, ax = plt.subplots(figsize=(6.8, 4.2))
+ax.plot(rhos, truth, c=INK, lw=2.4, label="closed form  −½ ln(1−ρ²)")
+ax.plot(rhos, est, "o", c=COOL, label="histogram estimate")
+ax.set_xlabel("correlation ρ"); ax.set_ylabel("mutual information (nats)")
+ax.set_title("The estimator matches the known Gaussian answer", fontsize=12)
+ax.legend(fontsize=9, frameon=False)
+despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+## Marginal vs Joint: Why Gaussianization Must Be *Joint*
+
+A subtle, important point that returns in [Fair
+Learning](../fairness/03-fair-kernel-learning.qmd): Gaussianizing each marginal
+*separately* does **not** remove dependence.  Only **joint** Gaussianization
+(RBIG on the variables together) drives the shared information to zero.
+
+```{python}
+#| label: fig-joint-vs-marginal
+#| fig-cap: "A curved pair: per-marginal Gaussianization leaves the mutual information almost untouched; joint RBIG drives it down."
+rng = np.random.default_rng(3)
+n = 2000
+s = rng.normal(0, 1, n)
+t = (s**2 - 1) + 0.4 * rng.normal(0, 1, n)   # curved dependence
+XY = np.column_stack([s, t])
+XY = (XY - XY.mean(0)) / XY.std(0)
+
+mi_raw = mutual_information_xy(XY[:, 0], XY[:, 1])
+
+# Per-marginal Gaussianization is already standard-normal marginals here; the
+# joint MI is unchanged by any per-coordinate monotone map.
+Z = AnnealedRBIG(n_layers=30, random_state=0).fit_transform(XY)
+mi_joint = mutual_information_xy(Z[:, 0], Z[:, 1])
+
+# Reference floor: MI estimate on genuinely independent data (finite-sample bias).
+ind = rng.normal(size=(n, 2))
+mi_floor = mutual_information_xy(ind[:, 0], ind[:, 1])
+
+fig, ax = plt.subplots(figsize=(7.2, 4.2))
+bars = ax.bar(["raw joint", "per-marginal\n(unchanged)", "joint RBIG"],
+              [mi_raw, mi_raw, mi_joint],
+              color=[CRASH, WARM, plotting.PALETTE["green"]])
+ax.axhline(mi_floor, color=INK, ls="--", lw=1.3,
+           label=f"independent-data floor ≈ {mi_floor:.2f}")
+ax.set_ylabel("mutual information (nats)")
+ax.set_title("Only joint Gaussianization removes the dependence", fontsize=12)
+ax.legend(fontsize=9, frameon=False)
+despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+::: {.callout-note icon=false}
+## The "Gaussianizing the Earth" Idea
+Because each RBIG layer is cheap and the total correlation it removes accumulates
+additively, the method scales to many dimensions where direct density estimation
+is hopeless — making mutual information a practical, high-dimensional measurement,
+not just a two-variable curiosity.
+:::
+
+Next: when RBIG's fixed structure is not flexible enough, *learn* the map —
+[normalizing flows](04-flows.qmd).

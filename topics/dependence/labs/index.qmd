@@ -1,0 +1,40 @@
+---
+title: "L1 Labs — Measuring Dependence"
+---
+
+Six hands-on notebooks organised in two parallel tracks.
+
+## Learn-the-Tool Track
+
+Work through the measures in isolation, on controlled synthetic data where you
+know the right answer, before touching real returns.
+
+| Lab | Topic |
+|-----|-------|
+| [Tool 1 — The ladder](lab-tool1-ladder.qmd) | Pearson · Spearman · distance correlation |
+| [Tool 2 — Information measures](lab-tool2-information.qmd) | Mutual information in bits · validating estimators |
+| [Tool 3 — Windows](lab-tool3-windows.qmd) | Scalar → vector → block; total correlation |
+
+## Do-the-Job Track
+
+Task-shaped deliverables on real S&P 500 data (the 14-stock basket).
+
+| Lab | Deliverable |
+|-----|-------------|
+| [Job A — Validate your tools](lab-jobA-validate.qmd) | Calibration sheet: every measure against a known answer |
+| [Job B — The measure book](lab-jobB-measure-book.qmd) | Full pairwise dependence report for the basket |
+| [Job C — Hidden risk](lab-jobC-hidden-risk.qmd) | Tail co-crash detection: the dependence that threatens a portfolio |
+
+## Shared Setup
+
+All labs load real data the same way:
+
+```python
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import datasets, measures, plotting
+from lectures.plotting import COOL, WARM, CRASH, INK, despine, annotate_box
+
+R = datasets.load_returns()     # 14-stock daily returns DataFrame
+META = datasets.load_basket_meta()
+```

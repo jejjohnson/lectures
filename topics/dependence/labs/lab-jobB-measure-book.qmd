@@ -1,0 +1,171 @@
+---
+title: "Job B — The Measure Book"
+subtitle: "Full pairwise dependence report for the 14-stock basket"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
+from lectures.measures import (distance_correlation, mutual_information_bits,
+                               linfoot_r, nats_to_bits, measure_trio)
+plotting.set_style("notes")
+import numpy as np, matplotlib.pyplot as plt
+from scipy.stats import pearsonr, spearmanr
+import itertools
+```
+
+*Do-the-job track · deliverable.*
+
+A risk manager's first question: "what is the dependence structure of our book?"
+This job produces that answer — a systematic, honest, multi-measure report for
+every pair in the basket.
+
+**Deliverable:** a ranked pairwise dependence table, a heatmap, and a written
+interpretation of the three most interesting pairs.
+
+---
+
+## Setup
+
+```{python}
+R = datasets.load_returns()
+META = datasets.load_basket_meta()
+label = dict(zip(META["ticker"], META["label"]))
+sector = dict(zip(META["ticker"], META["sector"]))
+tickers = list(R.columns)
+print(f"Book: {len(tickers)} stocks, {len(R)} trading days")
+print(f"Sectors: {sorted(set(sector.values()))}")
+```
+
+---
+
+## 1 · Compute the Full Measure Table
+
+```{python}
+def mi_hist(x, y, bins=25):
+    H, _, _ = np.histogram2d(x, y, bins=bins)
+    return mutual_information_bits(H)
+
+rows = []
+for a, b in itertools.combinations(tickers, 2):
+    x, y = R[a].values, R[b].values
+    t = measure_trio(x, y)
+    mi = mi_hist(x, y)
+    mi_nats = mi / np.log2(np.e)
+    R_lf = linfoot_r(mi_nats)
+    same_sec = sector.get(a) == sector.get(b)
+    rows.append(dict(
+        pair=f"{a}/{b}",
+        pair_label=f"{label.get(a,a)} / {label.get(b,b)}",
+        sector_a=sector.get(a, "?"),
+        sector_b=sector.get(b, "?"),
+        same_sector=same_sec,
+        pearson=t["pearson"],
+        spearman=t["spearman"],
+        distance=t["distance"],
+        mi_bits=mi,
+        linfoot_R=R_lf,
+        excess_mi=mi - nats_to_bits(-0.5 * np.log(1 - t["pearson"]**2)),
+    ))
+
+rows.sort(key=lambda r: r["mi_bits"], reverse=True)
+print(f"{'Pair':<12s}  {'Pearson':>8s}  {'Spearman':>9s}  {'distance':>9s}  {'MI(bits)':>9s}  {'excess':>8s}")
+print("-" * 68)
+for r in rows[:12]:
+    print(f"  {r['pair']:<10s}  {r['pearson']:+8.3f}  {r['spearman']:+9.3f}  "
+          f"{r['distance']:9.3f}  {r['mi_bits']:9.3f}  {r['excess_mi']:+8.3f}")
+```
+
+---
+
+## 2 · Heatmaps — Pearson Vs. MI Side by Side
+
+```{python}
+#| label: fig-heatmaps
+#| fig-cap: "Pearson (left) and MI in bits (right). Within-sector blocks are visible in both; the MI map reveals additional non-Gaussian structure."
+n = len(tickers)
+P_mat = np.zeros((n, n))
+MI_mat = np.zeros((n, n))
+
+for i, a in enumerate(tickers):
+    for j, b in enumerate(tickers):
+        if i == j:
+            P_mat[i, j] = 1.0
+            MI_mat[i, j] = 0.0
+        elif i < j:
+            x, y = R[a].values, R[b].values
+            P_mat[i, j] = P_mat[j, i] = pearsonr(x, y)[0]
+            MI_mat[i, j] = MI_mat[j, i] = mi_hist(x, y)
+
+labs = [label.get(t, t) for t in tickers]
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(15, 6))
+
+for ax, mat, title, cmap in [
+    (axL, P_mat,  "Pearson correlation", "RdBu_r"),
+    (axR, MI_mat, "Mutual information (bits)", "YlOrRd"),
+]:
+    v = np.abs(mat).max()
+    im = ax.imshow(mat, cmap=cmap, aspect="auto",
+                   vmin=-v if cmap == "RdBu_r" else 0, vmax=v)
+    ax.set_xticks(range(n)); ax.set_xticklabels(labs, rotation=45, ha="right", fontsize=9)
+    ax.set_yticks(range(n)); ax.set_yticklabels(labs, fontsize=9)
+    plt.colorbar(im, ax=ax)
+    ax.set_title(title, fontsize=12, fontweight="bold")
+
+fig.tight_layout()
+plt.show()
+```
+
+---
+
+## 3 · Sector Summary
+
+```{python}
+#| label: tbl-sector
+#| tbl-cap: "Average MI (bits) within vs. across sectors."
+within, across = [], []
+for r in rows:
+    (within if r["same_sector"] else across).append(r["mi_bits"])
+
+print(f"Within-sector pairs:  n={len(within):3d}  avg MI = {np.mean(within):.3f} bits")
+print(f"Cross-sector pairs:   n={len(across):3d}  avg MI = {np.mean(across):.3f} bits")
+print(f"Ratio: {np.mean(within)/np.mean(across):.2f}×")
+```
+
+---
+
+## 4 · Written Interpretation (Fill In)
+
+Use the table and heatmap above to answer:
+
+**Top-3 most dependent pairs:**
+
+1. `____` / `____` — MI = `____` bits, excess = `____` bits.
+   *Interpretation:* (e.g. "same sector, strong factor loading, but the excess
+   MI signals tail co-crash beyond what Pearson implies")
+
+2. (fill in)
+
+3. (fill in)
+
+**Most surprising pair (large excess MI):**
+
+`____` / `____` — Pearson = `____`, Linfoot R = `____`.
+*Why the gap?* (e.g. "cross-sector pair with occasional co-crash driven by
+macro shocks")
+
+**Pairs safe to treat with Pearson:**
+
+(List pairs where $|P - S| < 0.03$ and excess MI $< 0.05$ bits — the ones
+where the cheap tool is fine.)
+
+::: {.callout-note}
+## Deliverable Format
+A real measure book would export this table as a PDF or spreadsheet with
+interpretive notes for each flagged pair.  The key discipline: *always cite
+your estimator and its limitations* (here: histogram MI, 25 bins, underestimates
+in the tails).
+:::

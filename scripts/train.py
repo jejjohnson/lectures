@@ -10,9 +10,9 @@ import hydra
 from hydra.utils import get_original_cwd
 from omegaconf import DictConfig
 
-from myproject.models.baseline import BaselineModel
-from myproject.trainers.trainer import Trainer
-from myproject.utils.reproducibility import seed_everything
+from lectures.models.baseline import BaselineModel
+from lectures.trainers.trainer import Trainer
+from lectures.utils.reproducibility import seed_everything
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="train")
