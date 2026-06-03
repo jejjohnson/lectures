@@ -1,0 +1,60 @@
+---
+title: "Gaussianization"
+---
+
+Turn messy, dependent data into a **standard Gaussian** — where every coordinate
+is independent and everything is easy — using a map that is **invertible**.  That
+single requirement is what makes Gaussianization the hinge of the whole course:
+run the map *forward* to measure and remove dependence, run it *backward* to
+generate it.
+
+::: {.callout-note icon=false}
+## The Spine — One Invertible Map, Both Directions
+
+$$
+\underbrace{z = T(x)}_{\text{forward: simplify}}
+\qquad\qquad
+\underbrace{x = T^{-1}(z)}_{\text{backward: generate}}
+$$
+
+Forward, $T$ Gaussianizes — and the distortion it needs is *exactly* the
+dependence in the data.  Backward, you draw an easy Gaussian sample and invert it
+to recover the real, dependent world.  Measuring (Ch. 1), removing (Ch. 4), and
+[propagating](../uncertainty/index.qmd) (Ch. 3) are three uses of this one map.
+:::
+
+## Why It Sits Here
+
+- **Change of variables** — $p_X(x) = p_Z(T(x))\,\lvert\det J_T\rvert$ — is the
+  same Jacobian rule that powers [Uncertainty](../uncertainty/index.qmd).
+- **MI estimation** — Gaussianizing makes mutual information and total
+  correlation tractable in high dimensions, the density road from
+  [Chapter 1](../dependence/index.qmd).
+- **Code:** [rbig](https://github.com/jejjohnson/rbig) (rotation-based iterative
+  Gaussianization) and [gauss_flows](https://github.com/jejjohnson/gauss_flows)
+  (normalizing flows).  This chapter's figures call the real `rbig` package
+  (`from rbig import AnnealedRBIG`) — it is NumPy/scikit-learn based, so it
+  renders without the heavy JAX/Keras libraries.
+
+## The Ladder
+
+| Rung | Idea | Tool |
+|------|------|------|
+| 1 | Change of variables & the Jacobian | the density-transformation rule |
+| 2 | Marginal Gaussianize + rotate, iterated | **RBIG** |
+| 3 | Read dependence as information removed | MI / total correlation via RBIG |
+| 4 | Learn the map directly | normalizing **flows** |
+
+## Pages in This Chapter
+
+1. **[Change of variables](01-change-of-variables.qmd)** — how a density
+   transforms under an invertible map, and the 1-D rank → Gaussian trick.
+2. **[RBIG](02-rbig.qmd)** — marginal Gaussianization plus rotation, iterated to
+   a spherical Gaussian; and run backward to sample.
+3. **[Mutual information via Gaussianization](03-mutual-information.qmd)** — the
+   dependence removed *is* the information shared; total correlation in nats.
+4. **[Normalizing flows](04-flows.qmd)** — learned, flexible Gaussianization when
+   RBIG's fixed structure is not enough.
+
+The hands-on [labs](labs/index.qmd) build the 1-D transform, the full RBIG loop,
+an MI estimator, and a generator on real returns.

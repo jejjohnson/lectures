@@ -1,0 +1,46 @@
+---
+title: "Fair Learning — Labs"
+---
+
+Six hands-on notebooks in two parallel tracks, mirroring the
+[dependence labs](../../dependence/labs/index.qmd).  The verb is **remove**: every
+lab is the objective $\text{loss} = \text{fit} + \mu\,\operatorname{Dep}(\hat y, S)$
+with a different $\operatorname{Dep}$ or a different real-world $S$.
+
+## Learn-the-Tool Track
+
+Build each removal method in isolation, on controlled synthetic data where you
+know the right answer, before touching real applications.
+
+| Lab | Topic |
+|-----|-------|
+| [Tool 1 — Drop & orthogonalize](lab-tool1-drop.qmd) | why dropping $S$ leaks; linear neutrality and its hole |
+| [Tool 2 — The CKA penalty](lab-tool2-cka-penalty.qmd) | close the hole; sweep $\mu$; read the frontier |
+| [Tool 2.5 — The Gaussianize-first trap](lab-tool2.5-gaussianize-first.qmd) | why only *conditional* Gaussianization buys fairness |
+| [Tool 3 — Adversarial removal](lab-tool3-adversarial.qmd) | the learned $\operatorname{Dep}$ and its instability |
+
+## Do-the-Job Track
+
+Task-shaped deliverables on real data.
+
+| Lab | Deliverable |
+|-----|-------------|
+| [Job A — Validate your tools](lab-jobA-validate.qmd) | calibration sheet: each method against a known answer |
+| [Job B — Neutralize a credit model](lab-jobB-neutralize-credit.qmd) | fairness on the Adult-shaped credit data |
+| [Job C — Beta-neutralize a strategy](lab-jobC-beta-neutral.qmd) | factor-neutrality on the real S&P basket |
+
+## Shared Setup
+
+Every lab starts with the same imports:
+
+```python
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.measures import cka_rbf, cka_linear
+from lectures.neutralize import fair_fit
+plotting.set_style("notes")
+```
+
+The do-the-job labs additionally load real data with
+`datasets.load_adult_like()` (Job B) and `datasets.load_returns()` (Job C).

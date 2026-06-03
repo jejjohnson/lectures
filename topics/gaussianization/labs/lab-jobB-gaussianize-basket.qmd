@@ -1,0 +1,92 @@
+---
+title: "Job B — Gaussianize the Basket"
+subtitle: "Normal-scores + pairwise MI on real returns"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
+from lectures.gaussianization import gaussianize_1d
+from lectures.measures import mutual_information_xy
+plotting.set_style("notes")
+import numpy as np, matplotlib.pyplot as plt
+import itertools
+```
+
+*Do-the-job track · Job B of 3.*
+
+::: {.callout-note appearance="simple" icon=false}
+**See the data first** — [From Raw Prices to a Clean
+Panel](../../data/01-downloading-and-parsing.qmd) shows where this 14-stock basket
+comes from and how prices became the log-returns we load here.
+:::
+
+Take the real 14-stock basket, Gaussianize each marginal, and rank every pair by
+mutual information.  The deliverable is an **MI ranking** that catches dependence
+correlation alone would miss.
+
+---
+
+## 1 · Load and Gaussianize the Marginals
+
+```{python}
+R = datasets.load_returns()
+META = datasets.load_basket_meta()
+label = dict(zip(META["ticker"], META["label"]))
+tickers = list(R.columns)
+
+G = {t: gaussianize_1d(R[t].to_numpy()) for t in tickers}   # normal scores
+print(f"{len(R)} days × {len(tickers)} stocks, marginals Gaussianized")
+print("example — JPM normal scores: mean "
+      f"{G['JPM'].mean():+.2f}, std {G['JPM'].std():.2f}")
+```
+
+## 2 · Rank Every Pair by Mutual Information
+
+```{python}
+rows = []
+for u, v in itertools.combinations(tickers, 2):
+    mi = mutual_information_xy(G[u], G[v], bins=16)
+    rho = np.corrcoef(R[u], R[v])[0, 1]
+    rows.append((f"{u}/{v}", rho, mi))
+rows.sort(key=lambda r: r[2], reverse=True)
+
+print(f"{'pair':<10}{'Pearson':>9}{'MI (nats)':>11}")
+print("-" * 30)
+for pair, rho, mi in rows[:10]:
+    print(f"{pair:<10}{rho:>+9.2f}{mi:>11.3f}")
+```
+
+```{python}
+#| label: fig-jobB-mi-vs-corr
+#| fig-cap: "MI vs Pearson across all basket pairs. Points above the trend share more information than their correlation implies — nonlinear / tail co-movement."
+rho = np.array([r[1] for r in rows])
+mi = np.array([r[2] for r in rows])
+fig, ax = plt.subplots(figsize=(7, 4.4))
+ax.scatter(np.abs(rho), mi, s=28, c=COOL, alpha=0.7, edgecolors="none")
+ax.set_xlabel("|Pearson correlation|"); ax.set_ylabel("mutual information (nats)")
+ax.set_title("Information shared vs linear correlation", fontsize=12)
+despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+::: {.callout-tip}
+## The Deliverable
+The MI ranking, plus the names that sit *above* the MI-vs-correlation trend: those
+pairs carry dependence beyond the straight line — the candidates for a tail-risk
+or non-linear study.
+:::
+
+---
+
+## Your Turn
+
+- Subtract the independent-shuffle MI floor from each pair to get a debiased MI.
+- Pick the most "above-trend" pair and scatter its normal scores: can you see the
+  non-linearity the correlation missed?
+
+Next: turn the map around and *generate* — [Job C, scenarios](lab-jobC-scenarios.qmd).

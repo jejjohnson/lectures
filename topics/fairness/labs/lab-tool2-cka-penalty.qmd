@@ -1,0 +1,104 @@
+---
+title: "Tool 2 — The CKA Penalty"
+subtitle: "Close the hole · sweep μ · read the frontier"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
+from lectures.measures import cka_rbf
+from lectures.neutralize import fair_fit
+plotting.set_style("notes")
+import numpy as np, matplotlib.pyplot as plt
+```
+
+*Learn-the-tool track · Lab 2 of 3.*
+
+The hero rung.  `fair_fit` minimizes $\text{loss} = \text{fit} +
+\mu\,\operatorname{Dep}(\hat y, S)$ with a kernel dependence penalty.  You will
+close the nonlinear hole, then sweep $\mu$ to trace the trade-off frontier.
+
+---
+
+## 1 · Close the Hole
+
+```{python}
+d = datasets.fair_regression(n=1000, seed=0)
+x, S, y = d["x"], d["s"], d["y"]
+
+y0 = fair_fit(x, y, S, mu=0.0)
+y8 = fair_fit(x, y, S, mu=8.0)
+
+print(f"plain (μ=0):   CKA={cka_rbf(y0, S):.3f}")
+print(f"CKA penalty:   CKA={cka_rbf(y8, S):.3f}   ← curve gone")
+```
+
+```{python}
+#| label: fig-tool2-closes
+#| fig-cap: "μ = 8 decouples the predictions from S."
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.2))
+axL.scatter(S, y0, s=10, c=COOL, alpha=0.5, edgecolors="none")
+axL.set_title(f"plain · CKA={cka_rbf(y0, S):.2f}", fontsize=11)
+despine(axL)
+axR.scatter(S, y8, s=10, c=plotting.PALETTE["green"], alpha=0.5,
+            edgecolors="none")
+axR.set_title(f"CKA penalty (μ=8) · CKA={cka_rbf(y8, S):.2f}", fontsize=11)
+despine(axR)
+for ax in (axL, axR):
+    ax.set_xlabel("S"); ax.set_ylabel("prediction")
+fig.tight_layout()
+plt.show()
+```
+
+---
+
+## 2 · Sweep Μ — The Frontier
+
+```{python}
+sweep = [0.0, 0.5, 1.0, 2.0, 5.0, 8.0, 20.0]
+print(f"{'μ':>6}  {'accuracy':>9}  {'CKA(ŷ,S)':>9}")
+print("-" * 28)
+acc, dep = [], []
+for mu in sweep:
+    p = fair_fit(x, y, S, mu=mu)
+    a = max(1 - np.mean((p - y) ** 2) / np.var(y), 0.0)
+    c = cka_rbf(p, S)
+    acc.append(a); dep.append(c)
+    print(f"{mu:>6g}  {a:>9.3f}  {c:>9.3f}")
+```
+
+```{python}
+#| label: fig-tool2-frontier
+#| fig-cap: "Accuracy vs neutrality. The elbow marks where neutrality starts to get expensive."
+fig, ax = plt.subplots(figsize=(7.5, 4.4))
+ax.plot(dep, acc, "-o", c=COOL, lw=2.2)
+for mu, dx, ay in zip(sweep, dep, acc):
+    ax.annotate(f"μ={mu:g}", (dx, ay), textcoords="offset points",
+                xytext=(6, 6), fontsize=9, color=INK)
+ax.set_xlabel("CKA(ŷ, S)  →  less neutral"); ax.set_ylabel("accuracy (R²)")
+ax.set_title("The accuracy–neutrality frontier", fontsize=12)
+despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+::: {.callout-tip}
+## What to Look for
+There is no single "fair model" — there is a curve.  Pick the smallest $\mu$
+that pushes CKA below your threshold; everything to its right buys neutrality you
+may not need at an accuracy cost you do pay.
+:::
+
+---
+
+## 3 · Your Turn
+
+- Find the $\mu$ that brings CKA below 0.05.  What accuracy do you keep?
+- Re-run with `datasets.fair_regression(seed=...)` for several seeds: how stable
+  is the elbow location?
+
+Next: [Tool 3 — adversarial removal](lab-tool3-adversarial.qmd), the learned
+alternative to a fixed kernel.

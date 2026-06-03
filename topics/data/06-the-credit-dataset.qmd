@@ -1,0 +1,145 @@
+---
+title: "The Credit & Fairness Dataset"
+subtitle: "Columns, the group gap, and the channels that leak"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, BAND, despine
+plotting.set_style("notes")
+import numpy as np, pandas as pd, matplotlib.pyplot as plt
+adult = datasets.load_adult_like()
+```
+
+The fairness module runs on a different dataset: a credit-style table with a
+**protected attribute**, a **target** to predict, and **proxy features** that
+quietly carry the protected attribute even after you drop it.  This page shows all
+three, plus how the table is generated and why it is synthetic.
+
+---
+
+## 1 · The Columns
+
+```{python}
+#| label: tbl-credit-head
+print(f"rows: {len(adult):,}")
+print(adult.head().to_string(index=False))
+```
+
+| Column | Role | Meaning |
+|---|---|---|
+| `sex` | **protected** | the attribute we must not discriminate on (1 = male) |
+| `income_high` | **target** | 1 if high income — what a model predicts |
+| `education_num`, `hours_per_week`, `occupation_prestige` | **proxies** | legitimate-looking features correlated with `sex` |
+| `age` | control | a feature roughly *un*correlated with `sex` |
+
+## 2 · The Group Gap
+
+The whole problem in one chart: high-income rates differ by group.  This gap is
+real in the data and is what a fairness method must *not* simply reproduce.
+
+```{python}
+#| label: fig-gap
+#| fig-cap: "Left: overall marginals — the sample is ~67% male and ~46% high-income. Right: the high-income rate splits by sex, 54% vs 30%. That 24-point group gap is the dependence between the target and the protected attribute."
+p_male = adult.sex.mean()
+p_high = adult.income_high.mean()
+g_male = adult[adult.sex == 1].income_high.mean()
+g_female = adult[adult.sex == 0].income_high.mean()
+
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.0))
+axL.bar(["male", "high-income"], [p_male, p_high], color=[COOL, BAND])
+axL.set_ylim(0, 1); axL.set_ylabel("fraction of sample")
+axL.set_title("Overall marginals", fontsize=12); despine(axL)
+for i, v in enumerate([p_male, p_high]):
+    axL.text(i, v + 0.02, f"{v:.0%}", ha="center", fontsize=10)
+
+axR.bar(["female", "male"], [g_female, g_male], color=[WARM, COOL])
+axR.set_ylim(0, 1); axR.set_ylabel("P(high income)")
+axR.set_title(f"The group gap: {g_male - g_female:+.0%}", fontsize=12)
+despine(axR)
+for i, v in enumerate([g_female, g_male]):
+    axR.text(i, v + 0.02, f"{v:.0%}", ha="center", fontsize=10)
+fig.tight_layout(); plt.show()
+```
+
+## 3 · The Leakage Channels
+
+Now the subtle part.  Even if you **drop** `sex` from the model, the proxy features
+are correlated with it — so the model can reconstruct it and the gap leaks back in.
+Here is each feature's correlation with `sex`.
+
+```{python}
+#| label: fig-proxies
+#| fig-cap: "Correlation of each feature with the protected attribute. Education, hours, and occupation prestige all correlate ~0.3-0.4 with sex; age is ~0. Dropping sex does nothing about these channels — which is the entire point of the fairness chapter."
+feats = ["age", "education_num", "hours_per_week", "occupation_prestige"]
+corrs = pd.Series({c: adult[c].corr(adult.sex) for c in feats}).sort_values()
+colors = [plotting.PALETTE["green"] if abs(v) < 0.1 else CRASH
+          for v in corrs.values]
+fig, ax = plt.subplots(figsize=(8.4, 3.6))
+ax.barh(corrs.index, corrs.values, color=colors)
+ax.axvline(0, color=INK, lw=0.8)
+ax.set_xlabel("correlation with sex")
+ax.set_title("Proxies carry the protected attribute", fontsize=12)
+despine(ax); fig.tight_layout(); plt.show()
+```
+
+The strongest channel, `occupation_prestige`, leaks visibly: its distribution
+shifts between groups, so a model leaning on it partly *is* using `sex`.
+
+```{python}
+#| label: fig-proxy-shift
+#| fig-cap: "Occupation-prestige distribution by group. The male distribution (blue) sits to the right of the female one (orange); their means differ. A model that scores on prestige inherits part of the sex gap for free."
+fig, ax = plt.subplots(figsize=(8.4, 4.0))
+for g, col, name in [(0, WARM, "female"), (1, COOL, "male")]:
+    v = adult.loc[adult.sex == g, "occupation_prestige"]
+    ax.hist(v, bins=40, density=True, alpha=0.55, color=col, label=name)
+    ax.axvline(v.mean(), color=col, lw=2, ls="--")
+ax.set_xlabel("occupation prestige"); ax.set_ylabel("density")
+ax.set_title("A proxy that shifts by group", fontsize=12)
+ax.legend(fontsize=9, frameon=False); despine(ax)
+fig.tight_layout(); plt.show()
+```
+
+## 4 · How It's Generated (and Why It's Synthetic)
+
+Real Adult-census mirrors (OpenML/UCI) are network-blocked in this environment, so
+the table is **synthesised** by [`scripts/make_credit_data.py`](../../scripts/make_credit_data.py)
+to reproduce the *structure* that matters — a target that depends on `sex` both
+directly and through correlated proxies.  The core is a latent logistic model:
+
+```python
+# scripts/make_credit_data.py (excerpt)
+sex          = rng.binomial(1, 0.67, n)                 # 1 = male
+education    = clip(normal(10, 2.5) + 1.6 * sex, 1, 16) # proxy: leaks sex
+hours        = clip(normal(36, 11)  + 7   * sex, 1, 99) # proxy: leaks sex
+occ_prestige = clip(normal(0.40, 0.18) + 0.16 * sex, 0, 1)
+z = (-7.5 + 0.04*age + 0.28*education + 0.03*hours
+     + 2.0*occ_prestige + 0.5*sex + noise)              # +0.5*sex = direct unfairness
+income_high  = (rng.random(n) < sigmoid(z))
+```
+
+::: {.callout-note icon=false}
+## Synthetic, but Honest About It
+This is **not** the real Adult data and should not be cited as such.  It is a
+faithful *stand-in*: male-skewed, with a real group gap and genuine proxy leakage,
+so every fairness method behaves as it would on the real thing.  The numbers above
+are deterministic for the committed seed.
+:::
+
+::: {.callout-tip}
+## The Deliverable This Sets Up
+The [fairness](../fairness/index.qmd) chapter trains a scorecard on the proxies
+*with `sex` dropped*, shows the gap leaks anyway, then neutralises it — reporting
+the gap before and after.  Every number it quotes traces back to this table.
+:::
+
+---
+
+## Where This Goes Next
+
+That completes the data tour.  Pick a verb and go: measure dependence in the
+[dependence](../dependence/index.qmd) chapter, or remove it in
+[fair learning](../fairness/index.qmd).

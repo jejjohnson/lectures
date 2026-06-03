@@ -27,7 +27,7 @@ research_template/
 ├── notebooks/        # Jupytext percent-format .py scripts (no .ipynb in repo)
 ├── results/          # Experiment results (managed by DVC)
 ├── scripts/          # Entry point scripts
-├── src/myproject/    # Source package
+├── src/lectures/    # Source package
 └── tests/            # Test suite
 ```
 

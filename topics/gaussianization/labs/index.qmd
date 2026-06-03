@@ -1,0 +1,37 @@
+---
+title: "Gaussianization — Labs"
+---
+
+Six hands-on notebooks in two tracks, mirroring the
+[dependence labs](../../dependence/labs/index.qmd).  The verb is **simplify**:
+build the invertible map, run it forward to measure and backward to generate.
+
+## Learn-the-Tool Track
+
+| Lab | Topic |
+|-----|-------|
+| [Tool 1 — The 1-D transform](lab-tool1-change-of-variables.qmd) | rank → Gaussian; invertibility by hand |
+| [Tool 2 — RBIG forward & backward](lab-tool2-rbig.qmd) | marginal + rotation, iterated; sampling |
+| [Tool 3 — MI by Gaussianization](lab-tool3-mutual-information.qmd) | estimate mutual information; validate it |
+
+## Do-the-Job Track
+
+| Lab | Deliverable |
+|-----|-------------|
+| [Job A — Validate the estimator](lab-jobA-validate.qmd) | calibration vs the Gaussian closed form |
+| [Job B — Gaussianize the basket](lab-jobB-gaussianize-basket.qmd) | normal-scores + pairwise MI on real returns |
+| [Job C — Generate scenarios](lab-jobC-scenarios.qmd) | RBIG backward to sample joint return scenarios |
+
+## Shared Setup
+
+```python
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.gaussianization import gaussianize_1d
+from rbig import AnnealedRBIG
+from lectures.measures import mutual_information_xy, cocrash_fraction
+plotting.set_style("notes")
+```
+
+The do-the-job labs load real returns with `datasets.load_returns()`.

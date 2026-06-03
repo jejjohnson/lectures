@@ -1,0 +1,17 @@
+---
+title: "From Dependence to Causality"
+---
+
+> **Status:** outline — to be filled out next.
+
+Correlation (and even dependence) does not imply causation. This section covers what it
+takes to put *arrows* on the graph.
+
+## Outline
+
+- **Conditional dependence** — removing edges in a graph; the chi-square test.
+- **Hypothesis testing** — null vs. alternative, p-values, and the classic trap
+  $P(\text{obs}\mid H) \neq P(H\mid\text{obs})$.
+- **Directional measures** — directed information; Granger causality from temporal
+  regression; causality-from-residuals under additive-noise models ($y=f(x)+n$ vs.
+  $x=f(y)+n$).

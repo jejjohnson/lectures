@@ -1,0 +1,106 @@
+---
+title: "Job A — Validate Your Tools"
+subtitle: "A calibration sheet for every removal method"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
+from lectures.measures import cka_rbf, cka_linear
+from lectures.neutralize import fair_fit
+plotting.set_style("notes")
+import numpy as np, matplotlib.pyplot as plt
+from scipy.stats import pearsonr
+```
+
+*Do-the-job track · Job A of 3.*
+
+Before trusting a method on data where you *don't* know the answer, calibrate it
+on data where you do.  The deliverable is a **calibration sheet**: each method
+versus the dependence it is supposed to remove, with a pass/fail you can defend.
+
+---
+
+## The Known Case
+
+A target with a *known* linear-plus-curved dependence on $S$, so we know exactly
+what each method should and should not remove.
+
+```{python}
+d = datasets.fair_regression(n=1200, seed=7)
+x, S, y = d["x"], d["s"], d["y"]
+# Ground truth: y = 0.6 x + 0.7 S + 0.7 (S^2 - 1) + noise
+print("target depends on S linearly (0.7 S) AND curvily (0.7 (S^2-1))")
+```
+
+## The Calibration Sheet
+
+```{python}
+#| label: tbl-calibration
+def metrics(pred):
+    acc = max(1 - np.mean((pred - y) ** 2) / np.var(y), 0.0)
+    return pearsonr(pred, S)[0], cka_linear(pred, S), cka_rbf(pred, S), acc
+
+# Plain baseline.
+Phi = np.column_stack([np.ones(len(x)), x, S, S**2 - 1])
+theta, *_ = np.linalg.lstsq(Phi, y, rcond=None)
+plain = Phi @ theta
+
+# Linear removal.
+b = np.cov(plain, S)[0, 1] / np.var(S)
+lin = plain - b * S
+
+# CKA penalty.
+cka_neut = fair_fit(x, y, S, mu=8.0)
+
+rows = [("plain (uses S)", plain), ("linear removal", lin),
+        ("CKA penalty (μ=8)", cka_neut)]
+print(f"{'method':<20}{'Pearson':>9}{'CKA_lin':>9}{'CKA_rbf':>9}{'acc':>7}")
+print("-" * 54)
+for name, p in rows:
+    pe, cl, cr, ac = metrics(p)
+    print(f"{name:<20}{pe:>+9.3f}{cl:>9.3f}{cr:>9.3f}{ac:>7.3f}")
+```
+
+The numbers are easier to trust once you see the predictions against $S$:
+
+```{python}
+#| label: fig-jobA-shapes
+#| fig-cap: "Predictions vs S for each method. The plain model and the linear-removal residual still bend with S (CKA_rbf high); only the CKA penalty flattens the curve."
+fig, axes = plt.subplots(1, 3, figsize=(12, 3.8), sharey=True)
+cols = [COOL, CRASH, plotting.PALETTE["green"]]
+for ax, (name, p), col in zip(axes, rows, cols):
+    ax.scatter(S, p, s=8, c=col, alpha=0.3, edgecolors="none")
+    ax.set_title(f"{name}\nCKA_rbf = {cka_rbf(p, S):.2f}", fontsize=11)
+    ax.set_xlabel("sensitive S"); ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+axes[0].set_ylabel("prediction")
+fig.tight_layout()
+plt.show()
+```
+
+::: {.callout-tip}
+## How to Read It (the Pass/Fail)
+- **plain** — high on every measure: it is using $S$. ✗ (the thing to fix)
+- **linear removal** — Pearson and `CKA_lin` near 0, but `CKA_rbf` still high:
+  it removed the line, **left the curve**. ✗ for nonlinear dependence.
+- **CKA penalty** — all three near 0: line *and* curve gone. ✓
+:::
+
+A method "passes" only on the dependence shape it is built for.  Linear removal
+is not broken — it is *correctly* blind to curves, which is exactly why you must
+know your $S$'s shape before choosing a tool.
+
+---
+
+## Your Turn
+
+- Swap the curved term for a purely linear one ($y = 0.6x + S + \varepsilon$).
+  Now linear removal should pass `CKA_rbf` too — confirm it.
+- Add a third method row using `fair_fit(..., mu=1.0)` and place it on the
+  frontier between "linear removal" and "CKA penalty (μ=8)".
+
+Next: a real application — [Job B, a credit
+model](lab-jobB-neutralize-credit.qmd).

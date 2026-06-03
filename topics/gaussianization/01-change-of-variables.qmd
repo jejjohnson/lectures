@@ -1,0 +1,114 @@
+---
+title: "Change of Variables"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting
+from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
+from lectures.gaussianization import gaussianize_1d
+plotting.set_style("notes")
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import norm
+```
+
+## The One Formula
+
+Everything in this chapter rests on a single rule for how a probability density
+changes when you push it through an invertible map.  It relates the density in the
+data world to the density in the simple (Gaussian) world through one correction
+factor — the Jacobian determinant — and it is what lets us move between the two
+worlds without losing or inventing any probability.
+
+If $z = T(x)$ is an **invertible** map and $z$ has density $p_Z$, then $x$ has
+density
+
+$$
+p_X(x) = p_Z\big(T(x)\big)\,\left|\det \frac{\partial T}{\partial x}\right|.
+$$
+
+The Jacobian determinant is a *volume* correction: it accounts for how much $T$
+stretches or squeezes space at $x$.  This single equation is the engine of the
+course.
+
+::: {.callout-note icon=false}
+## What the Two Directions Mean
+
+- **Forward** ($z = T(x)$, Gaussianize): the Jacobian tells you how much $T$ had
+  to distort space to make $x$ look standard-normal — and that distortion *is* the
+  dependence (made precise as [total correlation](03-mutual-information.qmd)).
+- **Backward** ($x = T^{-1}(z)$): the formula is a sampling recipe — draw
+  $z \sim \mathcal N(0, I)$ and apply $T^{-1}$ to get a sample of $x$.  This is
+  the generative direction used in [Uncertainty](../uncertainty/index.qmd).
+:::
+
+## The 1-D Building Block: Rank → Gaussian
+
+The simplest non-trivial $T$ makes a *single* variable Gaussian.  Send each value
+through its own empirical CDF $\hat F$ (which maps any distribution to a uniform),
+then through the inverse Gaussian CDF $\Phi^{-1}$:
+
+$$
+T(x) = \Phi^{-1}\big(\hat F(x)\big).
+$$
+
+This is monotone, hence invertible, so it carries no information away — it only
+*reshapes the marginal*.  Cross-dependence between variables is untouched (that is
+what [rotation](02-rbig.qmd) is for).
+
+```{python}
+#| label: fig-gaussianize-1d
+#| fig-cap: "A skewed (exponential) variable, before and after the rank → Gaussian transform. The shape becomes a standard normal; the ordering of points is preserved."
+rng = np.random.default_rng(0)
+v = rng.exponential(size=4000)
+g = gaussianize_1d(v)
+
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.0))
+axL.hist(v, bins=40, color=WARM, alpha=0.8, density=True)
+axL.set_title("before:  heavy-skewed", fontsize=12)
+axL.set_xlabel("x"); axL.set_ylabel("density")
+despine(axL)
+
+grid = np.linspace(-4, 4, 200)
+axR.hist(g, bins=40, color=COOL, alpha=0.8, density=True)
+axR.plot(grid, norm.pdf(grid), c=INK, lw=2, label="standard normal")
+axR.set_title("after:  T(x) = Φ⁻¹(F̂(x))", fontsize=12)
+axR.set_xlabel("z"); axR.legend(fontsize=9, frameon=False)
+despine(axR)
+
+fig.tight_layout()
+plt.show()
+```
+
+## Why Invertibility Is the Whole Point
+
+A lossy transform (say, thresholding) cannot be undone, so you can never get back
+to the data — no sampling, no exact likelihood.  An *invertible* $T$ keeps a
+perfect dictionary between the two worlds.  Anything easy in Gaussian space
+(independent coordinates, closed-form densities) can be pulled back to the data
+exactly.
+
+```{python}
+#| label: fig-monotone-map
+#| fig-cap: "The 1-D map is monotone: it relabels the axis without reordering points, so it is exactly invertible."
+order = np.argsort(v)
+fig, ax = plt.subplots(figsize=(6.5, 4.0))
+ax.plot(v[order], g[order], c=COOL, lw=2.5)
+ax.set_xlabel("x  (data value)"); ax.set_ylabel("z = T(x)  (Gaussian value)")
+ax.set_title("A monotone, invertible relabelling", fontsize=12)
+annotate_box(ax, 0.5, -0.12, "rank preserved  ⇒  no information lost")
+despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+::: {.eli5}
+**One-liner.**  Change of variables is a currency exchange between probability
+worlds; the Jacobian is the exchange rate.  Make the rate invertible and you can
+always convert back.
+:::
+
+Next: stack this 1-D move with rotations to Gaussianize the *joint* — [RBIG](02-rbig.qmd).

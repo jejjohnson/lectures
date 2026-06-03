@@ -1,0 +1,128 @@
+---
+title: "Returns, Volatility & Fat Tails"
+subtitle: "How big is a typical day — and how big are the strange ones?"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, BAND, despine
+plotting.set_style("notes")
+import numpy as np, matplotlib.pyplot as plt
+from scipy.stats import norm, kurtosis
+R = datasets.load_returns()
+```
+
+A **return** is a single number per day: roughly the percent the stock moved.
+Most days are small; a few are wild.  This page measures both — the everyday
+wobble (**volatility**) and the surprisingly frequent extremes (**fat tails**) —
+straight from the basket.
+
+---
+
+## 1 · What a Return Looks Like
+
+Here is one bank's daily return, day by day.  It hovers near zero with bursts of
+turbulence — calm stretches punctuated by clusters of big moves.  The shaded
+bands mark **high-volatility windows** (where the 21-day rolling standard
+deviation is in its top fifth).
+
+```{python}
+#| label: fig-return-series
+#| fig-cap: "JPM daily log-returns over five years. Most days sit in a thin zero-centred band; volatility arrives in clusters (shaded), not evenly. The cluster in early 2016 and the spike in early 2018 are the turbulent episodes the later pages name."
+r = R["JPM"]
+roll = r.rolling(21).std()
+hi = roll > roll.quantile(0.80)            # high-volatility days
+fig, ax = plt.subplots(figsize=(9, 4.2))
+ax.plot(r.index, r, color=COOL, lw=0.6)
+ax.fill_between(r.index, r.min(), r.max(), where=hi.fillna(False),
+                color=CRASH, alpha=0.12, label="high-volatility window")
+ax.axhline(0, color=INK, lw=0.7)
+ax.set_ylabel("JPM daily log-return"); ax.set_xlabel("date")
+ax.set_title("Returns wobble — and the wobble clusters", fontsize=12)
+ax.legend(fontsize=9, frameon=False, loc="lower left")
+despine(ax); fig.tight_layout(); plt.show()
+```
+
+::: {.callout-note icon=false}
+## Volatility = the Size of the Wobble
+**Volatility** is just the standard deviation of returns.  Quoted *annualised*
+(daily std $\times \sqrt{252}$ trading days), it answers "how much does this name
+typically swing in a year?"
+:::
+
+## 2 · Who Wobbles Most?
+
+Annualised volatility ranks the basket exactly as intuition predicts: banks and
+tech swing hardest; defensive utilities and staples are the calmest.
+
+```{python}
+#| label: fig-vol-bars
+#| fig-cap: "Annualised volatility by name. Banks (red) and tech swing ~20–25% a year; defensive staples and utilities (green) sit near 14–16%. The same ordering returns when we measure market beta."
+meta = datasets.load_basket_meta().set_index("ticker")
+vol = (R.std() * np.sqrt(252)).sort_values()
+colors = [CRASH if meta.loc[t, "sector"] == "Banks"
+          else plotting.PALETTE["green"]
+          if meta.loc[t, "sector"] in ("Utilities", "Staples")
+          else COOL for t in vol.index]
+fig, ax = plt.subplots(figsize=(8.5, 4.0))
+ax.barh(vol.index, vol.values, color=colors)
+ax.set_xlabel("annualised volatility"); ax.set_title(
+    "Banks and tech swing hardest; staples are calm", fontsize=12)
+despine(ax); fig.tight_layout(); plt.show()
+```
+
+## 3 · The Tails Are Too Fat for a Bell Curve
+
+If returns were Gaussian, days beyond a few standard deviations would essentially
+never happen.  They happen often.  Overlay a fitted normal on the return histogram
+and the data pokes out **past it on both ends** — the *fat tails* that make crashes
+a recurring feature, not a freak.
+
+```{python}
+#| label: fig-fat-tails
+#| fig-cap: "JPM return histogram (bars) vs a fitted Gaussian (line). The data has a taller peak and heavier tails: the shaded regions beyond ±2.5 std hold far more mass than the bell curve allows. Excess kurtosis is 0 for a Gaussian; here it is 3.3."
+r = R["JPM"].to_numpy()
+mu, sd = r.mean(), r.std()
+grid = np.linspace(r.min(), r.max(), 400)
+fig, ax = plt.subplots(figsize=(8.5, 4.2))
+ax.hist(r, bins=80, density=True, color=BAND, alpha=0.8, label="JPM returns")
+ax.plot(grid, norm.pdf(grid, mu, sd), color=INK, lw=2,
+        label="fitted Gaussian")
+# shade the fat tails (beyond +/- 2.5 std)
+for lo, hi in [(grid.min(), mu - 2.5 * sd), (mu + 2.5 * sd, grid.max())]:
+    m = (grid >= lo) & (grid <= hi)
+    ax.fill_between(grid[m], norm.pdf(grid[m], mu, sd), color=CRASH, alpha=0.35)
+ax.set_yscale("log")        # log-y makes the tail gap unmissable
+ax.set_xlabel("daily log-return"); ax.set_ylabel("density (log scale)")
+ax.set_title(f"Fat tails: excess kurtosis = {kurtosis(r):.1f}  (Gaussian = 0)",
+             fontsize=12)
+ax.legend(fontsize=9, frameon=False); despine(ax)
+fig.tight_layout(); plt.show()
+```
+
+The heaviness varies a lot by name — a single earnings shock can dominate:
+
+```{python}
+k = R.apply(kurtosis).sort_values(ascending=False)
+print("excess kurtosis (0 = Gaussian):")
+print(k.round(1).to_string())
+```
+
+::: {.callout-tip}
+## Why Fat Tails Matter Later
+A Gaussian model of returns *understates* extreme losses — exactly the failure the
+[uncertainty](../uncertainty/index.qmd) chapter exploits when Gaussian Monte-Carlo
+produces tails that are too thin, and that
+[gaussianization](../gaussianization/index.qmd) fixes by learning the true shape.
+:::
+
+---
+
+## Where This Goes Next
+
+Fat tails are a distribution-shape fact.  The next page puts names and dates on the
+worst points in that tail → [Crashes, Drawdowns & Nameable
+Events](03-crashes-and-drawdowns.qmd).

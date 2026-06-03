@@ -1,0 +1,244 @@
+---
+title: "Patching & Windowing"
+subtitle: "Turn a time series into windows you can measure"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, BAND, GRID, PANEL, despine
+plotting.set_style("notes")
+import numpy as np, matplotlib.pyplot as plt
+from matplotlib.patches import FancyBboxPatch
+R = datasets.load_returns()
+```
+
+So far each measure took two *scalar* columns — one number per day.  But a real
+signal often lives across a **window of days**, not a single one, and a real book
+is many columns at once.  **Patching** is the move that turns a scalar series into
+vectors and blocks: cut the series into overlapping windows and treat each window
+as one sample.
+
+This is a hands-on tutorial — *how* to patch, *how* to look at patches, and *what*
+becomes measurable once you have them.  The formal measures (total correlation,
+mutual information) live in the [dependence](../dependence/index.qmd) chapter; here
+we build the raw material they run on.
+
+---
+
+## 1 · What Is a Patch?
+
+A **`w`-day patch** is a slice of `w` consecutive days.  Slide that window one day
+at a time down a series and you get a *matrix*: each row is a window, each column a
+position **within** the window.  One sample is now a `w`-vector.
+
+```{python}
+def windows(series, w):
+    """Sliding w-day patches of a 1-D series -> (n - w + 1, w) matrix."""
+    s = np.asarray(series, dtype=float)
+    if w <= 1:
+        return s.reshape(-1, 1)
+    return np.lib.stride_tricks.sliding_window_view(s, w)
+
+jpm = R["JPM"].to_numpy()
+P = windows(jpm, 3)
+print(f"JPM returns: {jpm.shape[0]} days")
+print(f"windows(JPM, w=3): shape {P.shape}   (each row is a 3-day vector)")
+print("first three patches:")
+print(np.round(P[:3], 4))
+```
+
+`numpy`'s `sliding_window_view` builds the patch matrix as a *view* — no data is
+copied, so even large series patch instantly.
+
+::: {.callout-note icon=false}
+## Consecutive Windows Share Days
+Patch 0 is days `(0,1,2)`, patch 1 is days `(1,2,3)` — they overlap in two days.
+That overlap is not a bug: it is exactly the *redundancy across time* a window is
+meant to expose.  We return to it in §4 and §6.
+:::
+
+## 2 · Seeing the Window Slide
+
+The clearest way to understand patching is to watch the window move.  Here is a
+slice of the JPM series with three consecutive `w=10` windows drawn on top — each
+shifted one day from the last.
+
+```{python}
+#| label: fig-patch-slide
+#| fig-cap: "Three consecutive 10-day windows on the JPM return series, each one day to the right of the last. Patching slides this box down the whole series, stacking every position into a row of the patch matrix."
+seg = jpm[60:120]
+t = np.arange(seg.size)
+fig, ax = plt.subplots(figsize=(9.5, 4.0))
+ax.plot(t, seg, color=COOL, lw=1.4, marker="o", ms=3)
+ax.axhline(0, color=INK, lw=0.6)
+w = 10
+for k, (start, col) in enumerate([(8, COOL), (9, WARM), (10, CRASH)]):
+    y0, y1 = ax.get_ylim()
+    ax.add_patch(FancyBboxPatch((start - 0.4, y0 + 0.002 * k), w - 0.2,
+                                (y1 - y0) - 0.004 * k, boxstyle="round,pad=0",
+                                fill=False, edgecolor=col, lw=2, alpha=0.8))
+    ax.text(start + w / 2 - 0.5, y1 - 0.004 - 0.004 * k, f"patch {k}",
+            color=col, fontsize=9, ha="center", fontweight="bold")
+ax.set_xlabel("day (within a 60-day slice)"); ax.set_ylabel("JPM return")
+ax.set_title("The window slides one day at a time", fontsize=12)
+despine(ax); fig.tight_layout(); plt.show()
+```
+
+## 3 · The Patch Matrix as a Picture
+
+Stack every window into a matrix and you can *look at it* as an image: rows are
+windows (time, top to bottom), columns are positions inside the window.  Do it on
+**\|returns\|** (a proxy for volatility) and two things show up at once: **diagonal
+streaks**, because one big day slides through the window positions as the window
+moves (the visible signature of overlap), and **bright clusters**, stretches where
+many large days bunch together — volatility clusters.
+
+```{python}
+#| label: fig-patch-matrix
+#| fig-cap: "The |returns| patch matrix for JPM (w=21), first 250 windows. Each row is a 21-day window. A single turbulent day appears in 21 successive windows at a sliding position, so it draws a diagonal streak — the signature of the overlap between neighbouring windows. Where streaks bunch into bright regions, volatility is clustering; dark stretches are calm."
+A = np.abs(jpm)
+M = windows(A, 21)[:250]
+fig, ax = plt.subplots(figsize=(9, 4.6))
+im = ax.imshow(M, aspect="auto", cmap="magma", interpolation="nearest")
+ax.set_xlabel("position within window  (day 0 … 20)")
+ax.set_ylabel("window index  (slides down the series →)")
+ax.set_title("Each row is a 21-day patch of |returns|", fontsize=12)
+fig.colorbar(im, ax=ax, fraction=0.04, pad=0.02, label="|return|")
+fig.tight_layout(); plt.show()
+```
+
+## 4 · Overlapping vs Non-Overlapping
+
+Two ways to cut patches.  **Sliding** windows move one day at a time (stride 1) and
+overlap heavily — many windows, but neighbours share days.  **Non-overlapping**
+windows tile the series (stride `w`) and reuse no day — fewer windows, cleaner but
+coarser.  The choice is a modelling decision with a cost.
+
+```{python}
+#| label: fig-overlap
+#| fig-cap: "Sliding (stride 1, overlapping) vs non-overlapping (stride w) windows over the same 24 days. Sliding gives many overlapping samples; tiling gives a handful of independent ones. Overlap can inflate apparent redundancy, so a finding should be checked against non-overlapping windows."
+days = np.arange(24)
+fig, (axT, axB) = plt.subplots(2, 1, figsize=(9.5, 3.8), sharex=True)
+for ax, stride, title, col in [
+    (axT, 1, "sliding · stride 1 (overlapping)", COOL),
+    (axB, 4, "non-overlapping · stride 4 (tiling)", CRASH),
+]:
+    ax.plot(days, np.zeros_like(days), "o", color=GRID, ms=4)
+    starts = range(0, 24 - 4 + 1, stride)
+    for i, s in enumerate(list(starts)[:8]):
+        y = 0.12 + 0.10 * (i % 4 if stride == 1 else 0)
+        ax.add_patch(FancyBboxPatch((s - 0.3, y), 4 - 0.4, 0.08,
+                                    boxstyle="round,pad=0.02", facecolor=col,
+                                    edgecolor=col, alpha=0.5))
+    ax.set_yticks([]); ax.set_ylim(-0.1, 0.6)
+    ax.set_title(title, fontsize=11, loc="left", color=col, fontweight="bold")
+    despine(ax)
+axB.set_xlabel("day"); fig.tight_layout(); plt.show()
+```
+
+## 5 · Patching More Than One Variable
+
+The payoff is comparing **blocks**.  Patch two series on the *same* days and you get
+two aligned matrices — a window of X against the contemporaneous window of Y.
+
+```{python}
+#| label: fig-two-blocks
+#| fig-cap: "JPM and BAC patched on the same days (w=10), first 120 windows as aligned images (red = up day, blue = down). Both share the diagonal-streak texture of overlap; the point here is the *alignment* — row i is the same 10 calendar days for each bank. A between-block measure compares these aligned rows and finds the banks move together (cross-correlation ≈ 0.83 at matching positions)."
+w = 10
+Pj = windows(jpm, w)[:120]
+Pb = windows(R["BAC"].to_numpy(), w)[:120]
+vmax = np.abs(np.concatenate([Pj, Pb])).max()
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(10, 4.6), sharey=True)
+for ax, Pm, name, cmap in [(axL, Pj, "JPM", "RdBu_r"), (axR, Pb, "BAC", "RdBu_r")]:
+    ax.imshow(Pm, aspect="auto", cmap=cmap, vmin=-vmax, vmax=vmax)
+    ax.set_title(f"{name} patched", fontsize=12); ax.set_xlabel("position in window")
+axL.set_ylabel("window index (aligned days)")
+fig.suptitle("Two series, same days, patched into aligned blocks", fontsize=12, y=1.0)
+fig.tight_layout(); plt.show()
+```
+
+You can also stack **different variables of the same asset** into one multivariate
+patch — say a stock's return *and* its volatility — so a window becomes a small
+table of (days × features):
+
+```{python}
+ret = jpm
+vol = np.abs(jpm)
+w = 5
+multi = np.stack([windows(ret, w), windows(vol, w)], axis=-1)
+print(f"multivariate patch tensor: {multi.shape}   (windows, days_in_window, features)")
+print("one window — columns are [return, |return|]:")
+print(np.round(multi[100], 4))
+```
+
+::: {.callout-tip}
+## The Pattern
+Patching is just *reshaping*: a 1-D series → a 2-D matrix (windows × positions); a
+set of series → a 3-D tensor (windows × positions × variables).  Everything
+downstream is a measurement on those rows.
+:::
+
+## 6 · What You Can Measure With Patches
+
+Patches turn vague questions into computable ones.  A few, in increasing richness —
+all of them just statistics on the patch matrix:
+
+- **Per-window summaries** — the mean, the standard deviation (volatility), the
+  worst day.  Plot per-window volatility and the clustering from §3 becomes a line.
+- **Structure *within* a window** — how the positions relate.  For raw returns the
+  positions are nearly independent (signs don't repeat); for *volatility* they are
+  correlated (turbulence persists).  That is the seed of **total correlation**.
+- **Structure *between* two windowed blocks** — how a window of X relates to the
+  window of Y, the seed of **mutual information between blocks**.
+
+The within-window contrast, shown directly:
+
+```{python}
+#| label: fig-within-structure
+#| fig-cap: "Correlation between window positions (w=8) for raw returns vs |returns|. Raw returns are near-zero off the diagonal — the days in a window barely relate (signs don't repeat). |returns| shows positive off-diagonal structure — volatility persists across the window. That off-diagonal mass is the redundancy a within-block measure adds up."
+def position_corr(series, w):
+    Pw = windows(series, w)
+    Pw = (Pw - Pw.mean(0)) / (Pw.std(0) + 1e-9)
+    return np.corrcoef(Pw.T)
+
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(9.5, 4.3))
+for ax, data, name in [(axL, jpm, "raw returns r"), (axR, np.abs(jpm), "|returns|")]:
+    C = position_corr(data, 8)
+    im = ax.imshow(C, cmap="RdBu_r", vmin=-1, vmax=1)
+    ax.set_title(f"{name}\nmean off-diag = {C[np.triu_indices(8, 1)].mean():+.2f}",
+                 fontsize=11)
+    ax.set_xlabel("position"); ax.set_xticks([]); ax.set_yticks([])
+axL.set_ylabel("position")
+fig.colorbar(im, ax=[axL, axR], fraction=0.025, label="correlation")
+plt.show()
+```
+
+The lesson of the two panels: switching from `r` to `|r|` did not clean the data —
+it changed the *question* from "do returns repeat?" (no) to "does turbulence
+persist?" (yes).  Same patches, different variable, opposite answer.
+
+::: {.callout-note icon=false}
+## Where the Real Measures Live
+The heatmaps above are correlation, the simplest within-block statistic.  Summing
+the Gaussian information across those off-diagonals gives **total correlation**;
+doing the same *between* two blocks gives **block mutual information**.  Both — and
+the honest check that overlap isn't manufacturing the result — are worked through
+in [Tool 3 · Windows](../dependence/labs/lab-tool3-windows.qmd) and the
+[mutual information](../dependence/02-mutual-information.qmd) chapter.
+:::
+
+---
+
+## Your Turn
+
+- Re-run §3's patch image on a calm staple (`KO`) instead of `JPM`.  Do the
+  volatility bands fade?
+- Build the two-block picture (§5) for a bank–utility pair (`JPM`, `DUK`).  Do the
+  aligned blocks still light up together, or does the co-movement disappear?
+- Change the window size `w` and watch the patch matrix grow wider and shorter.  At
+  what `w` does a "window" stop being a meaningful unit for daily returns?
+
+Back to the data tour: [Markets for Data People overview](index.qmd).

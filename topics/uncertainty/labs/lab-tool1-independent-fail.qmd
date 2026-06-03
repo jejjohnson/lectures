@@ -1,0 +1,83 @@
+---
+title: "Tool 1 — Independent Fails"
+subtitle: "Why per-marginal sampling destroys the joint"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
+from rbig import AnnealedRBIG
+from lectures.measures import cocrash_fraction
+plotting.set_style("notes")
+import numpy as np, matplotlib.pyplot as plt
+```
+
+*Learn-the-tool track · Lab 1 of 3.*
+
+The failure you must internalize before trusting any scenario generator:
+sampling each variable on its own gets the marginals right and the **joint**
+wrong.
+
+---
+
+## 1 · Build the Failure
+
+```{python}
+a, b = datasets.tail_dependent_pair(n=2000, seed=0)
+rng = np.random.default_rng(1)
+indep = np.column_stack([rng.permutation(a), rng.permutation(b)])
+
+print(f"marginals preserved?  std a: {a.std():.2f} vs {indep[:,0].std():.2f}")
+print(f"real co-crash      = {cocrash_fraction(a, b):.0%}")
+print(f"independent co-crash = {cocrash_fraction(indep[:,0], indep[:,1]):.0%}  ← destroyed")
+```
+
+Shuffling each column keeps the histograms identical but breaks the pairing — the
+co-crash collapses toward the independence baseline.
+
+```{python}
+#| label: fig-tool1-independent
+#| fig-cap: "Same marginals, different joint: real (left) vs independent resample (right)."
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.4), sharex=True, sharey=True)
+for ax, data, col, name in [
+    (axL, np.column_stack([a, b]), COOL, f"real · {cocrash_fraction(a,b):.0%}"),
+    (axR, indep, CRASH, f"independent · {cocrash_fraction(indep[:,0],indep[:,1]):.0%}"),
+]:
+    ax.scatter(data[:, 0], data[:, 1], s=7, c=col, alpha=0.3, edgecolors="none")
+    ax.axvspan(-6, np.quantile(data[:, 0], 0.1), color=CRASH, alpha=0.06)
+    ax.axhspan(-6, np.quantile(data[:, 1], 0.1), color=CRASH, alpha=0.06)
+    ax.set_title(name, fontsize=11); ax.set_xlim(-5, 4); ax.set_ylim(-5, 4)
+    ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+---
+
+## 2 · The Fix Is Joint Sampling
+
+```{python}
+gen = AnnealedRBIG(n_layers=30, random_state=0).fit(np.column_stack([a, b])).sample(2000)
+print(f"RBIG (joint) co-crash = {cocrash_fraction(gen[:,0], gen[:,1]):.0%}   ← restored")
+```
+
+::: {.callout-tip}
+## What to Look for
+Any method that samples coordinates independently — however carefully it matches
+each marginal — sits at the independence floor for joint extremes.  Only joint
+generation (next two labs) escapes it.
+:::
+
+---
+
+## 3 · Your Turn
+
+- Quantify it across quantiles: plot co-crash vs `q` for real vs independent.
+- Replace the shuffle with sampling each marginal from a fitted normal — does the
+  joint improve?  (It should not.)
+
+Next: [Tool 2 — Gaussian Monte-Carlo](lab-tool2-gaussian-mc.qmd) keeps the
+correlation but still thins the tail.

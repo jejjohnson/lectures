@@ -1,0 +1,48 @@
+---
+title: "Lectures"
+subtitle: "Course notes, slide decks, and hands-on labs"
+---
+
+A home for my teaching material. Most subjects come in three layers: deep,
+reproducible **reference notes**; curated **slide decks** that pick the key ideas for
+a course; and runnable **labs**. Browse by **course**, by **topic**, or jump straight
+to a **lecture or lab** below.
+
+## Courses
+
+Curated playlists — targeted slides, each backed by the full notes and labs.
+
+- **[Probabilistic ML for Finance](courses/2025-finance-msc/index.qmd)** — Master's
+  short course (10 h): measuring dependence, gaussianization, uncertainty, and fair
+  learning, grounded in real market data.
+
+*(More courses will live here as they are written.)*
+
+## Topics
+
+The evergreen reference — full derivations and every figure generated reproducibly,
+reusable across courses.
+
+| Topic | What it covers |
+|---|---|
+| [Markets for Data People](topics/data/index.qmd) | the finance background for data-minded readers — every term shown first in the data |
+| [Measures of Dependence](topics/dependence/index.qmd) | Pearson → Spearman → distance correlation → mutual information → HSIC |
+| [Gaussianization](topics/gaussianization/index.qmd) | change of variables, RBIG, normalizing flows |
+| [Uncertainty](topics/uncertainty/index.qmd) | noise propagation, predicted noise, ensembles |
+| [Fair Learning](topics/fairness/index.qmd) | removing a model's dependence on a protected attribute |
+
+## Lectures & Labs
+
+Jump straight in:
+
+- **Slide decks** —
+  [Welcome](courses/2025-finance-msc/slides/00-welcome.qmd) ·
+  [Dependence](courses/2025-finance-msc/slides/01-dependence.qmd) ·
+  [Gaussianization](courses/2025-finance-msc/slides/02-gaussianization.qmd) ·
+  [Uncertainty](courses/2025-finance-msc/slides/03-uncertainty.qmd) ·
+  [Fair Learning](courses/2025-finance-msc/slides/04-fairness.qmd)
+- **Lab collections** —
+  [Dependence](topics/dependence/labs/index.qmd) ·
+  [Gaussianization](topics/gaussianization/labs/index.qmd) ·
+  [Uncertainty](topics/uncertainty/labs/index.qmd) ·
+  [Fair Learning](topics/fairness/labs/index.qmd)

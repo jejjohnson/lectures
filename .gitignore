@@ -44,6 +44,10 @@ data/external/*
 !data/raw/.gitkeep
 !data/processed/.gitkeep
 !data/external/.gitkeep
+# ...except the small, script-derived datasets the rendered site depends on.
+!data/processed/returns_basket.csv
+!data/processed/basket_meta.csv
+!data/processed/adult_like.csv
 
 # Results (use DVC instead)
 results/figures/*
@@ -104,3 +108,17 @@ htmlcov/
 *.log
 *.tmp
 *.swp
+
+/.quarto/
+**/*.quarto_ipynb*
+
+# Quarto rendered output (built by CI and locally; never committed)
+/_site/
+/site_libs/
+
+# Coverage report (uploaded as a CI artifact, not committed)
+coverage.xml
+
+# Scratch plans and local agent config (kept local, never committed)
+.plans/
+.claude/

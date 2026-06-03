@@ -1,0 +1,79 @@
+---
+title: "Fair Learning"
+---
+
+Guide a model's learning to avoid a specific bias.  The idea is simple and it
+closes the loop with [Chapter 1](../dependence/index.qmd): **fairness is
+minimizing a dependence measure.**  Once you can *measure* how much two things
+move together, you can add that measure to the loss and *remove* the part you
+are not allowed to keep.
+
+::: {.callout-note icon=false}
+## The Spine — One Objective
+
+Every method in this chapter is the same optimization with a different
+dependence term:
+
+$$
+\text{loss} \;=\; \underbrace{\text{fit}(\hat y, y)}_{\text{predict well}}
+\;+\; \mu \cdot \underbrace{\operatorname{Dep}(\hat y, S)}_{\text{stay blind to } S}.
+$$
+
+Predict the target $y$ while keeping the predictions $\hat y$ independent of a
+**sensitive / nuisance variable** $S$.  The weight $\mu$ dials the trade-off.
+Every rung below is a *choice of* $\operatorname{Dep}$ and a way to minimize it.
+:::
+
+## Two Framings, One Operation
+
+"Don't discriminate" and "don't load on the factor I'm hedging" are the same
+maths:
+
+| Framing | $S$ is… | Goal |
+|---|---|---|
+| **Fairness** | a protected attribute (sex, race, age) | predictions don't depend on $S$ |
+| **Factor-neutrality** | a market/sector factor (beta) | a strategy doesn't load on $S$ |
+
+A credit model that must not depend on `sex` and a strategy that must be
+beta-neutral are solving *one* problem: remove the dependence between an output
+and a variable you have chosen to be blind to.
+
+## Why It Sits Here
+
+- Fairness = *minimizing a dependence measure* — it reuses
+  [HSIC / CKA](../dependence/03-kernels-hsic.qmd) from the dependence chapter as
+  a trainable penalty.
+- The "assume vs. learn the density" fork from Chapter 1 reappears: kernel
+  removal needs no density; information-theoretic removal does and reconnects to
+  [Gaussianization](../gaussianization/index.qmd).
+- **Code:** [keras-fairkl](https://github.com/jejjohnson/keras-fairkl) — fair
+  kernel learning in Keras 3, where the penalty weight is exactly this $\mu$.
+
+## The Ladder of Removal
+
+Each rung cancels a *shape* of dependence — mirroring the measurement ladder of
+Chapter 1, now run in reverse to *remove* rather than measure.
+
+| Rung | Method | $\operatorname{Dep}$ | Removes | Leaves |
+|------|--------|------|---------|--------|
+| 1 | Drop the feature | — | nothing (proxies leak) | all of it |
+| 2 | Linear neutrality | `cka_linear` | the straight line | the curve |
+| 3 | CKA penalty | `cka_rbf` | line **and** curve | ~nothing |
+| 4 | Information removal | MI / total corr. | any shape (via density) | ~nothing |
+| 5 | Adversarial | learned probe | whatever a net can find | depends |
+
+## Pages in This Chapter
+
+1. **[What is fair learning?](01-what-is-fair.qmd)** — the objective, the
+   Lagrangian behind it, regulation (GDPR, EU AI Act), and the credit /
+   factor-neutrality use cases.
+2. **[Bias and proxies](02-bias-and-proxies.qmd)** — why dropping the sensitive
+   feature fails, and how to balance errors *within* groups.
+3. **[Fair kernel learning](03-fair-kernel-learning.qmd)** — linear neutrality
+   and its hole, the Gaussianize-first trap, the CKA penalty hero, adversarial
+   removal, and the accuracy-vs-neutrality trade-off curve.
+4. **[Tie-back: (in)dependence and information](04-tie-back.qmd)** — fairness as
+   the mirror of measurement; the two roads, once more.
+
+The hands-on [labs](labs/index.qmd) build each rung in isolation, then neutralize
+a real credit model and a real trading strategy.

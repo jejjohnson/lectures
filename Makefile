@@ -160,15 +160,14 @@ clean: ## Remove build artefacts and cache directories
 ##@ Docs
 # ===========================================================================
 
-docs: ## Build documentation with MyST
-	uv run --group docs myst build --html
+docs: ## Render site + reveal.js slides with Quarto
+	pixi run -e docs render
 
-docs-serve: ## Serve documentation locally
-	uv run --group docs myst start
+docs-serve: ## Live-reload preview server (Quarto)
+	pixi run -e docs preview
 
-docs-deploy: ## Deploy documentation to GitHub Pages
-	uv run --group docs myst build --html
-	uv run --group docs ghp-import -n -p _build/html
+docs-deploy: ## Publish site to GitHub Pages (Quarto)
+	pixi run -e docs publish
 
 # ===========================================================================
 ##@ GitHub helpers

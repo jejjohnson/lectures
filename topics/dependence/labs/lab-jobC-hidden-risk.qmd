@@ -1,0 +1,225 @@
+---
+title: "Job C — Hidden Risk"
+subtitle: "Tail co-crash detection: the dependence that threatens a portfolio"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
+from lectures.measures import mutual_information_bits, linfoot_r, nats_to_bits
+plotting.set_style("notes")
+import numpy as np, matplotlib.pyplot as plt
+from scipy.stats import pearsonr, spearmanr
+import itertools
+```
+
+*Do-the-job track · deliverable.*
+
+::: {.callout-note appearance="simple" icon=false}
+**See the data first** — [Co-Movement &
+Co-Crashes](../../data/04-co-movement-and-co-crashes.qmd) shows the correlation
+block and the co-crash statistic in the real basket this job reports on.
+:::
+
+The lecture opened with a bad morning: a "diversified" book fell all at once.
+This job finds out *why* and *for which pairs* — by measuring the dependence
+that Pearson correlation structurally cannot see: the tail co-crash rate.
+
+**Deliverable:** a tail-risk report flagging pairs whose tail dependence exceeds
+what their linear correlation implies, with an estimate of how much more often
+they fall together than independence would predict.
+
+---
+
+## Setup
+
+```{python}
+R = datasets.load_returns()
+META = datasets.load_basket_meta()
+label = dict(zip(META["ticker"], META["label"]))
+sector = dict(zip(META["ticker"], META["sector"]))
+tickers = list(R.columns)
+```
+
+---
+
+## 1 · The Benchmark — Tail Frequency Under Independence
+
+If two assets were truly independent with marginal tail probability $p$, the
+probability of a *joint* tail event would be $p^2$.  We use $p = 0.10$
+(bottom decile).
+
+```{python}
+P_TAIL = 0.10   # tail threshold (bottom decile of each series)
+p_joint_indep = P_TAIL ** 2
+print(f"Expected joint tail frequency (if independent): {p_joint_indep:.4f} = {100*p_joint_indep:.2f}%")
+print(f"That is: once every {1/p_joint_indep:.0f} days ≈ {1/(p_joint_indep*252):.1f} years")
+```
+
+---
+
+## 2 · Actual Tail Co-Crash Frequencies
+
+```{python}
+results = []
+for a, b in itertools.combinations(tickers, 2):
+    x, y = R[a].values, R[b].values
+    q_a = np.percentile(x, 100 * P_TAIL)
+    q_b = np.percentile(y, 100 * P_TAIL)
+    crash_mask = (x <= q_a) & (y <= q_b)
+    p_joint = crash_mask.mean()
+    lift = p_joint / p_joint_indep   # how many times more often than independent
+    pearson = pearsonr(x, y)[0]
+    same_sec = sector.get(a) == sector.get(b)
+    results.append(dict(
+        pair=f"{a}/{b}",
+        pearson=pearson,
+        p_joint=p_joint,
+        lift=lift,
+        n_crash=crash_mask.sum(),
+        same_sector=same_sec,
+    ))
+
+results.sort(key=lambda r: r["lift"], reverse=True)
+
+print(f"{'Pair':<12s}  {'Pearson':>8s}  {'joint tail%':>11s}  {'lift':>6s}  {'N crashes':>10s}")
+print("-" * 58)
+for r in results[:10]:
+    print(f"  {r['pair']:<10s}  {r['pearson']:+8.3f}  {100*r['p_joint']:10.2f}%  "
+          f"{r['lift']:6.1f}×  {r['n_crash']:10d}")
+```
+
+---
+
+## 3 · The Scorecard — Lift Vs. Pearson
+
+```{python}
+#| label: fig-lift-vs-pearson
+#| fig-cap: "Tail co-crash lift vs. Pearson correlation. Points far above the expected curve have hidden tail risk — more crashes together than their correlation implies."
+pearson_vals = [r["pearson"] for r in results]
+lift_vals = [r["lift"] for r in results]
+same_sec = [r["same_sector"] for r in results]
+
+# Expected lift for a Gaussian pair with given correlation
+rho_grid = np.linspace(0, 0.95, 200)
+from scipy.stats import multivariate_normal
+
+def gaussian_tail_lift(rho, p=P_TAIL):
+    # P(X < q, Y < q) for a bivariate Gaussian with correlation rho
+    cov = [[1, rho], [rho, 1]]
+    q = multivariate_normal.ppf(p) if hasattr(multivariate_normal, "ppf") else -1.28
+    # Use 2-D Gaussian CDF
+    from scipy.stats import multivariate_normal as mvn
+    z = mvn(mean=[0, 0], cov=cov)
+    return z.cdf([q, q]) / p**2
+
+from scipy.stats import norm
+q_thresh = norm.ppf(P_TAIL)
+
+gauss_lift = []
+for rho in rho_grid:
+    cov = [[1, rho], [rho, 1]]
+    from scipy.stats import multivariate_normal as mvn2
+    p_joint_g = mvn2(mean=[0, 0], cov=cov).cdf([q_thresh, q_thresh])
+    gauss_lift.append(p_joint_g / p_joint_indep)
+
+fig, ax = plt.subplots(figsize=(9, 5.5))
+colors = [CRASH if s else COOL for s in same_sec]
+ax.scatter(pearson_vals, lift_vals, s=35, c=colors, alpha=0.75,
+           label=None, zorder=5)
+ax.plot(rho_grid, gauss_lift, color=INK, lw=1.6, ls="--",
+        label="Gaussian prediction")
+ax.axhline(1, color=WARM, lw=1.0, ls=":", label="independence")
+
+# Label the top outliers
+top_pairs = [(r["pair"], r["pearson"], r["lift"]) for r in results[:5]]
+for pair, p, lf in top_pairs:
+    ax.annotate(pair, xy=(p, lf), fontsize=8, color=INK,
+                xytext=(p + 0.01, lf + 0.3))
+
+from matplotlib.patches import Patch
+legend_els = [
+    Patch(fc=CRASH, label="same-sector pair"),
+    Patch(fc=COOL, label="cross-sector pair"),
+    plt.Line2D([0], [0], color=INK, ls="--", label="Gaussian prediction"),
+]
+ax.legend(handles=legend_els, fontsize=9, frameon=False)
+ax.set_xlabel("Pearson correlation  r")
+ax.set_ylabel("Tail lift  (× more crashes than independent)")
+ax.set_title("Hidden tail risk: pairs whose crashes exceed the Gaussian prediction",
+             fontsize=11, fontweight="bold")
+despine(ax)
+plt.tight_layout()
+plt.show()
+```
+
+---
+
+## 4 · The Banks — The Lecture's Central Character
+
+```{python}
+#| label: fig-bank-crash-zoom
+#| fig-cap: "JPM / BAC daily returns. Crash days (both below 10th percentile) highlighted in red — far more than independence predicts."
+x = R["JPM"].values
+y = R["BAC"].values
+q_x = np.percentile(x, 10)
+q_y = np.percentile(y, 10)
+crash = (x <= q_x) & (y <= q_y)
+
+p_crash = crash.mean()
+pearson = pearsonr(x, y)[0]
+lift = p_crash / p_joint_indep
+
+fig, ax = plt.subplots(figsize=(7, 5.5))
+ax.scatter(x[~crash], y[~crash], s=10, c=COOL, alpha=0.35, edgecolors="none",
+           label=f"bulk ({(~crash).sum()} days)")
+ax.scatter(x[crash], y[crash], s=30, c=CRASH, alpha=0.9, edgecolors="none",
+           label=f"co-crash ({crash.sum()} days)")
+
+ax.axvline(q_x, color=INK, lw=0.8, ls="--")
+ax.axhline(q_y, color=INK, lw=0.8, ls="--")
+
+ax.set_xlabel(f"JPM daily return"); ax.set_ylabel(f"BAC daily return")
+ax.set_title(f"JPMorgan / Bank of America\n"
+             f"Pearson={pearson:+.3f}   "
+             f"tail co-crash rate={100*p_crash:.1f}%   "
+             f"lift={lift:.1f}×",
+             fontsize=11)
+ax.legend(fontsize=9, frameon=False)
+despine(ax)
+plt.tight_layout()
+plt.show()
+
+print(f"\nKey numbers:")
+print(f"  Pearson correlation:              {pearson:.4f}")
+print(f"  Observed joint tail frequency:    {p_crash:.4f} ({100*p_crash:.2f}%)")
+print(f"  Expected under independence:      {p_joint_indep:.4f} ({100*p_joint_indep:.2f}%)")
+print(f"  Lift (observed / expected):       {lift:.1f}×")
+```
+
+---
+
+## 5 · Deliverable — Tail-Risk Report
+
+Based on the analysis above, write a short memo (3–5 bullet points):
+
+1. **Top-3 pairs by tail-lift** — name them, give the lift, explain the
+   economic relationship.
+2. **Any cross-sector surprises** — pairs whose tail-lift substantially exceeds
+   their within-sector peers.
+3. **Pearson blind spots** — pairs where Pearson $< 0.4$ but lift $> 5×$.
+4. **Portfolio implication** — which cluster of stocks would a simple
+   correlation-based risk model most severely understate as diversification
+   benefit?
+5. **Recommended next step** — which pairs warrant a full Gaussianization /
+   flow-based analysis (Lecture 3) to quantify the tail risk precisely?
+
+::: {.callout-warning}
+## Limitation of This Analysis
+The histogram MI estimator and the empirical tail frequency are both noisy with
+5 years of daily data.  A practitioner would bootstrap confidence intervals
+around the lift estimates before making capital allocation decisions.
+:::

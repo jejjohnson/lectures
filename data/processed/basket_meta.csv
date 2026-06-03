@@ -1,0 +1,15 @@
+ticker,label,sector
+JPM,JPMorgan,Banks
+BAC,Bank of Am.,Banks
+C,Citigroup,Banks
+WFC,Wells Fargo,Banks
+GS,Goldman,Banks
+AAPL,Apple,Tech
+MSFT,Microsoft,Tech
+GOOGL,Alphabet,Tech
+XOM,Exxon,Energy
+CVX,Chevron,Energy
+DUK,Duke Energy,Utilities
+SO,Southern Co.,Utilities
+PG,P&G,Staples
+KO,Coca-Cola,Staples

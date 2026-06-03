@@ -1,0 +1,190 @@
+---
+title: "Tool 2 — Information Measures"
+subtitle: "Mutual Information in Bits · Validating Estimators"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
+from lectures.measures import mutual_information_bits, linfoot_r, nats_to_bits
+plotting.set_style("notes")
+import numpy as np, matplotlib.pyplot as plt
+from scipy.stats import pearsonr, spearmanr
+```
+
+*Learn-the-tool track · Lab 2 of 3.*
+
+Tool 1 walked the no-density road.  This lab crosses to the **density road**:
+instead of asking "how aligned are the points," we ask "how much do these two
+share, in bits?"  That is mutual information, and it sees *any* form of
+dependence, not just the part a straight line captures.
+
+The responsible first move — and the spine of this lab — is to **prove the
+estimator works on a known answer** before trusting it on returns.
+
+**What you will produce:** a calibrated MI estimator and a measurement of
+shared information for every pair in the basket.
+
+---
+
+## Setup
+
+```{python}
+R = datasets.load_returns()
+META = datasets.load_basket_meta()
+label = dict(zip(META["ticker"], META["label"]))
+tickers = list(R.columns)
+rng = np.random.default_rng(0)
+print(f"Loaded {len(R)} days × {len(tickers)} stocks")
+```
+
+---
+
+## 1 · A Known Answer — The Gaussian Closed Form
+
+For a bivariate Gaussian with correlation $\rho$:
+
+$$I(X; Y) = -\tfrac{1}{2}\ln(1 - \rho^2) \quad \text{(nats)}$$
+
+This is our calibration target.  If the estimator gets this right, we can
+trust it on harder data.
+
+```{python}
+def mi_gaussian_nats(rho):
+    """Theoretical MI for a bivariate Gaussian."""
+    return -0.5 * np.log(1 - rho**2)
+
+# Test cases
+for rho in [0.0, 0.3, 0.6, 0.9]:
+    mi = mi_gaussian_nats(rho)
+    print(f"  rho={rho:.1f}  MI={mi:.4f} nats  = {nats_to_bits(mi):.4f} bits")
+```
+
+---
+
+## 2 · Build the Histogram Estimator
+
+The simplest estimator: bin both variables into a 2-D histogram, then compute
+MI from the joint frequency table.
+
+```{python}
+def mi_histogram_bits(x, y, bins=25):
+    """MI in bits via a 2-D histogram estimator."""
+    H, _, _ = np.histogram2d(x, y, bins=bins, density=False)
+    return mutual_information_bits(H)
+```
+
+**Validate on synthetic Gaussian data:**
+
+```{python}
+print(f"{'rho':>5s}  {'theory (bits)':>14s}  {'estimate (bits)':>16s}  {'error':>7s}")
+print("-" * 50)
+for rho in [0.0, 0.3, 0.6, 0.9]:
+    theory = nats_to_bits(mi_gaussian_nats(rho))
+    x, y = datasets.correlated_returns(n=2000, rho=rho)
+    est = mi_histogram_bits(x, y, bins=30)
+    print(f"  {rho:.1f}  {theory:14.4f}  {est:16.4f}  {abs(est - theory):7.4f}")
+```
+
+```{python}
+#| label: fig-mi-validation
+#| fig-cap: "Histogram estimator vs. Gaussian theory across correlations."
+rhos = np.linspace(0, 0.95, 20)
+theory_bits = [nats_to_bits(mi_gaussian_nats(r)) for r in rhos]
+est_bits = [mi_histogram_bits(*datasets.correlated_returns(n=1500, rho=r), bins=25)
+            for r in rhos]
+
+fig, ax = plt.subplots(figsize=(8, 4.2))
+ax.plot(rhos, theory_bits, color=INK, lw=2, label="Gaussian theory")
+ax.scatter(rhos, est_bits, color=COOL, s=40, zorder=5, label="histogram estimate")
+ax.set_xlabel("Pearson correlation  ρ")
+ax.set_ylabel("Mutual information  (bits)")
+ax.set_title("Histogram MI: calibration against Gaussian theory", fontsize=12)
+ax.legend(frameon=False)
+despine(ax)
+plt.tight_layout()
+plt.show()
+```
+
+---
+
+## 3 · Apply to the Real Basket
+
+```{python}
+import itertools
+
+results = []
+for a, b in itertools.combinations(tickers, 2):
+    x, y = R[a].values, R[b].values
+    mi = mi_histogram_bits(x, y)
+    rho = pearsonr(x, y)[0]
+    theory = nats_to_bits(mi_gaussian_nats(abs(rho)))
+    results.append(dict(
+        pair=f"{a}/{b}",
+        pearson=rho,
+        mi_bits=mi,
+        mi_theory=theory,
+        excess=mi - theory,   # excess MI beyond what Gaussian predicts
+    ))
+
+results.sort(key=lambda r: r["mi_bits"], reverse=True)
+
+print(f"{'Pair':<12s}  {'Pearson':>8s}  {'MI (bits)':>10s}  {'theory':>8s}  {'excess':>8s}")
+print("-" * 58)
+for r in results[:10]:
+    print(f"  {r['pair']:<10s}  {r['pearson']:+8.3f}  {r['mi_bits']:10.4f}  "
+          f"{r['mi_theory']:8.4f}  {r['excess']:+8.4f}")
+```
+
+::: {.callout-tip}
+## Reading the Excess Column
+Positive excess MI = dependence that Pearson correlation cannot account for
+(tail clustering, non-linear structure, regime switching).  Pairs with large
+excess are the hidden-risk candidates — candidates for Job C.
+:::
+
+---
+
+## 4 · Linfoot R — Back to the Correlation Scale
+
+```{python}
+#| label: fig-linfoot-real
+#| fig-cap: "Linfoot R vs Pearson |r| on the real basket. Points above the diagonal have dependence that correlation misses."
+pearson_vals = [abs(r["pearson"]) for r in results]
+linfoot_vals = [linfoot_r(nats_to_bits(r["mi_bits"]) / np.log2(np.e))
+                for r in results]   # convert bits→nats for linfoot_r
+
+fig, ax = plt.subplots(figsize=(7, 6))
+ax.scatter(pearson_vals, linfoot_vals, s=30, c=COOL, alpha=0.7)
+ax.plot([0, 1], [0, 1], color=INK, lw=1.2, ls="--", label="Linfoot R = |Pearson|")
+
+# Label the most interesting outliers
+for r, p, lf in zip(results, pearson_vals, linfoot_vals):
+    if lf - p > 0.08:
+        ax.annotate(r["pair"], xy=(p, lf), fontsize=8, color=CRASH,
+                    xytext=(p - 0.08, lf + 0.03))
+
+ax.set_xlabel("|Pearson r|"); ax.set_ylabel("Linfoot R")
+ax.set_xlim(0, 1); ax.set_ylim(0, 1)
+ax.set_title("Points above the line: non-Gaussian dependence", fontsize=12)
+ax.legend(frameon=False)
+despine(ax)
+plt.tight_layout()
+plt.show()
+```
+
+---
+
+## 5 · Your Turn — The Honest Number
+
+Pick the **three pairs** with the largest excess MI from your table.  For each:
+
+1. What sector relationship do they represent?
+2. Is the excess plausible (tail crashes? regime co-movement?)?
+3. Does the Linfoot R exceed the Pearson $|r|$ by a meaningful amount?
+
+This is the start of Job B's deliverable — a *measure book* with honest
+numbers for every pair.

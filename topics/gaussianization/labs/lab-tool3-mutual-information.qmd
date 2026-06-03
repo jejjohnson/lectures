@@ -1,0 +1,98 @@
+---
+title: "Tool 3 — MI by Gaussianization"
+subtitle: "estimate mutual information · validate it"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
+from lectures.measures import mutual_information_xy
+plotting.set_style("notes")
+import numpy as np, matplotlib.pyplot as plt
+```
+
+*Learn-the-tool track · Lab 3 of 3.*
+
+The forward map answers "how much do these share?" in nats.  You will estimate
+mutual information and check it against a case with a known answer.
+
+---
+
+## 1 · The Estimator on Three Shapes
+
+```{python}
+rng = np.random.default_rng(0)
+n = 3000
+indep = (rng.normal(size=n), rng.normal(size=n))
+lin = rng.multivariate_normal([0, 0], [[1, 0.7], [0.7, 1]], size=n)
+s = rng.normal(size=n); curve = (s, s**2 + 0.3 * rng.normal(size=n))
+
+shapes = [("independent", indep),
+          ("linear ρ=0.7", (lin[:, 0], lin[:, 1])),
+          ("U-shape (curved)", curve)]
+for name, (xx, yy) in shapes:
+    print(f"{name:<18} MI ≈ {mutual_information_xy(xx, yy):.3f} nats")
+```
+
+See the data behind those numbers — the same scatter, three different
+dependencies:
+
+```{python}
+#| label: fig-tool3-shapes
+#| fig-cap: "The three pairs whose MI is reported above. MI is ~0 for the independent cloud and lights up for both the linear tilt and the curve (which a correlation would miss)."
+fig, axes = plt.subplots(1, 3, figsize=(12, 3.8))
+for ax, (name, (xx, yy)) in zip(axes, shapes):
+    ax.scatter(xx, yy, s=8, c=COOL, alpha=0.3, edgecolors="none")
+    ax.set_title(f"{name}\nMI ≈ {mutual_information_xy(xx, yy):.2f} nats", fontsize=11)
+    ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+Independent ≈ a small finite-sample floor; both dependent shapes light up —
+including the curve a correlation would miss.
+
+---
+
+## 2 · Validate Against the Gaussian Closed Form
+
+For a Gaussian pair, $I = -\tfrac12 \ln(1-\rho^2)$.
+
+```{python}
+#| label: fig-tool3-validate
+#| fig-cap: "Estimated vs exact mutual information across correlations."
+rhos = np.linspace(0, 0.9, 10)
+truth = [-0.5 * np.log(1 - r**2) for r in rhos]
+est = []
+for r in rhos:
+    xy = rng.multivariate_normal([0, 0], [[1, r], [r, 1]], size=4000)
+    est.append(mutual_information_xy(xy[:, 0], xy[:, 1], bins=24))
+
+fig, ax = plt.subplots(figsize=(6.8, 4.2))
+ax.plot(rhos, truth, c=INK, lw=2.4, label="exact")
+ax.plot(rhos, est, "o", c=COOL, label="estimate")
+ax.set_xlabel("ρ"); ax.set_ylabel("MI (nats)")
+ax.legend(fontsize=9, frameon=False); despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+::: {.callout-tip}
+## What to Look for
+The estimate tracks the truth but sits a touch high at ρ=0 — the finite-sample
+**bias floor** of any histogram MI.  Always compare a measured MI to the floor on
+shuffled data, never to zero.
+:::
+
+---
+
+## 3 · Your Turn
+
+- Estimate the bias floor: shuffle one column (`rng.permutation`) and re-measure
+  MI.  Subtract it as a baseline.
+- Vary `bins`.  How does the bias floor change with resolution and sample size?
+
+Next, the do-the-job track: [Job A — validate the estimator](lab-jobA-validate.qmd).

@@ -1,0 +1,322 @@
+---
+title: "Gaussianization"
+subtitle: "Module 2 · Probabilistic ML for Finance"
+format:
+  revealjs:
+    theme: [default, ../../../styles/slides.scss]
+    slide-number: true
+    incremental: true
+    transition: fade
+    fig-align: center
+    auto-stretch: false # keep figures at their natural aspect (no fill-to-height distortion)
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
+from lectures.gaussianization import gaussianize_1d
+from rbig import AnnealedRBIG
+from lectures.measures import mutual_information_xy, cocrash_fraction
+plotting.set_style("slides")
+import numpy as np, matplotlib.pyplot as plt
+from scipy.stats import norm
+```
+
+## The Wish {.center}
+
+Real data is messy: fat-tailed, curved, dependent.
+
+. . .
+
+**A Gaussian is the opposite** — every coordinate independent, everything in
+closed form.
+
+. . .
+
+What if we could *turn one into the other* — with a map we can run **both ways**?
+
+## One Invertible Map, Both Directions
+
+$$\underbrace{z = T(x)}_{\text{forward: simplify}}
+\qquad
+\underbrace{x = T^{-1}(z)}_{\text{backward: generate}}$$
+
+- **Forward** → Gaussianize: the distortion needed *is* the dependence
+  (measure / remove)
+- **Backward** → sample a Gaussian, invert: **generate** real scenarios
+  (propagate)
+
+. . .
+
+*The same machine powers Modules 1, 3, and 4.*
+
+## Change of Variables · Conserve the Mass
+
+A map can **move and stretch** probability mass — it can't create or destroy it.
+The mass in a thin slab is the same on both sides:
+
+$$p_X(x)\,\Delta x \;=\; p_Z(z)\,\Delta z$$
+
+```{python}
+#| echo: false
+#| fig-width: 9.5
+#| fig-height: 3.0
+xs = np.linspace(0, 4.5, 500)
+pX = np.exp(-xs)  # an illustrative skewed source density
+x0, dx = 0.8, 0.7
+F = 1 - np.exp(-np.array([x0, x0 + dx]))  # mass to the left of each edge
+z0, z1 = norm.ppf(F)  # the same mass mapped onto N(0,1)
+zs = np.linspace(-3.5, 3.5, 500)
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(9.5, 3.0))
+axL.plot(xs, pX, color=WARM, lw=2.2)
+axL.fill_between(xs, pX, where=(xs >= x0) & (xs <= x0 + dx), color=WARM, alpha=0.5)
+axL.set_ylim(-0.26, 1.05); axL.set_yticks([]); axL.set_xlabel("x")
+axL.annotate("", xy=(x0, -0.07), xytext=(x0 + dx, -0.07),
+             arrowprops=dict(arrowstyle="<->", color=INK, lw=1.5))
+axL.text(x0 + dx / 2, -0.19, r"$\Delta x$", ha="center", va="center",
+         color=INK, fontsize=12)
+axL.set_title(r"source  $p_X$  (skewed)", fontsize=12); despine(axL)
+axR.plot(zs, norm.pdf(zs), color=COOL, lw=2.2)
+axR.fill_between(zs, norm.pdf(zs), where=(zs >= z0) & (zs <= z1), color=COOL, alpha=0.5)
+axR.set_ylim(-0.125, 0.45); axR.set_yticks([]); axR.set_xlabel("z")
+axR.annotate("", xy=(z0, -0.026), xytext=(z1, -0.026),
+             arrowprops=dict(arrowstyle="<->", color=INK, lw=1.5))
+axR.text((z0 + z1) / 2, -0.092, r"$\Delta z$", ha="center", va="center",
+         color=INK, fontsize=12)
+axR.set_title(r"target  $p_Z=\mathcal{N}(0,1)$", fontsize=12); despine(axR)
+fig.suptitle("same shaded mass · different width", fontsize=12)
+fig.tight_layout(); plt.show()
+```
+
+**Density = mass ÷ width.** Stretch the slab and the density must drop to keep the
+two shaded areas equal.
+
+## Change of Variables · The Jacobian Is the Stretch
+
+Take the limit — the width ratio becomes the derivative, and in $d$ dimensions the
+local **volume** change is the Jacobian determinant:
+
+$$\begin{aligned}
+\text{1-D:}\quad & p_X(x) = p_Z\big(T(x)\big)\,\big|T'(x)\big| \\[2pt]
+d\text{-dim:}\quad & p_X(x) = p_Z\big(T(x)\big)\,\Big|\det \tfrac{\partial T}{\partial x}\Big|
+\end{aligned}$$
+
+. . .
+
+- **Forward** — the distortion needed to flatten the data *is* the dependence
+  (measure / remove).
+- **Backward** — a sampling recipe: draw $z\sim\mathcal N(0,I)$, apply $T^{-1}$
+  (generate).
+
+---
+
+## #1 The 1-D Move: Rank → Gaussian {auto-animate=true}
+
+$$T(x) = \Phi^{-1}\big(\hat F(x)\big)$$
+
+Empirical CDF (→ uniform), then inverse Gaussian CDF. Monotone ⇒ invertible.
+
+```{python}
+#| echo: false
+#| fig-width: 10
+#| fig-height: 3.4
+rng = np.random.default_rng(0)
+v = rng.exponential(size=4000); g = gaussianize_1d(v)
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(10, 3.4))
+axL.hist(v, bins=40, color=WARM, alpha=0.85, density=True)
+axL.set_title("before: skewed", fontsize=12); despine(axL)
+grid = np.linspace(-4, 4, 200)
+axR.hist(g, bins=40, color=COOL, alpha=0.85, density=True)
+axR.plot(grid, norm.pdf(grid), c=INK, lw=2)
+axR.set_title("after: standard normal", fontsize=12); despine(axR)
+fig.tight_layout(); plt.show()
+```
+
+It reshapes one marginal — but can't touch dependence *between* variables.
+
+## #2 RBIG · Why Gaussian Marginals Aren't Enough
+
+The 1-D move fixes one axis at a time. Apply it to **both** axes of a V:
+
+```{python}
+#| echo: false
+#| fig-width: 9
+#| fig-height: 3.4
+u, v = datasets.convex_payoff(n=1200, seed=0)
+XV = np.column_stack([u, v]); XV = (XV - XV.mean(0)) / XV.std(0)
+GV = np.column_stack([gaussianize_1d(XV[:, 0]), gaussianize_1d(XV[:, 1])])
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(9, 3.4))
+for ax, D, t in [(axL, XV, "data: a V"),
+                 (axR, GV, r"both marginals $\to \mathcal{N}(0,1)$")]:
+    ax.scatter(D[:, 0], D[:, 1], s=7, c=COOL, alpha=0.4, edgecolors="none")
+    ax.set_title(t, fontsize=12); ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+fig.tight_layout(); plt.show()
+```
+
+Both axes are now exactly Gaussian — yet the joint is **still a V**. The dependence
+lives *between* the axes, where a per-axis map can't reach: **marginalizing alone
+can't make it Gaussian.**
+
+## #2 RBIG · Rotate, Re-Gaussianize, Repeat
+
+Rotation mixes the axes, so leftover dependence resurfaces *as* non-Gaussian
+marginals — which the 1-D move can then flatten. Alternate the two:
+
+```{python}
+#| echo: false
+#| fig-width: 12
+#| fig-height: 3.0
+def gm(D):
+    return np.column_stack([gaussianize_1d(D[:, 0]), gaussianize_1d(D[:, 1])])
+
+def rot(D, deg):
+    th = np.deg2rad(deg)
+    R = np.array([[np.cos(th), -np.sin(th)], [np.sin(th), np.cos(th)]])
+    return D @ R.T
+
+R1 = rot(GV, 45); G2 = gm(R1)
+ZV = AnnealedRBIG(n_layers=30, random_state=0).fit(XV).transform(XV)
+seq = [("marginals Gaussian\n(still a V)", GV),
+       ("rotate 45°\n→ marginals skew", R1),
+       ("gaussianize\nmarginals", G2),
+       ("…repeat → spherical", ZV)]
+fig, axes = plt.subplots(1, 4, figsize=(12, 3.0))
+for ax, (t, D) in zip(axes, seq):
+    ax.scatter(D[:, 0], D[:, 1], s=6, c=COOL, alpha=0.4, edgecolors="none")
+    ax.set_title(t, fontsize=10); ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+fig.tight_layout(); plt.show()
+```
+
+Each rotation turns hidden dependence into visible non-Gaussian marginals; each
+gaussianize flattens it. Loop until the cloud is round — **that alternation, not
+marginals alone, is RBIG.**
+
+## #2 Forward to Gaussian, Backward to Data
+
+```{python}
+#| echo: false
+#| fig-width: 11
+#| fig-height: 3.6
+a, b = datasets.tail_dependent_pair(n=1500, seed=1)
+X = np.column_stack([a, b])
+rbig = AnnealedRBIG(n_layers=30, random_state=0).fit(X)
+Z = rbig.transform(X); gen = rbig.sample(len(X))
+fig, axes = plt.subplots(1, 3, figsize=(11, 3.6))
+panels = [(X, COOL, f"data · co-crash {cocrash_fraction(X[:,0],X[:,1]):.0%}"),
+          (Z, plotting.PALETTE["green"], "RBIG forward (spherical)"),
+          (gen, WARM, f"RBIG sample · co-crash {cocrash_fraction(gen[:,0],gen[:,1]):.0%}")]
+for ax, (data, col, t) in zip(axes, panels):
+    ax.scatter(data[:, 0], data[:, 1], s=7, c=col, alpha=0.35, edgecolors="none")
+    ax.set_title(t, fontsize=11); ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+fig.tight_layout(); plt.show()
+```
+
+**What it removes going forward, it regenerates going backward.**
+
+## #3 Total Correlation · Make a Meatball
+
+Same ingredients, laid out loose, fill the whole bowl. Bind them into one ball and
+they **overlap** — the room you save is exactly what they *share*.
+
+```{python}
+#| echo: false
+#| fig-width: 8
+#| fig-height: 3.4
+from matplotlib.patches import Ellipse
+rng = np.random.default_rng(3)
+n = 1200
+L = rng.multivariate_normal([0, 0], [[1, 0], [0, 1]], n)
+rho = 0.85
+M = rng.multivariate_normal([0, 0], [[1, rho], [rho, 1]], n)
+
+
+def cov_ellipse(ax, cov, color):
+    vals, vecs = np.linalg.eigh(cov)
+    order = vals.argsort()[::-1]
+    vals, vecs = vals[order], vecs[:, order]
+    ang = np.degrees(np.arctan2(vecs[1, 0], vecs[0, 0]))
+    w, h = 2 * 2 * np.sqrt(vals)  # 2-sigma footprint
+    ax.add_patch(Ellipse((0, 0), w, h, angle=ang, fill=False,
+                         edgecolor=color, lw=2.4))
+
+
+lim = 3.6
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(8, 3.4))
+for ax, D, cov, t in [
+    (axL, L, [[1, 0], [0, 1]], "loose — fills the bowl"),
+    (axR, M, [[1, rho], [rho, 1]], "bound into a meatball — tighter"),
+]:
+    ax.scatter(D[:, 0], D[:, 1], s=6, c=WARM, alpha=0.35, edgecolors="none")
+    cov_ellipse(ax, np.array(cov), INK)
+    ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim); ax.set_aspect("equal")
+    ax.set_xticks([]); ax.set_yticks([]); ax.set_title(t, fontsize=11); despine(ax)
+fig.tight_layout(); plt.show()
+```
+
+Same marginals both sides — only the binding differs. That saved room, every
+marginal's spread minus the joint's, is **total correlation**:
+
+$$\mathrm{TC}(x) = \sum_i H(x_i) - H(x) = \operatorname{KL}\!\big(p \,\|\, \textstyle\prod_i p_i\big)$$
+
+Gaussianize and you can squeeze it out — and *measure* it — even in high dimensions.
+
+## #3 Back to ρ — Comparable With the Other Roads
+
+Two variables ⇒ total correlation **is** mutual information. For a Gaussian it's a
+clean function of ρ:
+
+$$I(X;Y) = -\tfrac12\ln\!\big(1-\rho^2\big)$$
+
+```{python}
+#| echo: false
+#| fig-width: 7
+#| fig-height: 3.0
+rng = np.random.default_rng(0)
+rhos = np.linspace(0, 0.9, 10)
+truth = [-0.5 * np.log(1 - r**2) for r in rhos]
+est = [mutual_information_xy(*rng.multivariate_normal([0, 0], [[1, r], [r, 1]],
+       size=4000).T, bins=24) for r in rhos]
+fig, ax = plt.subplots(figsize=(7, 3.0))
+ax.plot(rhos, truth, c=INK, lw=2.4, label="exact  −½ln(1−ρ²)")
+ax.plot(rhos, est, "o", c=COOL, label="estimate")
+ax.set_xlabel("ρ"); ax.set_ylabel("MI (nats)"); ax.legend(fontsize=10, frameon=False)
+despine(ax); fig.tight_layout(); plt.show()
+```
+
+Linfoot puts those nats back on the correlation scale, $R=\sqrt{1-e^{-2I}}$, so MI
+lines up beside Pearson, Spearman, dCor and HSIC on the scorecard.
+
+## #4 Normalizing Flows — Learn the Map {.center}
+
+RBIG's map is *fixed* (rank-Gaussianize + rotate).
+
+. . .
+
+A **flow** *learns* $T$: a chain of invertible layers, trained by maximum
+likelihood — bending to dependence too rich for fixed rotations.
+
+. . .
+
+Same forward/backward spine, more capacity, more training cost
+([gauss_flows](https://github.com/jejjohnson/gauss_flows), JAX).
+
+## The Punchline → Demo {.center}
+
+One invertible map, three jobs:
+
+. . .
+
+**measure** dependence (forward) · **remove** it (Module 4) · **generate** it
+(backward).
+
+. . .
+
+The demo fits RBIG and a flow on real returns, estimates mutual information, and
+samples scenarios that keep the co-crash.
+
+. . .
+
+*Next: run it backward as a risk engine — [Uncertainty](03-uncertainty.qmd).*

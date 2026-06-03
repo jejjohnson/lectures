@@ -11,9 +11,9 @@ from __future__ import annotations
 
 from hydra_zen import ZenStore, builds, launch, make_config
 
-from myproject.models.baseline import BaselineModel
-from myproject.trainers.trainer import Trainer
-from myproject.utils.reproducibility import seed_everything
+from lectures.models.baseline import BaselineModel
+from lectures.trainers.trainer import Trainer
+from lectures.utils.reproducibility import seed_everything
 
 
 # --- Build structured configs from Python classes ---

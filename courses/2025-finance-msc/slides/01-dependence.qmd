@@ -1,0 +1,849 @@
+---
+title: "Measuring Dependence"
+subtitle: "Module 1 · Probabilistic ML for Finance"
+format:
+  revealjs:
+    theme: [default, ../../../styles/slides.scss]
+    slide-number: true
+    incremental: true
+    transition: fade
+    fig-align: center
+    auto-stretch: false # keep figures at their natural aspect (no fill-to-height distortion)
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, GRID, PANEL, despine, annotate_box
+from lectures.measures import distance_correlation, mutual_information_bits, linfoot_r, hsic_rbf, cka_rbf
+plotting.set_style("slides")
+import numpy as np, matplotlib.pyplot as plt
+from matplotlib.patches import Circle, Ellipse, FancyBboxPatch, Rectangle
+from matplotlib.gridspec import GridSpec
+from scipy.stats import pearsonr, spearmanr
+
+
+def _venn_circle(ax, xy, r, color, alpha=0.32):
+    ax.add_patch(Circle(xy, r, facecolor=color, edgecolor=color, lw=2.4, alpha=alpha, zorder=2))
+    ax.add_patch(Circle(xy, r, facecolor="none", edgecolor=color, lw=2.4, zorder=3))
+```
+
+## A Bad Morning {.center}
+
+> "The portfolio was diversified. Low correlations everywhere."
+>
+> Then one shock arrived — and everything fell at once.
+
+. . .
+
+**What did the number miss?**
+
+That question drives this entire lecture.
+
+## Your Data
+
+In finance you work with:
+
+- **Daily returns** — fat-tailed, volatility-clustered
+- **Factor exposures** — linear structure, but the residuals aren't
+- **Credit tables** — binary outcomes, group structure
+
+The *joint* behaviour is what matters.  Marginals lie.
+
+## Why It's Hard — The Shapes {auto-animate=true}
+
+```{python}
+#| echo: false
+#| fig-width: 10
+#| fig-height: 3.8
+rng = np.random.default_rng(7)
+n = 350
+t = rng.normal(size=n)
+x1 = 0.8*t + 0.4*rng.normal(size=n); y1 = 0.8*t + 0.4*rng.normal(size=n)  # linear
+x2 = rng.uniform(-2.5,2.5,n); y2 = x2**2 + 0.5*rng.normal(size=n)          # U-shape
+x3 = rng.normal(size=n); y3 = rng.normal(size=n)                             # tail crash
+crash = rng.random(n) < 0.08
+x3[crash] -= rng.uniform(2,4,crash.sum()); y3[crash] -= rng.uniform(2,4,crash.sum())
+
+fig, axes = plt.subplots(1, 3, figsize=(11, 3.8))
+titles = ["Linear (Pearson sees this)", "Non-linear (Pearson blind)", "Tail crash (Pearson blind)"]
+data = [(x1,y1,COOL,None), (x2,y2,WARM,None), (x3,y3,COOL,crash)]
+for ax, (x,y,col,m), title in zip(axes, data, titles):
+    if m is None:
+        ax.scatter(x, y, s=12, c=col, alpha=0.5, edgecolors="none")
+    else:
+        ax.scatter(x[~m], y[~m], s=12, c=col, alpha=0.4, edgecolors="none")
+        ax.scatter(x[m], y[m], s=20, c=CRASH, alpha=0.9, edgecolors="none")
+    ax.set_title(title, fontsize=12)
+    ax.set_xticks([]); ax.set_yticks([])
+    despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+## The Running Characters {.center}
+
+We follow **two pairs** down every rung of the ladder.
+
+. . .
+
+**The banks** — strong dependence + joint crashes.
+Pearson says "high". The lesson is the extra tail risk it misses.
+
+. . .
+
+**The convex payoff** — $v = |u| + \text{noise}$.
+Pearson says "nothing". The ladder's hero case.
+
+## Two Roads to Measure Dependence
+
+There are only **two ways** to ask "how much do these move together?"
+
+. . .
+
+**Road 1 — compare directly** (no density):
+`compare( transform(x), transform(y) )`
+Pearson · Spearman · distance correlation · HSIC
+
+. . .
+
+**Road 2 — through the density** (information):
+how far is the joint from independent, *in bits*?
+entropy · mutual information · total correlation · Linfoot · Gaussianization
+
+. . .
+
+The **transform** is the thread through both.
+
+---
+
+## Road 1 · Compare Directly {.center}
+
+No density required — **transform** each variable, then measure a **distance**:
+
+`measure = compare( transform(x), transform(y) )`
+
+. . .
+
+Four rungs of increasing reach:
+**Pearson → Spearman → distance correlation → HSIC**.
+
+---
+
+## #1 Pearson — The Line {auto-animate=true}
+
+$$r = \frac{\operatorname{cov}(X,Y)}{\sigma_X\,\sigma_Y} \in [-1, 1]$$
+
+- Measures **linear** co-movement only
+- Fast, familiar, the default everywhere
+
+## #1 Pearson — In Pictures
+
+```{python}
+#| echo: false
+x, y = datasets.correlated_returns(rho=0.6)
+r = np.corrcoef(x, y)[0, 1]
+fig, ax = plt.subplots(figsize=(6, 3.6))
+ax.scatter(x, y, s=14, alpha=0.5, color=COOL)
+plotting.finalize(ax, f"Pearson r = {r:.2f}")
+ax.set_xlabel("Asset A return"); ax.set_ylabel("Asset B return")
+despine(ax)
+plt.tight_layout()
+plt.show()
+```
+
+## #1 Pearson — Our Characters
+
+```{python}
+#| echo: false
+a, b, crash = datasets.two_banks(n=500)
+u, v = datasets.convex_payoff(n=500)
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(10, 3.8))
+axL.scatter(a[~crash], b[~crash], s=12, c=COOL, alpha=0.5, edgecolors="none")
+axL.scatter(a[crash], b[crash], s=18, c=CRASH, alpha=0.9, edgecolors="none")
+axL.set_title(f"Banks   r = {pearsonr(a,b)[0]:+.2f}", fontsize=12)
+despine(axL)
+axR.scatter(u, v, s=12, c=WARM, alpha=0.55, edgecolors="none")
+axR.set_title(f"Convex   r = {pearsonr(u,v)[0]:+.2f}", fontsize=12)
+despine(axR)
+for ax in (axL,axR): ax.set_xticks([]); ax.set_yticks([])
+fig.tight_layout()
+plt.show()
+```
+
+The convex pair: Pearson ≈ 0 despite $v$ being almost a deterministic function of $u$.
+
+---
+
+## #2 Spearman — Ranks
+
+$$\rho_S = \operatorname{corr}(\operatorname{rank}(X),\; \operatorname{rank}(Y))$$
+
+Only one slot changes from Pearson — the **transform**:
+
+```
+Pearson   = corr( x       , y       )
+Spearman  = corr( rank(x) , rank(y) )
+```
+
+Catches any *monotonic* relationship.  Fails on U-shapes.
+
+## #2 Spearman — The Seed
+
+Notice: Pearson and Spearman are the **same move**, different transform.
+
+```
+general = compare( transform(x) , transform(y) )
+```
+
+. . .
+
+**First road**: compare directly, never needing the distribution.
+
+Plant the seed: *do you need the distribution?*
+**No** → stay here. **Yes** → the other road.
+
+---
+
+## Same Correlation, Different Reality
+
+**All four share Pearson ≈ 0.30** — yet each hides a different reality.
+
+```{python}
+#| echo: false
+rng = np.random.default_rng(7)
+N, TARGET = 600, 0.30
+
+def tune(xx, struct, target, rng):
+    s = (struct - struct.mean()) / struct.std()
+    ind = rng.normal(0, 1, len(xx)); ind = (ind - ind.mean()) / ind.std()
+    best = None
+    for w in np.linspace(0.05, 1, 200):
+        yy = w * s + (1 - w) * ind
+        r = pearsonr(xx, yy)[0]
+        if best is None or abs(abs(r) - target) < abs(abs(best[1]) - target):
+            best = (yy, r)
+    return best
+
+xa = rng.normal(0, 1, N); ya, ra = tune(xa, xa, TARGET, rng)
+xb = rng.uniform(-3, 3, N); yb, rb = tune(xb, -(xb**2)+0.9*xb, TARGET, rng)
+xc0 = rng.normal(0,1,N); yc0 = rng.normal(0,1,N); rc, crash_c = None, None
+for frac in np.linspace(0.04, 0.18, 40):
+    m = rng.random(N) < frac
+    xx, yy = xc0.copy(), yc0.copy()
+    sh = rng.uniform(1.3, 3.2, m.sum())
+    xx[m] = -sh + rng.normal(0, .18, m.sum()); yy[m] = -sh + rng.normal(0, .18, m.sum())
+    r = pearsonr(xx, yy)[0]
+    if rc is None or abs(r - TARGET) < abs(rc - TARGET):
+        rc, crash_c, xc, yc = r, m, xx, yy
+xd = rng.uniform(-3, 3, N); nd = rng.normal(0, 1, N)
+best_d = None
+for a in np.linspace(0, 1.3, 220):
+    yy = a * xd + nd * (0.25 + 0.7 * np.abs(xd))
+    r = pearsonr(xd, yy)[0]
+    if best_d is None or abs(r - TARGET) < abs(best_d[1] - TARGET):
+        best_d = (yy, r)
+yd, rd = best_d
+
+panels = [("Linear", xa, ya, ra, None), ("Curved", xb, yb, rb, None),
+          ("Quiet, then crash", xc, yc, rc, crash_c), ("Drift + rising risk", xd, yd, rd, None)]
+fig, axes = plt.subplots(2, 2, figsize=(10.5, 6.0))
+for ax, (t, x, y, r, mask) in zip(axes.flat, panels):
+    if mask is None:
+        ax.scatter(x, y, s=22, c=COOL, alpha=0.5, edgecolors="none")
+    else:
+        ax.scatter(x[~mask], y[~mask], s=22, c=COOL, alpha=0.45, edgecolors="none")
+        ax.scatter(x[mask], y[mask], s=34, c=CRASH, alpha=0.9, edgecolors="none")
+    ax.set_title(f"{t}    ·    Pearson = {r:+.2f}", fontsize=14)
+    ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+---
+
+## #3 Distance Correlation — Any Shape {.center}
+
+Still **no density** — but it compares *all pairwise distances*, so it sees **any**
+dependence, not just lines.  And it is **zero if and only if independent**.
+
+```{python}
+#| echo: false
+a, b, _ = datasets.two_banks(n=500)
+u, v = datasets.convex_payoff(n=500)
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(10, 4.2))
+axL.scatter(a, b, s=14, c=COOL, alpha=0.5, edgecolors="none")
+axL.set_title(f"Banks\nPearson {pearsonr(a, b)[0]:+.2f}   ·   dCor {distance_correlation(a, b):.2f}",
+              fontsize=14)
+axR.scatter(u, v, s=14, c=WARM, alpha=0.55, edgecolors="none")
+axR.set_title(f"Convex\nPearson {pearsonr(u, v)[0]:+.2f}   ·   dCor {distance_correlation(u, v):.2f}",
+              fontsize=14)
+for ax in (axL, axR):
+    ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+fig.tight_layout(); plt.show()
+```
+
+Pearson sees a line and misses the V; distance correlation catches both.
+
+---
+
+## #4 HSIC — Dependence Without a Density {.center}
+
+$$\operatorname{HSIC}(X, Y) = \frac{1}{(n-1)^2}\operatorname{tr}(K_X H K_Y H)$$
+
+- Zero *exactly* under independence
+- No density estimate needed
+- **Differentiable** → usable as a training penalty
+
+. . .
+
+The kernel generalization of distance correlation — the most general Road 1 test.
+*The same HSIC becomes the fairness penalty in Lecture 2.*
+
+---
+
+## Road 1 · Side by Side {.center}
+
+Same two characters, all four rungs.  Each new rung catches what the last missed:
+
+```{python}
+#| echo: false
+a, b, _ = datasets.two_banks(n=500)
+u, v = datasets.convex_payoff(n=500)
+methods = ["Pearson", "Spearman", "distance\ncorr", "HSIC"]
+banks = [abs(pearsonr(a, b)[0]), abs(spearmanr(a, b)[0]),
+         distance_correlation(a, b), cka_rbf(a, b)]
+convex = [abs(pearsonr(u, v)[0]), abs(spearmanr(u, v)[0]),
+          distance_correlation(u, v), cka_rbf(u, v)]
+xs = np.arange(4); wbar = 0.38
+fig, ax = plt.subplots(figsize=(10.5, 4.6))
+ax.axvspan(-0.5, 1.5, color=CRASH, alpha=0.06)
+ax.bar(xs - wbar / 2, banks, wbar, color=COOL, label="Banks (a line)")
+ax.bar(xs + wbar / 2, convex, wbar, color=WARM, label="Convex (a V)")
+ax.set_xticks(xs); ax.set_xticklabels(methods, fontsize=14)
+ax.set_ylabel("dependence detected"); ax.set_ylim(0, 1)
+ax.text(0.5, 0.93, "blind to the V", ha="center", fontsize=13, color=CRASH,
+        style="italic", fontweight="bold")
+ax.text(2.5, 0.93, "sees any shape", ha="center", fontsize=13,
+        color=plotting.PALETTE["green"], style="italic", fontweight="bold")
+ax.legend(fontsize=12, frameon=False, loc="center right")
+despine(ax); fig.tight_layout(); plt.show()
+```
+
+Pearson & Spearman collapse on the convex V; distance correlation and HSIC hold.
+
+---
+
+## Road 2 · Through the Density {.center}
+
+A different question: *how far is the joint from independent — in bits?*
+
+That needs the **density** $p(x,y)$ — **assume** its shape (parametric, fast, wrong
+in the tails) or **learn** it (Gaussianization).
+
+. . .
+
+**Independence → entropy → MI → total correlation → Linfoot → Gaussianization**
+
+---
+
+## Independence as the Reference
+
+Independent means $p(x, y) = p(x)\,p(y)$.  Shuffle one column and you *build* that
+reference: same marginals, all dependence destroyed.  **Dependence = distance from
+the shuffled version.**
+
+```{python}
+#| echo: false
+rng = np.random.default_rng(1)
+n = 450
+x = rng.normal(size=n); y = 0.9 * x + 0.45 * rng.normal(size=n)
+y_ref = rng.permutation(y)                      # same values, link destroyed
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(9.5, 4.3), sharex=True, sharey=True)
+axL.scatter(x, y, s=20, c=WARM, alpha=0.55, edgecolors="none")
+axL.set_title("The data — dependent", fontsize=14)
+axR.scatter(x, y_ref, s=20, c=COOL, alpha=0.55, edgecolors="none")
+axR.set_title("Independent reference — Y shuffled", fontsize=14)
+for ax in (axL, axR):
+    ax.set_xlabel("X"); ax.set_ylabel("Y"); ax.set_xticks([]); ax.set_yticks([])
+    despine(ax)
+fig.tight_layout(); plt.show()
+```
+
+Measuring *how far* the data is from that reference — in bits — is mutual
+information.
+
+---
+
+## #5 Entropy — Information Is Surprise {.center}
+
+A rare event is **surprising**; a near-certain one tells you almost nothing.
+*Information* puts a number on that surprise:
+
+$$I(x) = \log\frac{1}{p(x)}$$
+
+The rarer the outcome, the more bits it carries.
+
+---
+
+## #5 Entropy — The Average Surprise
+
+**Entropy is the *expected* surprise** — how unpredictable a variable is on average:
+
+$$H(X) = \mathbb{E}\!\left[\log\frac{1}{p(X)}\right] = -\sum_x p(x)\log p(x)$$
+
+```{python}
+#| echo: false
+p = np.linspace(0.001, 0.999, 400)
+H = -p * np.log2(p) - (1 - p) * np.log2(1 - p)
+fig, ax = plt.subplots(figsize=(7.8, 4.0))
+ax.plot(p, H, color=COOL, lw=3)
+marks = [(0.5, "fair coin\n1 bit", (0, -52)), (0.9, "biased 90/10\n0.47 bit", (-2, 14))]
+for pv, lab, off in marks:
+    hv = -pv * np.log2(pv) - (1 - pv) * np.log2(1 - pv)
+    ax.scatter([pv], [hv], s=80, c=CRASH, zorder=5)
+    ax.annotate(lab, (pv, hv), textcoords="offset points", xytext=off,
+                ha="center", fontsize=12, color=INK)
+ax.set_xlabel("P(heads)"); ax.set_ylabel("entropy H  (bits)")
+ax.set_title("A fair coin is the hardest to predict", fontsize=13)
+ax.set_ylim(0, 1.15); despine(ax); fig.tight_layout(); plt.show()
+```
+
+More volatile returns = higher entropy = genuinely harder to predict.
+
+---
+
+## #6 Mutual Information — The Honest Measure {.center}
+
+**Shared information = each variable's surprise, minus the surprise of the pair:**
+
+$$I(X; Y) = H(X) + H(Y) - H(X,Y) \geq 0$$
+
+**Equivalently — the distance from the independent reference:**
+
+$$I(X;Y) = D_{\mathrm{KL}}\big(p(x,y)\,\|\,p(x)\,p(y)\big)$$
+
+Zero *only* under independence; positive whenever they share structure.
+
+---
+
+## Mutual Information — Overlap Is Shared Bits {.center}
+
+Toy data, the Venn it maps to, and the bits of MI it earns:
+
+```{python}
+#| echo: false
+rng = np.random.default_rng(3)
+n = 2500
+xd = rng.uniform(-2.5, 2.5, n); yd = xd**2 + 0.5 * rng.normal(size=n)  # dependent (curved)
+xi = rng.normal(size=n); yi = rng.normal(size=n)                        # independent
+
+def mi_bits(x, y):
+    return mutual_information_bits(np.histogram2d(x, y, bins=10)[0])
+
+fig = plt.figure(figsize=(9.5, 6.0))
+gs = GridSpec(2, 2, height_ratios=[1.25, 1], hspace=0.3, wspace=0.18)
+
+# top row — the toy data
+axDs = fig.add_subplot(gs[0, 0])
+axDs.scatter(xd, yd, s=8, c=WARM, alpha=0.4, edgecolors="none")
+axDs.set_title("Dependent data (curved)", fontsize=13)
+axIs = fig.add_subplot(gs[0, 1])
+axIs.scatter(xi, yi, s=8, c=COOL, alpha=0.4, edgecolors="none")
+axIs.set_title("Independent data", fontsize=13)
+for ax in (axDs, axIs):
+    ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+
+# bottom row — the Venn it maps to, with MI
+def mini_venn(ax, overlap, mi, label):
+    ax.set_xlim(0, 10); ax.set_ylim(0, 6); ax.axis("off"); ax.set_aspect("equal")
+    dx = 1.5 if overlap else 2.7
+    _venn_circle(ax, (5 - dx, 3), 2.0, COOL)
+    _venn_circle(ax, (5 + dx, 3), 2.0, WARM)
+    if overlap:
+        ax.text(5, 3, "MI", family="monospace", ha="center", va="center",
+                fontsize=13, fontweight="bold", color=INK, zorder=6)
+    ax.set_title(f"{label}  →  MI = {mi:.2f} bit", fontsize=13, fontweight="bold")
+
+mini_venn(fig.add_subplot(gs[1, 0]), True, mi_bits(xd, yd), "overlap")
+mini_venn(fig.add_subplot(gs[1, 1]), False, mi_bits(xi, yi), "no overlap")
+plt.show()
+```
+
+---
+
+## The Overlap *Is* Mutual Information {.center}
+
+```{python}
+#| echo: false
+fig, ax = plt.subplots(figsize=(8.2, 4.6))
+ax.set_xlim(0, 10); ax.set_ylim(0, 8); ax.axis("off"); ax.set_aspect("equal")
+r, cx1, cx2, cy = 2.1, 4.0, 6.0, 4.2
+_venn_circle(ax, (cx1, cy), r, COOL)
+_venn_circle(ax, (cx2, cy), r, WARM)
+ax.text(cx1 - 1.1, cy + 1.1, "H(X)", family="monospace", fontsize=20, color=COOL, fontweight="bold", ha="center")
+ax.text(cx2 + 1.1, cy + 1.1, "H(Y)", family="monospace", fontsize=20, color=WARM, fontweight="bold", ha="center")
+ax.text(5.0, cy, "I(X;Y)", family="monospace", fontsize=17, color=INK, fontweight="bold", ha="center", zorder=5)
+ax.text(5.0, 0.8, "I(X;Y) = H(X) + H(Y) - H(X,Y)", family="monospace", fontsize=16, color=INK, ha="center",
+        bbox=dict(boxstyle="round,pad=0.4", fc=PANEL, ec=GRID))
+fig.tight_layout(); plt.show()
+```
+
+The shared area is *what knowing one tells you about the other*.
+
+---
+
+## The Dial · Scalar → Entropy {.center}
+
+So far one sample = one **day**: a single value.  Its uncertainty is **entropy**.
+
+```{python}
+#| echo: false
+# series + a reusable one-row panel (reused on the next two slides)
+rng = np.random.default_rng(7)
+T = 26; t = np.arange(T)
+common = np.cumsum(rng.normal(0, 1, T))
+x_series = 0.7 * common + np.cumsum(rng.normal(0, 0.5, T))
+y_series = 0.7 * np.roll(common, 1) + np.cumsum(rng.normal(0, 0.5, T))
+x_series = (x_series - x_series.mean()) / x_series.std()
+y_series = (y_series - y_series.mean()) / y_series.std()
+
+
+def _dial(highlight=None, second_hl=None, measure="", desc="", mcolor=COOL, two=False):
+    fig = plt.figure(figsize=(11, 3.3))
+    gs = GridSpec(1, 2, figure=fig, width_ratios=[1.85, 1], wspace=0.12)
+    ax = fig.add_subplot(gs[0, 0])
+    ax.plot(t, x_series, color=COOL, lw=2.2, marker="o", ms=4, label="X")
+    if two:
+        ax.plot(t, y_series, color=WARM, lw=2.2, marker="o", ms=4, label="Y")
+        ax.legend(loc="upper right", fontsize=12, frameon=False, ncol=2)
+    y0, y1 = ax.get_ylim()
+    if highlight is not None:
+        s, w = highlight
+        ax.axvspan(s - 0.4, s + w - 0.6, color=COOL, alpha=0.15, lw=0)
+        ax.add_patch(FancyBboxPatch((s - 0.4, y0), w - 0.2, y1 - y0, boxstyle="round,pad=0",
+                                    fill=False, edgecolor=COOL, lw=2.5, zorder=5))
+    if second_hl is not None:
+        s, w = second_hl
+        ax.axvspan(s - 0.4, s + w - 0.6, color=WARM, alpha=0.15, lw=0)
+        ax.add_patch(FancyBboxPatch((s - 0.4, y0), w - 0.2, y1 - y0, boxstyle="round,pad=0",
+                                    fill=False, edgecolor=WARM, lw=2.5, zorder=5))
+    ax.set_xticks([]); ax.set_yticks([])
+    ax.set_xlabel("time (trading days) →", fontsize=13, color="#555")
+    ax.set_ylabel("return", fontsize=13, color="#555")
+    for sp in ax.spines.values():
+        sp.set_edgecolor(GRID)
+    axR = fig.add_subplot(gs[0, 1]); axR.axis("off")
+    axR.text(0.5, 0.66, desc, ha="center", fontsize=14, color="#555")
+    axR.text(0.5, 0.28, measure, family="monospace", ha="center", fontsize=26,
+             fontweight="bold", color=mcolor, bbox=dict(boxstyle="round,pad=0.45", fc=PANEL, ec=GRID))
+    plt.show()
+
+
+_dial(highlight=(8, 1), measure="H(X)", desc="uncertainty of one value")
+```
+
+One value per day → $H(X)$, the surprise of a single variable.
+
+---
+
+## The Dial · Window → Total Correlation {.center}
+
+Widen the window: a sample is now a **vector** of days.
+
+```{python}
+#| echo: false
+_dial(highlight=(8, 3), measure="T(x)", desc="redundancy WITHIN the window")
+```
+
+The days inside a window share information → $T(\mathbf{x})$, total correlation.
+
+---
+
+## The Dial · Two Windows → Mutual Information {.center}
+
+Now two series: compare a window of **X** against a window of **Y**.
+
+```{python}
+#| echo: false
+_dial(highlight=(6, 3), second_hl=(16, 3), measure="I(X;Y)",
+      desc="shared info BETWEEN two windows", mcolor="#7d6b8f", two=True)
+```
+
+What the two windows share → $I(X;Y)$, mutual information.
+
+---
+
+## A Portfolio Is Not Two Columns {.center}
+
+```{python}
+#| echo: false
+fig, ax = plt.subplots(figsize=(8.4, 4.6))
+ax.set_xlim(0, 10); ax.set_ylim(0, 6); ax.axis("off")
+d = 8; cx, cy, Rr = 5.0, 3.1, 2.2
+pts = [(cx + Rr * np.cos(2 * np.pi * k / d + np.pi / 2),
+        cy + Rr * np.sin(2 * np.pi * k / d + np.pi / 2)) for k in range(d)]
+for i in range(d):
+    for j in range(i + 1, d):
+        ax.plot([pts[i][0], pts[j][0]], [pts[i][1], pts[j][1]], color=GRID, lw=0.7, alpha=0.7, zorder=1)
+for (x, y) in pts:
+    ax.add_patch(Circle((x, y), 0.24, facecolor=COOL, edgecolor=INK, lw=1.3, zorder=3))
+ax.text(cx, cy, f"{d * (d - 1) // 2}\npairs", fontsize=16, color=CRASH, fontweight="bold",
+        ha="center", va="center", zorder=5, bbox=dict(boxstyle="round,pad=0.3", fc="white", ec=CRASH))
+fig.tight_layout(); plt.show()
+```
+
+Pairwise MI checks every pair — but redundancy shared by three or more names is invisible to any pair.
+
+---
+
+## The Shared Core Is Total Correlation {.center}
+
+```{python}
+#| echo: false
+fig, ax = plt.subplots(figsize=(7.6, 5.2))
+ax.set_xlim(0, 10); ax.set_ylim(0, 8.6); ax.axis("off"); ax.set_aspect("equal")
+cols = [COOL, WARM, plotting.PALETTE["green"]]; names = ["X1", "X2", "X3"]
+cx, cy, R, r = 5.0, 4.6, 1.15, 2.0
+for k in range(3):
+    ang = np.pi / 2 + k * 2 * np.pi / 3
+    _venn_circle(ax, (cx + R * np.cos(ang), cy + R * np.sin(ang)), r, cols[k], alpha=0.30)
+for (lx, ly), nm, col in zip([(cx, cy + R + r + 0.5), (cx - (R + r) * 0.92, cy - R * 0.5 - 0.2),
+                              (cx + (R + r) * 0.92, cy - R * 0.5 - 0.2)], names, cols):
+    ax.text(lx, ly, f"H({nm})", family="monospace", fontsize=16, color=col, fontweight="bold", ha="center", va="center")
+ax.text(cx, cy, "T(x)", family="monospace", fontsize=20, color=INK, fontweight="bold", ha="center", va="center", zorder=8)
+ax.text(cx, 1.0, "T(x) = sum_i H(Xi) - H(X1...Xd)", family="monospace", fontsize=15, color=INK, ha="center",
+        bbox=dict(boxstyle="round,pad=0.4", fc=PANEL, ec=GRID))
+fig.tight_layout(); plt.show()
+```
+
+Multivariate mutual information — the redundancy binding a basket together.
+
+---
+
+## Mutual Information *Between* Whole Groups {.center}
+
+```{python}
+#| echo: false
+fig, ax = plt.subplots(figsize=(9.4, 5.0))
+ax.set_xlim(0, 11); ax.set_ylim(0, 7.2); ax.axis("off"); ax.set_aspect("equal")
+
+def _block(center, tagcol):
+    bx, by = center
+    for k in range(3):
+        ang = np.pi / 2 + k * 2 * np.pi / 3
+        pos = (bx + 0.55 * np.cos(ang), by + 0.55 * np.sin(ang))
+        ax.add_patch(Circle(pos, 1.05, facecolor=tagcol, edgecolor=tagcol, lw=1.8, alpha=0.22, zorder=2))
+        ax.add_patch(Circle(pos, 1.05, facecolor="none", edgecolor=tagcol, lw=1.8, alpha=0.6, zorder=3))
+    ax.text(bx, by, "T", family="monospace", fontsize=16, color=tagcol, fontweight="bold", ha="center", va="center", zorder=6)
+
+_block((3.2, 3.9), COOL); _block((7.8, 3.9), WARM)
+ax.add_patch(Ellipse((5.5, 3.9), 2.4, 3.0, facecolor="#7d6b8f", edgecolor="#5e4f6e", lw=1.6, alpha=0.30, zorder=4))
+ax.text(5.5, 3.9, "I(X;Y)", family="monospace", fontsize=15, color=INK, fontweight="bold", ha="center", va="center", zorder=7)
+ax.text(3.2, 6.1, "X = (X1..Xp)", family="monospace", fontsize=15, color=COOL, fontweight="bold", ha="center")
+ax.text(7.8, 6.1, "Y = (Y1..Yq)", family="monospace", fontsize=15, color=WARM, fontweight="bold", ha="center")
+fig.tight_layout(); plt.show()
+```
+
+Each block has internal redundancy $T$; the lens between them is $I(X;Y)$ — and shrinking it is exactly Lecture 2.
+
+---
+
+## All the Measures — One Grid {.center}
+
+Two knobs index every measure: **patch width**, and **within vs between**.
+
+|  | **WITHIN** one variable | **BETWEEN** two variables |
+|---|:---:|:---:|
+| **scalar** | $H(X)$ — entropy | $I(X;Y)$ — mutual information |
+| **vector / block** | $T(\mathbf{x})$ — total correlation | $I(X;Y)$ — block |
+
+One family — the patch dial picks which.
+
+---
+
+## The Whole Story in One Grid {.center}
+
+```{python}
+#| echo: false
+def _cell_grid(ax, x0, y0, ncol, nrow, cw, ch, color, alpha=0.5, gap=0.06, labels=None):
+    for i in range(nrow):
+        for j in range(ncol):
+            cx = x0 + j * (cw + gap); cy = y0 - i * (ch + gap)
+            ax.add_patch(Rectangle((cx, cy), cw, ch, facecolor=color, edgecolor="white", lw=1.2, alpha=alpha))
+            if labels is not None:
+                ax.text(cx + cw / 2, cy + ch / 2, str(labels[i][j]), ha="center", va="center",
+                        fontsize=15, color="white", fontweight="bold", zorder=5)
+
+LENS = "#7d6b8f"
+fig = plt.figure(figsize=(13.5, 8.0))
+gs = GridSpec(3, 3, figure=fig, width_ratios=[1.0, 1.3, 1.05], hspace=0.55, wspace=0.22)
+for c, h in enumerate(["THE QUESTION", "THE MANIPULATION", "THE PICTURE"]):
+    ax = fig.add_subplot(gs[0, c]); ax.axis("off")
+    ax.text(0.5, 1.18, h, transform=ax.transAxes, ha="center", fontsize=15, fontweight="bold", color=COOL)
+
+# Row 1 — two scalar columns
+axQ = fig.add_subplot(gs[0, 0]); axQ.axis("off")
+axQ.text(0.5, 0.5, "Move together\nday to day?", ha="center", va="center", transform=axQ.transAxes,
+         fontsize=18, color=INK, fontweight="bold")
+axM = fig.add_subplot(gs[0, 1]); axM.axis("off"); axM.set_xlim(0, 10); axM.set_ylim(0, 10)
+_cell_grid(axM, 3.0, 8.5, 1, 6, 0.9, 0.9, COOL); _cell_grid(axM, 6.1, 8.5, 1, 6, 0.9, 0.9, WARM)
+axM.text(3.45, 9.7, "X", ha="center", fontsize=15, color=COOL, fontweight="bold")
+axM.text(6.55, 9.7, "Y", ha="center", fontsize=15, color=WARM, fontweight="bold")
+axM.text(5, 1.4, "each row = one day", ha="center", fontsize=12, style="italic", color="#666")
+axP = fig.add_subplot(gs[0, 2]); axP.axis("off"); axP.set_xlim(0, 10); axP.set_ylim(0, 10); axP.set_aspect("equal")
+for cxx, col in [(4.2, COOL), (5.8, WARM)]:
+    axP.add_patch(Circle((cxx, 5.5), 2.1, facecolor=col, edgecolor=col, lw=2, alpha=0.30))
+axP.text(5.0, 5.5, "I(X;Y)", family="monospace", ha="center", va="center", fontsize=14, fontweight="bold", color=INK)
+axP.text(5.0, 1.4, "Pearson / MI", ha="center", fontsize=14, color=INK, fontweight="bold")
+
+# Row 2 — one series chunked into patches
+axQ2 = fig.add_subplot(gs[1, 0]); axQ2.axis("off")
+axQ2.text(0.5, 0.5, "Structure across\na window?", ha="center", va="center", transform=axQ2.transAxes,
+          fontsize=18, color=INK, fontweight="bold")
+axM2 = fig.add_subplot(gs[1, 1]); axM2.axis("off"); axM2.set_xlim(0, 10); axM2.set_ylim(0, 10)
+_cell_grid(axM2, 0.6, 8.6, 1, 6, 0.8, 0.8, COOL, alpha=0.45, labels=[[d] for d in range(1, 7)])
+axM2.annotate("", xy=(4.0, 5.2), xytext=(2.1, 5.2), arrowprops=dict(arrowstyle="-|>", color=INK, lw=2.5))
+axM2.text(3.05, 6.2, "w=3", ha="center", fontsize=13, color=INK, fontweight="bold")
+_cell_grid(axM2, 4.6, 8.6, 3, 4, 0.95, 0.95, COOL, alpha=0.6, labels=[[1, 2, 3], [2, 3, 4], [3, 4, 5], [4, 5, 6]])
+axM2.text(5, 0.6, "windows share days", ha="center", fontsize=12, style="italic", color="#666")
+axP2 = fig.add_subplot(gs[1, 2]); axP2.axis("off"); axP2.set_xlim(0, 10); axP2.set_ylim(0, 10); axP2.set_aspect("equal")
+for k in range(3):
+    ang = np.pi / 2 + k * 2 * np.pi / 3
+    axP2.add_patch(Circle((5 + 0.85 * np.cos(ang), 5.5 + 0.85 * np.sin(ang)), 1.6, facecolor=COOL, edgecolor=COOL, lw=1.6, alpha=0.25))
+axP2.text(5, 5.5, "T(x)", family="monospace", ha="center", va="center", fontsize=16, fontweight="bold", color=INK)
+axP2.text(5, 1.4, "total correlation", ha="center", fontsize=14, color=INK, fontweight="bold")
+
+# Row 3 — two series patched, aligned
+axQ3 = fig.add_subplot(gs[2, 0]); axQ3.axis("off")
+axQ3.text(0.5, 0.5, "Two windowed\nseries share?", ha="center", va="center", transform=axQ3.transAxes,
+          fontsize=18, color=INK, fontweight="bold")
+axM3 = fig.add_subplot(gs[2, 1]); axM3.axis("off"); axM3.set_xlim(0, 10); axM3.set_ylim(0, 10)
+blk = [[1, 2, 3], [2, 3, 4], [3, 4, 5], [4, 5, 6]]
+_cell_grid(axM3, 0.4, 8.8, 3, 4, 0.82, 0.82, COOL, alpha=0.6, labels=blk)
+_cell_grid(axM3, 5.4, 8.8, 3, 4, 0.82, 0.82, WARM, alpha=0.6, labels=blk)
+axM3.text(1.7, 9.9, "X patched", ha="center", fontsize=12, color=COOL, fontweight="bold")
+axM3.text(6.7, 9.9, "Y patched", ha="center", fontsize=12, color=WARM, fontweight="bold")
+axP3 = fig.add_subplot(gs[2, 2]); axP3.axis("off"); axP3.set_xlim(0, 10); axP3.set_ylim(0, 10); axP3.set_aspect("equal")
+for cx0, col in [(3.3, COOL), (6.7, WARM)]:
+    for k in range(3):
+        ang = np.pi / 2 + k * 2 * np.pi / 3
+        axP3.add_patch(Circle((cx0 + 0.5 * np.cos(ang), 5.5 + 0.5 * np.sin(ang)), 1.2, facecolor=col, edgecolor=col, lw=1.2, alpha=0.22))
+axP3.add_patch(Ellipse((5.0, 5.5), 1.8, 2.6, facecolor=LENS, edgecolor="#5e4f6e", lw=1.4, alpha=0.32))
+axP3.text(5.0, 5.5, "I(X;Y)", family="monospace", ha="center", va="center", fontsize=13, fontweight="bold", color=INK)
+axP3.text(5.0, 1.4, "MI between blocks", ha="center", fontsize=13, color=INK, fontweight="bold")
+plt.show()
+```
+
+The question drives the manipulation; the manipulation drives the picture.
+
+---
+
+## #7 Linfoot R — Back to the Correlation Scale
+
+$$R = \sqrt{1 - e^{-2\,I}} \in [0, 1]$$
+
+For a Gaussian pair: $R = |\rho|$ exactly.
+
+. . .
+
+> **Correlation is the shadow that mutual information casts when the world is Gaussian.**
+
+Any gap between $R$ and Pearson on real data is the non-Gaussian,
+tail dependence that correlation structurally cannot see.
+
+---
+
+## #8 Gaussianization — Learn the Density
+
+Iteratively reshape each marginal to Gaussian, rotate to mix residual
+dependence, repeat until the joint *is* a standard Gaussian.
+
+. . .
+
+Every step is invertible → exact log-likelihoods.
+
+**The dependence it must remove IS the data's total correlation.**
+
+. . .
+
+*The same machine, run backward in Lecture 3, generates scenarios.*
+
+---
+
+## The Synthesis — Two Roads {.center}
+
+```
+Do you need the distribution?
+│
+├── NO  →  compare(transform(x), transform(y))
+│          Pearson · Spearman · distance corr · HSIC
+│          (differ only in transform + metric)
+│
+└── YES →  KL(p(x,y) || p(x)p(y))
+           │
+           ├── assume shape  → parametric (fast, wrong in tails)
+           │
+           └── learn shape   → Gaussianization / flows (exact)
+```
+
+The **transform** is the thread through both roads.
+
+---
+
+## The Scorecard — Both Roads {.center}
+
+```{python}
+#| echo: false
+a, b, _ = datasets.two_banks(n=800)
+u, v = datasets.convex_payoff(n=800)
+
+
+def linf(x, y):
+    mb = mutual_information_bits(np.histogram2d(x, y, bins=20)[0])
+    return linfoot_r(mb * np.log(2))  # bits → nats → Linfoot R on [0,1]
+
+
+methods = ["Pearson", "Spearman", "distance\ncorr", "HSIC", "MI\n(Linfoot)"]
+banks = [abs(pearsonr(a, b)[0]), abs(spearmanr(a, b)[0]),
+         distance_correlation(a, b), cka_rbf(a, b), linf(a, b)]
+convex = [abs(pearsonr(u, v)[0]), abs(spearmanr(u, v)[0]),
+          distance_correlation(u, v), cka_rbf(u, v), linf(u, v)]
+xs = np.arange(5); wbar = 0.38
+fig, ax = plt.subplots(figsize=(11, 4.7))
+ax.axvspan(-0.5, 1.5, color=CRASH, alpha=0.06)
+ax.axvline(3.5, color=GRID, lw=1.6, ls="--")
+ax.bar(xs - wbar / 2, banks, wbar, color=COOL, label="Banks (a line)")
+ax.bar(xs + wbar / 2, convex, wbar, color=WARM, label="Convex (a V)")
+ax.text(1.5, 1.07, "Road 1 · no density", ha="center", fontsize=12, color=INK, fontweight="bold")
+ax.text(4.0, 1.07, "Road 2 · information", ha="center", fontsize=12, color=INK, fontweight="bold")
+ax.text(0.5, 0.9, "blind to the V", ha="center", fontsize=12, color=CRASH,
+        style="italic", fontweight="bold")
+ax.set_xticks(xs); ax.set_xticklabels(methods, fontsize=13)
+ax.set_ylabel("dependence detected"); ax.set_ylim(0, 1.15)
+ax.legend(fontsize=12, frameon=False, loc="center right")
+despine(ax); fig.tight_layout(); plt.show()
+```
+
+Pearson & Spearman go blind on the convex V; distance correlation, HSIC, **and MI
+all catch it** — the two roads agree.
+
+---
+
+## The Punchline → Lab {.center}
+
+The same ladder, now on **real S&P 500 returns**.
+
+. . .
+
+JPMorgan & Bank of America share ~1 bit of information.
+
+They fall into their worst days together **~7× more often** than
+independence allows.
+
+. . .
+
+*That is the dependence correlation cannot see — and the one that actually
+threatens a portfolio.*

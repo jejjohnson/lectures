@@ -1,0 +1,107 @@
+---
+title: "RBIG — Rotation-Based Iterative Gaussianization"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
+from lectures.gaussianization import gaussianize_1d
+from rbig import AnnealedRBIG
+from lectures.measures import cocrash_fraction
+plotting.set_style("notes")
+import numpy as np
+import matplotlib.pyplot as plt
+```
+
+The 1-D [rank → Gaussian](01-change-of-variables.qmd) trick fixes one marginal at
+a time but cannot touch the dependence *between* variables.  RBIG fixes that with
+one more idea: after Gaussianizing the marginals, **rotate**, so dependence hiding
+between coordinates is exposed to the next round of marginal Gaussianization.
+Iterate, and the joint converges to a spherical Gaussian.
+
+::: {.callout-note icon=false}
+## One Layer = Two Invertible Steps
+
+$$
+x \;\xrightarrow{\;\text{marginal Gaussianize}\;}\; g
+\;\xrightarrow{\;\text{rotate } R\;}\; x'
+$$
+
+- **Marginal Gaussianize**: $g_j = \Phi^{-1}(\hat F_j(x_j))$ on each coordinate.
+- **Rotate**: $x' = g R$ with an orthogonal $R$ (PCA or random).
+
+Both steps are invertible, so the whole stack is.  Each layer's Jacobian is cheap
+(a diagonal marginal map times an orthogonal rotation), which is why RBIG scales.
+:::
+
+## One Layer, in Pictures
+
+```{python}
+#| label: fig-rbig-step
+#| fig-cap: "One RBIG layer on a correlated, fat-tailed pair: Gaussianize each marginal, then rotate to decorrelate."
+a, b = datasets.tail_dependent_pair(n=1500, seed=1)
+X = np.column_stack([a, b])
+
+G = np.column_stack([gaussianize_1d(X[:, 0]), gaussianize_1d(X[:, 1])])
+cov = np.cov(G, rowvar=False)
+_, vecs = np.linalg.eigh(cov)        # PCA rotation
+Xr = G @ vecs
+
+fig, axes = plt.subplots(1, 3, figsize=(13, 4.0))
+for ax, (data, title) in zip(
+    axes,
+    [(X, "data (correlated, fat tails)"),
+     (G, "after marginal Gaussianize"),
+     (Xr, "after rotation (decorrelated)")],
+):
+    ax.scatter(data[:, 0], data[:, 1], s=8, c=COOL, alpha=0.35, edgecolors="none")
+    ax.set_title(title, fontsize=11)
+    ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+## Forward to Gaussian, Backward to Data
+
+Stack ~30 layers and the joint *is* a standard Gaussian.  Then run the stack
+backward — draw $z \sim \mathcal N(0, I)$ and invert each layer — and you generate
+fresh samples that keep the **real joint tail**.
+
+```{python}
+#| label: fig-rbig-forward-backward
+#| fig-cap: "Left: the data. Middle: RBIG forward — a spherical Gaussian. Right: samples drawn backward keep the co-crash (the tail dependence is regenerated, not assumed)."
+rbig = AnnealedRBIG(n_layers=30, random_state=0).fit(X)
+Z = rbig.transform(X)
+gen = rbig.sample(len(X))
+
+cc_data = cocrash_fraction(X[:, 0], X[:, 1])
+cc_gen = cocrash_fraction(gen[:, 0], gen[:, 1])
+
+fig, axes = plt.subplots(1, 3, figsize=(13, 4.2))
+panels = [
+    (X, COOL, f"data · co-crash {cc_data:.0%}"),
+    (Z, plotting.PALETTE["green"], f"RBIG forward · |corr|={abs(np.corrcoef(Z[:,0],Z[:,1])[0,1]):.2f}"),
+    (gen, WARM, f"RBIG sample · co-crash {cc_gen:.0%}"),
+]
+for ax, (data, col, title) in zip(axes, panels):
+    ax.scatter(data[:, 0], data[:, 1], s=8, c=col, alpha=0.35, edgecolors="none")
+    ax.set_title(title, fontsize=11)
+    ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+The middle panel is round and uncorrelated — the dependence is gone.  The right
+panel has it back: **what RBIG removes going forward, it regenerates going
+backward.**
+
+::: {.callout-tip}
+## The Reading
+The forward pass is a dependence *detector* (how hard did we have to work to
+Gaussianize?); the backward pass is a dependence *generator*.  The next page
+turns the first into a number — [mutual information](03-mutual-information.qmd) —
+and [Uncertainty](../uncertainty/index.qmd) leans on the second.
+:::

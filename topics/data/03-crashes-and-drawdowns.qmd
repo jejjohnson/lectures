@@ -1,0 +1,131 @@
+---
+title: "Crashes, Drawdowns & Nameable Events"
+subtitle: "Putting dates and names on the left tail"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, BAND, despine, mark_event
+plotting.set_style("notes")
+import numpy as np, pandas as pd, matplotlib.pyplot as plt
+R = datasets.load_returns()
+BANKS = ["JPM", "BAC", "C", "WFC", "GS"]
+```
+
+A **crash** is not a special object in the data — it is simply a day deep in the
+**left tail**.  The previous page showed those tails are fat; this page walks over
+to them and reads the dates.  It turns out the worst days have names you'll
+recognise.
+
+---
+
+## 1 · The Worst Days Have Names
+
+Average the five banks into one series and ask for its worst days.  Each one lines
+up with a real market event — a vote, a volatility blow-up, a global-growth scare.
+
+```{python}
+bank_avg = R[BANKS].mean(axis=1)
+worst = bank_avg.sort_values().head(5)
+print("five worst average-bank days:")
+for d, v in worst.items():
+    print(f"  {d.date()}   {v:+.1%}")
+```
+
+```{python}
+#| label: fig-events
+#| fig-cap: "Average bank return with the four worst days marked. Each crash is a nameable event: the Brexit referendum result (2016-06-24), the 'Volmageddon' volatility spike (2018-02-05), China's 'Black Monday' devaluation selloff (2015-08-24), and the bank/oil-price scare that bottomed in February 2016."
+events = {
+    pd.Timestamp("2016-06-24"): "Brexit",
+    pd.Timestamp("2018-02-05"): "Volmageddon",
+    pd.Timestamp("2015-08-24"): "China selloff",
+    pd.Timestamp("2016-02-11"): "Bank/oil scare",
+}
+fig, ax = plt.subplots(figsize=(9.2, 4.4))
+ax.plot(bank_avg.index, bank_avg, color=COOL, lw=0.6)
+ax.axhline(0, color=INK, lw=0.7)
+for i, (d, name) in enumerate(events.items()):
+    mark_event(ax, d, name, top=0.97 - 0.12 * (i % 2))   # stagger bubbles
+ax.set_ylabel("average bank daily return"); ax.set_xlabel("date")
+ax.set_title("The left tail, with names attached", fontsize=12)
+despine(ax); fig.tight_layout(); plt.show()
+```
+
+::: {.callout-note icon=false}
+## A Crash Is a Quantile, Not a Category
+There is no switch in the data that flips to "crash."  We *define* one — say, a day
+below the 5th percentile — and the definition is a dial.  Keep that in mind on the
+next page, where the same dial moves a co-crash headline from 3% to 72%.
+:::
+
+## 2 · Drawdown: the Pain of Staying Invested
+
+A single bad day is one thing; the **drawdown** is the cumulative wound — how far
+below its previous peak an investment has fallen, and for how long.  Reconstruct
+JPM's equity curve and shade the *underwater* region between the running peak and
+the price.
+
+```{python}
+#| label: fig-drawdown
+#| fig-cap: "Top: JPM equity curve (indexed to 100) with its running peak. Bottom: the drawdown — percent below the prior peak — shaded underwater. The deepest trough, about -24%, bottoms on 2016-02-11, the same bank/oil scare flagged above."
+eq = 100 * np.exp(R["JPM"].cumsum())
+peak = eq.cummax()
+dd = eq / peak - 1.0
+trough = dd.idxmin()
+
+fig, (axT, axB) = plt.subplots(2, 1, figsize=(9.2, 5.4), sharex=True,
+                               height_ratios=[2, 1])
+axT.plot(eq.index, eq, color=COOL, lw=1.2, label="JPM (indexed to 100)")
+axT.plot(peak.index, peak, color=INK, lw=0.9, ls="--", label="running peak")
+axT.set_ylabel("price"); axT.legend(fontsize=9, frameon=False, loc="upper left")
+axT.set_title("Equity curve and its drawdown", fontsize=12); despine(axT)
+
+axB.fill_between(dd.index, dd * 100, 0, color=CRASH, alpha=0.35)
+axB.plot(dd.index, dd * 100, color=CRASH, lw=0.9)
+axB.axvline(trough, color=INK, lw=0.8, ls=":")
+axB.annotate(f"max drawdown {dd.min():.0%}\n{trough.date()}",
+             (trough, dd.min() * 100), textcoords="offset points",
+             xytext=(10, 8), fontsize=9, color=INK)
+axB.set_ylabel("drawdown (%)"); axB.set_xlabel("date"); despine(axB)
+fig.tight_layout(); plt.show()
+```
+
+## 3 · The Same Days, Seen in the Distribution
+
+Crashes and the histogram are two views of one thing.  Mark the worst days back on
+the return distribution and they land exactly where the **left tail** is shaded —
+the fat tail of the last page is *made of* these named days.
+
+```{python}
+#| label: fig-tail-marks
+#| fig-cap: "Average-bank return histogram with the 5% left tail shaded and the four named crashes marked. The events are not outliers off the chart — they are the residents of the fat left tail."
+x = bank_avg.to_numpy()
+cut = np.quantile(x, 0.05)
+fig, ax = plt.subplots(figsize=(8.8, 4.2))
+counts, bins, _ = ax.hist(x, bins=70, color=BAND, alpha=0.85)
+ax.axvspan(x.min(), cut, color=CRASH, alpha=0.15, label="worst 5% of days")
+for d, name in events.items():
+    ax.axvline(bank_avg[d], color=CRASH, lw=1.0, ls="--")
+ax.set_xlabel("average bank daily return"); ax.set_ylabel("days")
+ax.set_title(f"The left tail (below {cut:.1%}) holds the named crashes",
+             fontsize=12)
+ax.legend(fontsize=9, frameon=False); despine(ax)
+fig.tight_layout(); plt.show()
+```
+
+::: {.callout-tip}
+## The Takeaway
+"Crash" = deep left-tail day; "drawdown" = cumulative distance below the peak.
+Both are everyday consequences of fat tails — and on the next page we'll see the
+banks don't take these days *alone*.
+:::
+
+---
+
+## Where This Goes Next
+
+One name's crashes are dramatic; the real risk is that many names crash *together*.
+→ [Co-Movement & Co-Crashes](04-co-movement-and-co-crashes.qmd).

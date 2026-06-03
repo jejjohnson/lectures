@@ -1,0 +1,145 @@
+---
+title: "Co-Movement & Co-Crashes"
+subtitle: "Sectors, the correlation block, and the headline statistic"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, BAND, despine
+from lectures.measures import cocrash_fraction
+plotting.set_style("notes")
+import numpy as np, pandas as pd, matplotlib.pyplot as plt
+R = datasets.load_returns()
+meta = datasets.load_basket_meta().set_index("ticker")
+BANKS = ["JPM", "BAC", "C", "WFC", "GS"]
+```
+
+A portfolio's real danger is not that one name falls — it's that **many fall
+together**.  This page shows that co-movement directly: which names share a fate,
+how the banks form a block, and what the course's headline *co-crash* number
+actually counts.
+
+---
+
+## 1 · The Correlation Block
+
+Order the basket by sector and the correlation matrix lights up in blocks.  The
+five banks form a bright square (they move almost as one); utilities and staples
+sit in their own dim corner, nearly indifferent to the banks.
+
+```{python}
+#| label: fig-corr-block
+#| fig-cap: "Return correlation matrix, ordered by sector. The bank block (top-left) is uniformly bright — average within-bank correlation ~0.79 — while bank-vs-utility correlation averages ~0.04. Sector membership predicts co-movement."
+order = meta.sort_values("sector").index.tolist()
+C = R[order].corr()
+fig, ax = plt.subplots(figsize=(7.2, 6.2))
+im = ax.imshow(C.values, cmap="RdBu_r", vmin=-1, vmax=1)
+ax.set_xticks(range(len(order))); ax.set_xticklabels(order, rotation=90, fontsize=8)
+ax.set_yticks(range(len(order))); ax.set_yticklabels(order, fontsize=8)
+# sector dividers
+secs = meta.loc[order, "sector"].values
+bounds = [i for i in range(1, len(order)) if secs[i] != secs[i - 1]]
+for b in bounds:
+    ax.axhline(b - 0.5, color=INK, lw=1.0); ax.axvline(b - 0.5, color=INK, lw=1.0)
+fig.colorbar(im, ax=ax, fraction=0.046, label="correlation")
+ax.set_title("Correlation lives in sector blocks", fontsize=12)
+fig.tight_layout(); plt.show()
+```
+
+## 2 · Co-Movement Up Close: Two Scatters
+
+Correlation is an average over all days.  Zoom into two pairs and the *shape* of
+the dependence appears.  Two banks fall on a tight diagonal — and crucially their
+points pile into the **lower-left quadrant** (both down hard on the same day).  A
+bank and a utility make a diffuse cloud with that danger corner nearly empty.
+
+```{python}
+#| label: fig-scatters
+#| fig-cap: "Daily returns, JPM vs BAC (two banks) and JPM vs DUK (bank vs utility). The shaded lower-left box is the joint-crash quadrant (both below their 10% tail). It is crowded for the banks and almost empty for the bank-utility pair — tail dependence you can see."
+def lower_tail_box(ax, x, y, q=0.10):
+    tx, ty = np.quantile(x, q), np.quantile(y, q)
+    ax.axvspan(x.min(), tx, color=CRASH, alpha=0.08)
+    ax.axhspan(y.min(), ty, color=CRASH, alpha=0.08)
+    ax.axvline(tx, color=CRASH, lw=0.8, ls="--")
+    ax.axhline(ty, color=CRASH, lw=0.8, ls="--")
+
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.6))
+for ax, b, name in [(axL, "BAC", "two banks"), (axR, "DUK", "bank vs utility")]:
+    x, y = R["JPM"].to_numpy(), R[b].to_numpy()
+    lower_tail_box(ax, x, y)
+    ax.scatter(x, y, s=8, c=COOL, alpha=0.3, edgecolors="none")
+    cc = cocrash_fraction(x, y)
+    ax.set_xlabel("JPM return"); ax.set_ylabel(f"{b} return")
+    ax.set_title(f"JPM vs {b} ({name})\nco-crash = {cc:.0%}", fontsize=11)
+    despine(ax)
+fig.tight_layout(); plt.show()
+```
+
+## 3 · The Co-Crash Number
+
+The statistic the course quotes again and again is the **co-crash fraction**:
+
+> Of the days when one name is in its worst 10%, on what fraction is the *other*
+> name also in its worst 10%?
+
+That is `cocrash_fraction(x, y)` — a conditional probability,
+$P(Y \text{ crashes} \mid X \text{ crashes})$.  An **independent** pair scores ~10%
+(the threshold itself); a co-crashing pair scores far higher.
+
+```{python}
+#| label: fig-cocrash-bars
+#| fig-cap: "Co-crash fraction of every name with JPM. Other banks land at 70%+ (when JPM has a worst-10% day, so do they); utilities sit near the 10% independence line. The dashed line is the independent baseline."
+cc = (pd.Series({t: cocrash_fraction(R["JPM"].to_numpy(), R[t].to_numpy())
+                 for t in R.columns if t != "JPM"})
+      .sort_values())
+colors = [CRASH if meta.loc[t, "sector"] == "Banks"
+          else plotting.PALETTE["green"]
+          if meta.loc[t, "sector"] in ("Utilities", "Staples")
+          else COOL for t in cc.index]
+fig, ax = plt.subplots(figsize=(8.5, 4.2))
+ax.barh(cc.index, cc.values * 100, color=colors)
+ax.axvline(10, color=INK, lw=1.2, ls="--", label="independent baseline (10%)")
+ax.set_xlabel("co-crash with JPM (%)")
+ax.set_title("Banks crash with JPM; utilities mostly don't", fontsize=12)
+ax.legend(fontsize=9, frameon=False, loc="lower right"); despine(ax)
+fig.tight_layout(); plt.show()
+```
+
+::: {.callout-note icon=false}
+## Reconciling the Headline "56%"
+The same `cocrash_fraction` you see here is what the
+[gaussianization](../gaussianization/index.qmd) and
+[uncertainty](../uncertainty/index.qmd) labs report — there on a *controlled*
+synthetic co-crashing pair, where it lands near **56%**.  On real bank pairs it is
+even higher (~72%); on a bank-utility pair it collapses to ~15%.  One definition,
+three datasets:
+
+| Pair | Co-crash | |
+|---|---|---|
+| Synthetic co-crashing pair (the labs) | ~56% | the teaching example |
+| Real bank pair (JPM, BAC) | ~72% | contagion in the wild |
+| Real bank-utility pair (JPM, DUK) | ~15% | barely above independence |
+| Independent baseline | ~10% | the threshold itself |
+
+The number is only meaningful next to its definition and its data.
+:::
+
+::: {.callout-tip}
+## Why This Drives the Course
+Pearson correlation already sees the bank block.  What it *misses* is that the
+co-movement **concentrates in the tail** — the days you most need diversification
+are the days it vanishes.  Catching that is the job of the
+[dependence](../dependence/index.qmd) measures and the reason Gaussian risk models
+fail in the [uncertainty](../uncertainty/index.qmd) chapter.
+:::
+
+---
+
+## Where This Goes Next
+
+If names crash together, how much should a portfolio plan to lose — and how much of
+each name's move is just "the market"? → [Risk: VaR, the Market Factor &
+Beta](05-risk-measures.qmd).

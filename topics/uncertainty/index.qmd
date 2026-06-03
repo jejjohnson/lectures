@@ -1,0 +1,64 @@
+---
+title: "Uncertainty in Networks"
+---
+
+Uncertainty *is* probability.  This chapter treats inputs, parameters, and
+predictions as **distributions**, not point values, and propagates that
+uncertainty honestly through a model.  The engine is the same invertible map from
+[Gaussianization](../gaussianization/index.qmd) — now run **backward** to
+*generate* the dependence the model must carry.
+
+::: {.callout-note icon=false}
+## The Spine — The Same Machine, Run Backward
+
+$$
+\underbrace{z = T(x)}_{\text{forward: measure / remove}}
+\qquad\qquad
+\underbrace{x = T^{-1}(z)}_{\text{backward: propagate}}
+$$
+
+To carry uncertainty forward you must **sample**, and sampling *jointly* is the
+whole game.  Draw an easy Gaussian sample and invert it: you recover the real,
+dependent world — tails and all — which the naive "sample each variable on its
+own" can never do.
+:::
+
+## Why It Sits Here
+
+- **Probability under transformation** — the change-of-variables / Jacobian rule
+  shared with [Gaussianization](../gaussianization/index.qmd): a distribution
+  pushed through a function is reshaped by the derivative.
+- **Noise propagation** — error scales with the derivative of the system; joint
+  noise must keep its [dependence](../dependence/index.qmd).
+- **Code:** [pyrox](https://github.com/jejjohnson/pyrox) — the Bayesian
+  primitives, if you want the formal version behind the ensemble.  Figures here
+  use NumPy so they render without the heavy libs.
+
+## The Ladder of Propagation
+
+Each rung is a way to *generate* the joint — mirroring Chapter 1's measurement
+ladder, run in reverse to sample.
+
+| Rung | Method | Captures | Misses |
+|------|--------|----------|--------|
+| 1 | Independent sampling | marginals | all the joint structure |
+| 2 | Gaussian Monte-Carlo | linear co-movement | the fat joint tail |
+| 3 | RBIG backward | the real joint tail | (the hero) |
+| 4 | Normalizing flows | rich learned joints | (training cost) |
+| 5 | Predict-the-noise + ensemble | data **and** model noise | — |
+
+## Pages in This Chapter
+
+1. **[Uncertainty is probability](01-uncertainty-is-probability.qmd)** — point
+   estimates lie; entropy; learning *changes* uncertainty, it doesn't only shrink
+   it.
+2. **[Probability under transformation](02-probability-under-transformation.qmd)**
+   — the Jacobian rule; noise scales with the derivative.
+3. **[Noise and propagation](03-noise-and-propagation.qmd)** — independent
+   sampling fails; Gaussian Monte-Carlo thins the tail; RBIG backward keeps it.
+4. **[Predictive bands: noise & ensembles](04-predictive-bands.qmd)** — aleatoric
+   (predict the noise / volatility) vs epistemic (ensembles) by sampling; and the
+   capstone — one machine, three uses.
+
+The hands-on [labs](labs/index.qmd) build each rung and propagate a real portfolio
+to its tail risk.

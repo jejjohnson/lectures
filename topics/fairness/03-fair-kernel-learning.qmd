@@ -1,0 +1,253 @@
+---
+title: "Fair Kernel Learning"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
+from lectures.measures import cka_rbf, cka_linear, mutual_information_xy
+from lectures.gaussianization import gaussianize_1d
+from rbig import AnnealedRBIG
+from lectures.neutralize import fair_fit
+plotting.set_style("notes")
+import numpy as np
+import matplotlib.pyplot as plt
+```
+
+We climb the [ladder of removal](index.qmd): each rung is a choice of
+$\operatorname{Dep}$ in $\text{loss} = \text{fit} + \mu\,\operatorname{Dep}(\hat y, S)$,
+and each cancels a different *shape* of dependence.
+
+The running dataset has a target that depends on $S$ **both linearly and
+curvily**, $y = 0.6\,x + 0.7\,S + 0.7\,(S^2-1) + \varepsilon$.  The linear term
+is what cheap methods remove; the quadratic term is the *hole* they leave.
+
+## Rung 2 · Linear Neutrality — And the Hole It Leaves
+
+```
+Dep = cka_linear(y_hat, S)
+```
+
+Orthogonalize the predictions against $S$ — the beta-neutral classic.  Cheap and
+exact, but it removes only the *linear* part: when the dependence is curved, the
+residual looks neutral to correlation while the relationship survives.
+
+::: {.callout-note icon=false}
+## Background — What Orthogonalization Actually Removes
+
+Regressing $\hat y$ on $S$ and keeping the residual is the projection
+
+$$
+r = \hat y - \frac{\operatorname{Cov}(\hat y, S)}{\operatorname{Var}(S)}\,S,
+$$
+
+which guarantees $\operatorname{Cov}(r, S) = 0$ — *linear* dependence gone.  But
+zero covariance is not independence.  If $\hat y$ depends on $S$ through an even
+function, e.g. $\hat y = S^2$, then $\operatorname{Cov}(S^2, S) = \mathbb{E}[S^3]
+= 0$ for symmetric $S$, so the residual is already "uncorrelated" while remaining
+fully dependent.  Orthogonalization is blind to exactly the curved structure a
+kernel measure sees.
+:::
+
+```{python}
+#| label: fig-linear-hole
+#| fig-cap: "Linear neutrality zeroes the correlation but leaves the curve — CKA barely moves."
+d = datasets.fair_regression(n=1000, seed=0)
+x, S, y = d["x"], d["s"], d["y"]
+
+y_hat = fair_fit(x, y, S, mu=0.0)                       # plain model (sees the curve)
+beta = np.cov(y_hat, S)[0, 1] / np.var(S)
+resid = y_hat - beta * S                                 # linear removal
+
+ck_before, ck_after = cka_rbf(y_hat, S), cka_rbf(resid, S)
+
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.2))
+axL.scatter(S, y_hat, s=12, c=COOL, alpha=0.5, edgecolors="none")
+axL.set_title(f"Plain model:  CKA = {ck_before:.2f}", fontsize=12)
+despine(axL)
+axR.scatter(S, resid, s=12, c=CRASH, alpha=0.5, edgecolors="none")
+axR.set_title(f"After LINEAR removal:  CKA = {ck_after:.2f}", fontsize=12)
+annotate_box(axR, 0.5, -0.10, "the curve (nonlinear dependence) survives")
+despine(axR)
+for ax in (axL, axR):
+    ax.set_xlabel("sensitive variable S"); ax.set_ylabel("prediction")
+fig.tight_layout()
+plt.show()
+```
+
+## Rung 2.5 · The Tempting Shortcut: Gaussianize First
+
+A natural hope: per-variable [Gaussianize](../gaussianization/index.qmd)
+everything, then linear methods suffice because the data is "Gaussian now."  It
+fails — *marginal* Gaussianization removes linear cross-dependence but the
+nonlinear $\hat y$–$S$ relation survives (left).
+
+What about **joint** Gaussianization (RBIG on $[\hat y, S]$ together)?  It drives
+the mutual information *between the two latent axes* to zero (right) — but that is
+**not** a fair model: RBIG's rotations mix the inputs, so the $\hat y$-axis still
+encodes $S$, and reading it off as a prediction brings the leak back.  The
+density-road fix that genuinely works is a **conditional** transform — Gaussianize
+$\hat y$ *given* $S$ — which the [Gaussianize-first
+lab](labs/lab-tool2.5-gaussianize-first.qmd) proves end-to-end.  The practical
+default remains the kernel penalty below.
+
+```{python}
+#| label: fig-gauss-fail
+#| fig-cap: "Per-marginal Gaussianize + linear removal leaves the nonlinear dependence (left). Joint Gaussianization decorrelates the two latent axes (right) — but that is not a fair predictor; the conditional transform that is lives in the Gaussianize-first lab."
+rng = np.random.default_rng(3)
+n = 800
+S2 = rng.normal(0, 1, n)
+y_hat2 = (S2**2 - 1) + 0.4 * rng.normal(0, 1, n)
+
+# Per-marginal Gaussianize, then linear removal.
+gy, gs = gaussianize_1d(y_hat2), gaussianize_1d(S2)
+b = np.cov(gy, gs)[0, 1] / np.var(gs)
+resid_g = gy - b * gs
+ck_marg = cka_rbf(resid_g, gs)
+
+# Joint Gaussianization with RBIG.
+XY = np.column_stack([y_hat2, S2])
+XY = (XY - XY.mean(0)) / XY.std(0)
+Z = AnnealedRBIG(n_layers=30, random_state=0).fit_transform(XY)
+mi_before = mutual_information_xy(XY[:, 0], XY[:, 1])
+mi_after = mutual_information_xy(Z[:, 0], Z[:, 1])
+
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.2))
+axL.scatter(gs, resid_g, s=12, c=CRASH, alpha=0.5, edgecolors="none")
+axL.set_title("Per-marginal + linear removal", fontsize=12)
+annotate_box(axL, 0.5, -0.10, f"CKA(resid, S) = {ck_marg:.2f}  (survives)")
+despine(axL)
+axR.scatter(Z[:, 0], Z[:, 1], s=12, c=COOL, alpha=0.5, edgecolors="none")
+axR.set_title("Joint Gaussianization: pair decorrelated", fontsize=12)
+annotate_box(axR, 0.5, -0.10, f"MI: {mi_before:.2f} → {mi_after:.2f} nats")
+despine(axR)
+fig.tight_layout()
+plt.show()
+```
+
+## Rung 3 · The CKA Penalty — The Hero
+
+```
+Dep = cka_rbf(y_hat, S)   # bounded [0, 1]
+```
+
+CKA sees nonlinear dependence and is bounded, so $\mu$ is interpretable.
+Penalized during training, it closes the hole linear removal left: the
+predictions genuinely decouple from $S$.
+
+::: {.callout-note icon=false}
+## Background — CKA Is Normalized HSIC
+
+Map each variable into a kernel feature space and measure cross-covariance
+there.  The Hilbert–Schmidt Independence Criterion is, with centered kernel
+matrices $K$ (on $\hat y$) and $L$ (on $S$),
+
+$$
+\operatorname{HSIC}(\hat y, S) = \frac{1}{(n-1)^2}\,\operatorname{tr}(K H L H),
+$$
+
+zero iff $\hat y$ and $S$ are independent (for a characteristic kernel like the
+RBF) — it catches *any* dependence.  Its scale depends on the kernels, so CKA
+normalizes it the way Pearson normalizes covariance,
+
+$$
+\operatorname{CKA}(\hat y, S)
+= \frac{\operatorname{HSIC}(\hat y, S)}
+       {\sqrt{\operatorname{HSIC}(\hat y, \hat y)\,\operatorname{HSIC}(S, S)}}
+\in [0, 1].
+$$
+:::
+
+```{python}
+#| label: fig-cka-closes
+#| fig-cap: "The CKA penalty (μ = 8) decouples the predictions from S — the curve is gone."
+y0 = fair_fit(x, y, S, mu=0.0)
+yc = fair_fit(x, y, S, mu=8.0)
+c0, cc = cka_rbf(y0, S), cka_rbf(yc, S)
+
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.2))
+axL.scatter(S, y0, s=12, c=COOL, alpha=0.5, edgecolors="none")
+axL.set_title(f"Plain model:  CKA = {c0:.2f}", fontsize=12)
+despine(axL)
+axR.scatter(S, yc, s=12, c=plotting.PALETTE["green"], alpha=0.5,
+            edgecolors="none")
+axR.set_title(f"CKA penalty (μ=8):  CKA = {cc:.2f}", fontsize=12)
+annotate_box(axR, 0.5, -0.10, "predictions decoupled from S")
+despine(axR)
+for ax in (axL, axR):
+    ax.set_xlabel("sensitive variable S"); ax.set_ylabel("prediction")
+fig.tight_layout()
+plt.show()
+```
+
+## Rung 5 · Adversarial Removal — The Learned Dep
+
+Instead of a fixed measure, *learn* the dependence: a probe tries to predict $S$
+from $\hat y$, and the model trains to defeat it.  When the probe can no longer
+recover $S$, the predictions are independent of it — by definition.  The flexible
+extreme: it adapts to whatever a fixed kernel would miss, at the cost of unstable
+min-max training.
+
+```{python}
+#| label: fig-adversarial
+#| fig-cap: "As μ grows, a quadratic probe's ability to recover S from the predictions decays toward chance."
+mus = [0.0, 0.5, 2.0, 8.0, 20.0]
+r2 = []
+for mu in mus:
+    p = fair_fit(x, y, S, mu=mu)
+    coef = np.polyfit(p, S, 2)                # quadratic adversary S ~ poly(ŷ)
+    S_hat = np.polyval(coef, p)
+    r2.append(max(1 - np.mean((S_hat - S) ** 2) / np.var(S), 0.0))
+
+fig, ax = plt.subplots(figsize=(7.5, 4.2))
+ax.plot(mus, r2, "-o", c=CRASH, lw=2.2)
+ax.set_xlabel("neutrality weight μ")
+ax.set_ylabel("adversary R²  (recoverability of S)")
+ax.set_title("The harder we neutralize, the less S an attacker recovers",
+             fontsize=12)
+annotate_box(ax, 0.62, 0.9, "S becomes unrecoverable")
+despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+## The Artifact — The Trade-Off Curve
+
+The scorecard of this chapter: accuracy versus neutrality as $\mu$ sweeps.  The
+**elbow** is the lesson — neutrality is cheap up to a point, then expensive.
+Because CKA is bounded, both axes are comparable.
+
+```{python}
+#| label: fig-tradeoff
+#| fig-cap: "Accuracy vs CKA-neutrality as μ sweeps. There is no single fair model — there is a frontier, and μ chooses the operating point."
+sweep = [0.0, 0.5, 1.0, 2.0, 5.0, 8.0, 20.0]
+acc, dep = [], []
+for mu in sweep:
+    p = fair_fit(x, y, S, mu=mu)
+    acc.append(max(1 - np.mean((p - y) ** 2) / np.var(y), 0.0))
+    dep.append(cka_rbf(p, S))
+
+fig, ax = plt.subplots(figsize=(7.8, 4.6))
+ax.plot(dep, acc, "-o", c=COOL, lw=2.2)
+for mu, dx, ay in zip(sweep, dep, acc):
+    ax.annotate(f"μ={mu:g}", (dx, ay), textcoords="offset points",
+                xytext=(6, 6), fontsize=9, color=INK)
+ax.set_xlabel("CKA(ŷ, S)   →  less neutral")
+ax.set_ylabel("accuracy (R²)")
+ax.set_title("The accuracy–neutrality frontier", fontsize=12)
+despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+::: {.eli5}
+**One-liner recap.**  Drop the feature and proxies leak; orthogonalize and the
+curve survives; penalize CKA and the dependence — line *and* curve — is gone.
+The price is read off the frontier.
+:::
+
+Next: how this mirrors measurement, and the two roads once more —
+[the tie-back](04-tie-back.qmd).

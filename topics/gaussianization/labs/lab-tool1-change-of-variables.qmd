@@ -1,0 +1,91 @@
+---
+title: "Tool 1 — The 1-D Transform"
+subtitle: "rank → Gaussian · invertibility by hand"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
+from lectures.gaussianization import gaussianize_1d
+plotting.set_style("notes")
+import numpy as np, matplotlib.pyplot as plt
+from scipy.stats import norm, rankdata
+```
+
+*Learn-the-tool track · Lab 1 of 3.*
+
+The atom of Gaussianization: map one variable to a standard normal, and be able
+to map back.  You will build the transform by hand and confirm it is invertible.
+
+---
+
+## 1 · Build It from the Definition
+
+$T(x) = \Phi^{-1}(\hat F(x))$ — empirical CDF, then inverse Gaussian CDF.
+
+```{python}
+rng = np.random.default_rng(0)
+x = rng.exponential(scale=2.0, size=3000)
+
+def my_gaussianize(v):
+    ranks = rankdata(v)
+    u = (ranks - 0.5) / len(v)      # empirical CDF (Blom offset)
+    return norm.ppf(u)
+
+z = my_gaussianize(x)
+print(f"input  : mean={x.mean():.2f}  std={x.std():.2f}  skew≈{((x-x.mean())**3).mean()/x.std()**3:+.2f}")
+print(f"output : mean={z.mean():.2f}  std={z.std():.2f}  skew≈{((z-z.mean())**3).mean()/z.std()**3:+.2f}")
+print(f"matches lectures.gaussianize_1d? {np.allclose(z, gaussianize_1d(x))}")
+```
+
+---
+
+## 2 · Invert It
+
+Because the map is monotone, the inverse is the quantile function: send a Gaussian
+value through $\Phi$, then through the empirical quantile of the data.
+
+```{python}
+def my_inverse(zq, data):
+    s = np.sort(data)
+    grid = (np.arange(len(s)) + 0.5) / len(s)
+    return np.interp(norm.cdf(zq), grid, s)
+
+x_recon = my_inverse(z, x)
+print(f"max round-trip error: {np.abs(x_recon - x).max():.3e}")
+```
+
+```{python}
+#| label: fig-tool1-roundtrip
+#| fig-cap: "Forward then inverse returns the original values (points on the diagonal)."
+fig, ax = plt.subplots(figsize=(5.5, 5))
+ax.scatter(x, x_recon, s=8, c=COOL, alpha=0.4, edgecolors="none")
+lims = [x.min(), x.max()]
+ax.plot(lims, lims, c=INK, lw=1.5, ls="--")
+ax.set_xlabel("original x"); ax.set_ylabel("reconstructed x")
+ax.set_title("Round-trip is exact", fontsize=12)
+despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+::: {.callout-tip}
+## What to Look for
+The reconstruction error is at the interpolation-grid level, not structural: the
+transform loses *no* information because it never changes the order of points.
+:::
+
+---
+
+## 3 · Your Turn
+
+- Gaussianize a real return series: `datasets.load_returns()["JPM"]`.  Does the
+  transform tame its fat tails?  Plot a histogram before and after.
+- A monotone map preserves *rank* correlation but not *Pearson* correlation.
+  Verify: Gaussianize both legs of a pair and compare Spearman (unchanged) to
+  Pearson (changed).
+
+Next: stack this with rotations — [Tool 2, RBIG](lab-tool2-rbig.qmd).

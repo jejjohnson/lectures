@@ -1,0 +1,144 @@
+---
+title: "Risk: VaR, the Market Factor & Beta"
+subtitle: "The loss you plan for, the market everything loads on"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, BAND, despine
+plotting.set_style("notes")
+import numpy as np, pandas as pd, matplotlib.pyplot as plt
+R = datasets.load_returns()
+meta = datasets.load_basket_meta().set_index("ticker")
+BANKS = ["JPM", "BAC", "C", "WFC", "GS"]
+```
+
+Two questions run through the rest of the course.  *How bad is a bad day?* —
+answered by **Value at Risk**.  *How much of a name's move is just "the market"?*
+— answered by the **market factor** and **beta**.  Both are read straight off the
+basket here, so the later [VaR](../uncertainty/labs/lab-jobB-portfolio-var.qmd) and
+[beta-neutral](../fairness/labs/lab-jobC-beta-neutral.qmd) labs rest on data you've
+already seen.
+
+---
+
+## 1 · Value at Risk: a Quantile of the Loss
+
+**Value at Risk (VaR)** at the 5% level is simply the 5th-percentile return: a loss
+you expect to *exceed* on only 1 day in 20.  It is the left-tail cutoff from the
+crashes page, now given a number.
+
+```{python}
+#| label: fig-var
+#| fig-cap: "JPM return histogram with the 5% VaR cutoff. The shaded tail to its left is the worst 5% of days; the cutoff itself, about -2.1%, is the daily 5% VaR — the loss exceeded roughly once every 20 trading days."
+r = R["JPM"].to_numpy()
+var5 = np.quantile(r, 0.05)
+fig, ax = plt.subplots(figsize=(8.6, 4.2))
+ax.hist(r, bins=70, color=BAND, alpha=0.85)
+ax.axvspan(r.min(), var5, color=CRASH, alpha=0.18, label="worst 5% of days")
+ax.axvline(var5, color=CRASH, lw=2)
+ax.annotate(f"5% VaR = {var5:.1%}", (var5, ax.get_ylim()[1] * 0.7),
+            textcoords="offset points", xytext=(-10, 0), ha="right",
+            fontsize=10, color=INK)
+ax.set_xlabel("JPM daily log-return"); ax.set_ylabel("days")
+ax.set_title("VaR is the left-tail cutoff", fontsize=12)
+ax.legend(fontsize=9, frameon=False); despine(ax)
+fig.tight_layout(); plt.show()
+```
+
+::: {.callout-note icon=false}
+## VaR Is Not the Worst Case
+VaR is the *threshold* of the tail, not its depth.  Days beyond it (the shaded
+region) can be far worse — which is exactly why fat tails matter and why the
+[uncertainty](../uncertainty/index.qmd) chapter stress-tests it.
+:::
+
+## 2 · Diversification, in One Number
+
+Spread the bet across all 14 names (equal weight) and the VaR shrinks: independent
+wobbles partly cancel.  But spread it across the five **banks** only and you get
+almost no relief — they co-crash (previous page), so the tail barely improves.
+
+```{python}
+#| label: fig-port-var
+#| fig-cap: "5% daily VaR for single names vs portfolios. The diversified 14-name portfolio cuts the tail to about -1.3%; a banks-only portfolio stays near -2.0% because the banks fall together. Diversification only helps where co-movement is low."
+mkt = R.mean(axis=1)                       # equal-weight all 14
+bankport = R[BANKS].mean(axis=1)
+items = {
+    "JPM (single)": R["JPM"], "BAC (single)": R["BAC"],
+    "Banks portfolio": bankport, "All-14 portfolio": mkt,
+}
+vals = {k: np.quantile(v, 0.05) * 100 for k, v in items.items()}
+colors = [COOL, COOL, CRASH, plotting.PALETTE["green"]]
+fig, ax = plt.subplots(figsize=(8.4, 3.8))
+ax.barh(list(vals.keys()), list(vals.values()), color=colors)
+ax.set_xlabel("5% daily VaR (%)")
+ax.set_title("Diversification helps — unless everything co-crashes", fontsize=12)
+despine(ax); fig.tight_layout(); plt.show()
+```
+
+## 3 · The Market Factor and Beta
+
+Most of any stock's daily move is just the **market** moving.  Proxy the market by
+the equal-weight average return, then **beta** is the slope of a stock's return
+regressed on it: $\beta = \mathrm{cov}(r, m) / \mathrm{var}(m)$.  $\beta > 1$ means
+the name amplifies the market; $\beta < 1$ means it dampens it.
+
+```{python}
+#| label: fig-beta-scatter
+#| fig-cap: "JPM return vs the equal-weight market factor, with the regression line. The slope is JPM's beta, about 1.33: a 1% market day moves JPM ~1.33% on average. The tight scatter shows how much of JPM is simply 'the market'."
+m = mkt.to_numpy()
+y = R["JPM"].to_numpy()
+beta = np.cov(y, m)[0, 1] / np.var(m)
+xs = np.linspace(m.min(), m.max(), 100)
+fig, ax = plt.subplots(figsize=(7.2, 4.4))
+ax.scatter(m, y, s=9, c=COOL, alpha=0.35, edgecolors="none")
+ax.plot(xs, beta * xs + (y.mean() - beta * m.mean()), color=CRASH, lw=2.4,
+        label=f"beta = {beta:.2f}")
+ax.axhline(0, color=INK, lw=0.6); ax.axvline(0, color=INK, lw=0.6)
+ax.set_xlabel("market factor return (equal-weight)")
+ax.set_ylabel("JPM return")
+ax.set_title("Beta is the slope on the market", fontsize=12)
+ax.legend(fontsize=9, frameon=False); despine(ax)
+fig.tight_layout(); plt.show()
+```
+
+Compute it for the whole basket and the sector story returns once more: banks
+amplify the market (high beta), utilities and staples cushion it (low beta).
+
+```{python}
+#| label: fig-beta-bars
+#| fig-cap: "Market beta by name. Banks (red) lead at 1.3–1.5; defensive utilities and staples (green) sit near 0.4–0.6. Beta and volatility tell the same ranking from two angles."
+betas = (pd.Series({t: np.cov(R[t], mkt)[0, 1] / np.var(mkt) for t in R.columns})
+         .sort_values())
+colors = [CRASH if meta.loc[t, "sector"] == "Banks"
+          else plotting.PALETTE["green"]
+          if meta.loc[t, "sector"] in ("Utilities", "Staples")
+          else COOL for t in betas.index]
+fig, ax = plt.subplots(figsize=(8.5, 4.2))
+ax.barh(betas.index, betas.values, color=colors)
+ax.axvline(1.0, color=INK, lw=1.2, ls="--", label="market (beta = 1)")
+ax.set_xlabel("beta to the market factor")
+ax.set_title("Banks amplify the market; defensives cushion it", fontsize=12)
+ax.legend(fontsize=9, frameon=False, loc="lower right"); despine(ax)
+fig.tight_layout(); plt.show()
+```
+
+::: {.callout-tip}
+## The Bridge to Fairness
+"Beta-neutral" means a strategy whose returns don't load on the market factor —
+$\beta \approx 0$.  That is *identical* to "fair": a prediction that doesn't load
+on a protected attribute.  The [fairness](../fairness/index.qmd) module makes this
+exact, swapping the market factor for `sex`.
+:::
+
+---
+
+## Where This Goes Next
+
+The market basket is done.  The last page introduces the second dataset — the
+credit table behind the fairness module → [The Credit & Fairness
+Dataset](06-the-credit-dataset.qmd).
