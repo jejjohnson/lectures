@@ -13,48 +13,33 @@ curl -fsSL https://pixi.sh/install.sh | bash
 Clone the repository and install the environment:
 
 ```bash
-git clone https://github.com/your-org/your-repo
-cd your-repo
+git clone https://github.com/jejjohnson/lectures
+cd lectures
 pixi install
 ```
 
-## Running Experiments
+## Build the Site
 
-### Data Preprocessing
-
-```bash
-pixi run preprocess
-```
-
-### Training
+The notes, slide decks, and labs are one Quarto site.
 
 ```bash
-# Using Hydra (classic)
-pixi run train
+# Live-reload preview of the site + slides (http://localhost:4848)
+pixi run -e docs preview
 
-# Using hydra-zen (type-safe)
-pixi run train-zen
-
-# Override hyperparameters
-pixi run train training.lr=0.01 model=transformer
+# Render everything to _site/
+pixi run -e docs render
 ```
 
-### Evaluation
+## Run the Tests
 
 ```bash
-pixi run evaluate
+pixi run test
 ```
 
-## Notebook Environments
+## JupyterLab
 
-### JupyterLab
+For exploring the library and labs interactively:
 
 ```bash
 pixi run -e jupyterlab lab
-```
-
-### Marimo
-
-```bash
-pixi run -e marimo marimo-edit
 ```

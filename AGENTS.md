@@ -19,16 +19,14 @@ pixi install -e jupyterlab
 ## Project Structure
 
 ```
-research_template/
-├── configs/          # Hydra configuration hierarchy
-├── data/             # Data directories (managed by DVC)
-├── docs/             # MyST documentation
-├── marimo_notebooks/ # Marimo reactive notebooks
-├── notebooks/        # Jupytext percent-format .py scripts (no .ipynb in repo)
-├── results/          # Experiment results (managed by DVC)
-├── scripts/          # Entry point scripts
-├── src/lectures/    # Source package
-└── tests/            # Test suite
+lectures/
+├── topics/          # Deep reference notes (Quarto .qmd + executable code)
+├── courses/         # Curated courses: reveal.js slide decks + demos
+├── src/lectures/    # Shared library: plotting, datasets, measures, etc.
+├── styles/          # Site + slide SCSS themes
+├── scripts/         # Data-generation scripts (download_market_data, make_credit_data)
+├── tests/           # Test suite
+└── _freeze/         # Committed Quarto compute cache (fast, reproducible CI)
 ```
 
 ## Development Commands
@@ -50,66 +48,16 @@ pixi run typecheck
 pixi run precommit
 ```
 
-## Running Experiments
+## Documentation (Quarto)
+
+The site and the reveal.js slide decks are both built by Quarto.
 
 ```bash
-# Preprocess data
-pixi run preprocess
+# Live-reload preview of the site + slides
+pixi run -e docs preview
 
-# Train with default config
-pixi run train
-
-# Train with hydra-zen
-pixi run train-zen
-
-# Train with overrides
-pixi run train training.lr=0.001 model=transformer
-
-# Evaluate
-pixi run evaluate
-```
-
-## DVC Conventions
-
-- **Never commit raw data** to git. Use `dvc add` and `dvc push`.
-- Run `dvc repro` to reproduce the full pipeline.
-- Check pipeline status with `dvc status`.
-- View pipeline DAG with `dvc dag`.
-- Commit `.dvc` pointer files and `dvc.lock` to git.
-
-```bash
-# Add a data file to DVC tracking
-dvc add data/raw/dataset.csv
-
-# Push data to remote storage
-dvc push
-
-# Pull data from remote storage
-dvc pull
-
-# Reproduce the pipeline
-dvc repro
-
-# Check what has changed
-dvc status
-```
-
-## Hydra / hydra-zen Conventions
-
-- Config files live in `configs/`.
-- Use `configs/train.yaml` as the main entry point config.
-- Override values on the command line: `python scripts/train.py training.lr=0.01`.
-- Use multirun for sweeps: `python scripts/train.py -m training.lr=0.001,0.01,0.1`.
-- hydra-zen configs are defined in `scripts/train_zen.py` using `builds()` and `make_config()`.
-
-## Documentation
-
-```bash
-# Serve docs locally
-pixi run -e docs docs-serve
-
-# Build static HTML
-pixi run -e docs docs-build
+# Render the whole site + slides to _site/
+pixi run -e docs render
 ```
 
 ## Notebook Environments
@@ -117,9 +65,6 @@ pixi run -e docs docs-build
 ```bash
 # JupyterLab
 pixi run -e jupyterlab lab
-
-# Marimo
-pixi run -e marimo marimo-edit
 ```
 
 ## Code Style

@@ -616,7 +616,7 @@ def score(x, y):
     # Discrete MI approximation via 2-D histogram
     H, _, _ = np.histogram2d(x, y, bins=20, density=True)
     mi_approx = mutual_information_bits(H)
-    R = linfoot_r(mi_approx / np.log(2))  # convert bits → nats for linfoot
+    R = linfoot_r(mi_approx * np.log(2))  # bits → nats (1 bit = ln 2 nats)
     return dict(pearson=p, spearman=s, distance=dc,
                 mi_bits=mi_approx, linfoot_R=R)
 
