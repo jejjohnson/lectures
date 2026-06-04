@@ -115,6 +115,9 @@ htmlcov/
 # Quarto rendered output (built by CI and locally; never committed)
 /_site/
 /site_libs/
+# Stray standalone renders of root-level docs (the source .md/.qmd stay tracked)
+/CONTRIBUTING.html
+/CONTRIBUTING_files/
 
 # Coverage report (uploaded as a CI artifact, not committed)
 coverage.xml
@@ -122,3 +125,5 @@ coverage.xml
 # Scratch plans and local agent config (kept local, never committed)
 .plans/
 .claude/
+
+**/*.quarto_ipynb

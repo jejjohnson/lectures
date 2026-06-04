@@ -154,8 +154,8 @@ excess are the hidden-risk candidates — candidates for Job C.
 #| label: fig-linfoot-real
 #| fig-cap: "Linfoot R vs Pearson |r| on the real basket. Points above the diagonal have dependence that correlation misses."
 pearson_vals = [abs(r["pearson"]) for r in results]
-linfoot_vals = [linfoot_r(nats_to_bits(r["mi_bits"]) / np.log2(np.e))
-                for r in results]   # convert bits→nats for linfoot_r
+linfoot_vals = [linfoot_r(r["mi_bits"] * np.log(2))
+                for r in results]   # bits → nats (1 bit = ln 2 nats)
 
 fig, ax = plt.subplots(figsize=(7, 6))
 ax.scatter(pearson_vals, linfoot_vals, s=30, c=COOL, alpha=0.7)
