@@ -46,8 +46,9 @@ ever do with it:
 
 . . .
 
-**measure** it   ·   **remove** the part you may not keep   ·   **propagate** it
-honestly
+* **measure** it
+* **remove** the part you may not keep
+* **propagate** it honestly
 
 . . .
 
@@ -147,6 +148,33 @@ data.*
 
 The same change-of-variables map runs **forward** to measure and remove,
 **backward** to propagate.
+
+## The Ideal vs. the Shortcut {.center}
+
+That one invertible map is the **clean picture** — the exact way to see all four
+verbs as one operation.
+
+. . .
+
+But an exact map is expensive.
+
+. . .
+
+So in practice each module **trades exactness for a cheaper estimator** that
+measures the same dependence a different way.
+
+## The Shortcut, Module by Module
+
+| Module | The exact map | The practical shortcut |
+|---|---|---|
+| 1 · measure | MI via gaussianization | histogram MI, correlation, CKA |
+| 3 · propagate | invert $T$, draw scenarios | ensembles, predict-the-noise |
+| 4 · remove | conditional transform | a **penalty** in the loss |
+
+. . .
+
+So the spine is the *ideal*; much of the course is learning **when the shortcut
+is good enough — and when only the exact map will do.**
 
 ## How the Course Runs {.center}
 

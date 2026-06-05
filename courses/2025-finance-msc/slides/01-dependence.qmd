@@ -832,6 +832,30 @@ all catch it** — the two roads agree.
 
 ---
 
+## Which Road, When?
+
+They **agree on detection** — but hand you different things.
+
+| | **Kernel score** · HSIC, dCor, CKA | **Gaussianization** · RBIG, flows |
+|---|---|---|
+| Gives you | a number: *how much* | the whole density / map |
+| Units | kernel-dependent score | **bits** (+ Linfoot R) |
+| Cost & data | cheap, one-shot | iterative, data-hungry |
+| Invertible? | no | **yes** → generate, propagate |
+
+---
+
+## Which Road, When? {.center}
+
+The **shortcut** (a score) answers *is there dependence?*
+
+. . .
+
+The **exact map** (a density) lets you *use* it — generate, propagate,
+neutralize.
+
+---
+
 ## The Punchline → Lab {.center}
 
 The same ladder, now on **real S&P 500 returns**.
