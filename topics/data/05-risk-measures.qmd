@@ -33,19 +33,24 @@ crashes page, now given a number.
 
 ```{python}
 #| label: fig-var
-#| fig-cap: "JPM return histogram with the 5% VaR cutoff. The shaded tail to its left is the worst 5% of days; the cutoff itself, about -2.1%, is the daily 5% VaR — the loss exceeded roughly once every 20 trading days."
+#| fig-cap: "JPM return histogram with the 5% VaR cutoff (the calm-day peak is clipped so the tail stays legible). The shaded region to the cutoff's left is the worst 5% of days; the cutoff itself, about -3.2%, is the daily 5% VaR — the loss exceeded roughly once every 20 trading days."
 r = R["JPM"].to_numpy()
 var5 = np.quantile(r, 0.05)
+peak_days = int(np.histogram(r, bins=70)[0].max())
 fig, ax = plt.subplots(figsize=(8.6, 4.2))
 ax.hist(r, bins=70, color=BAND, alpha=0.85)
 ax.axvspan(r.min(), var5, color=CRASH, alpha=0.18, label="worst 5% of days")
 ax.axvline(var5, color=CRASH, lw=2)
-ax.annotate(f"5% VaR = {var5:.1%}", (var5, ax.get_ylim()[1] * 0.7),
+ax.set_ylim(0, 300)        # cap so the tail + cutoff read; the calm-day peak,
+                           # far taller, is clipped and annotated instead
+ax.annotate(f"5% VaR = {var5:.1%}", (var5, 250),
             textcoords="offset points", xytext=(-10, 0), ha="right",
             fontsize=10, color=INK)
+ax.annotate(f"↑ calm-day peak ≈ {peak_days:,} days", (0.004, 293),
+            fontsize=8, color="#666", ha="left", va="top")
 ax.set_xlabel("JPM daily log-return"); ax.set_ylabel("days")
 ax.set_title("VaR is the left-tail cutoff", fontsize=12)
-ax.legend(fontsize=9, frameon=False); despine(ax)
+ax.legend(fontsize=9, frameon=False, loc="upper right"); despine(ax)
 fig.tight_layout(); plt.show()
 ```
 
@@ -60,11 +65,12 @@ region) can be far worse — which is exactly why fat tails matter and why the
 
 Spread the bet across all 14 names (equal weight) and the VaR shrinks: independent
 wobbles partly cancel.  But spread it across the five **banks** only and you get
-almost no relief — they co-crash (previous page), so the tail barely improves.
+almost no relief — they co-crash (previous page), so a five-bank basket is barely
+safer than a single bank.
 
 ```{python}
 #| label: fig-port-var
-#| fig-cap: "5% daily VaR for single names vs portfolios. The diversified 14-name portfolio cuts the tail to about -1.3%; a banks-only portfolio stays near -2.0% because the banks fall together. Diversification only helps where co-movement is low."
+#| fig-cap: "5% daily VaR for single names vs portfolios. The diversified 14-name portfolio cuts the tail to about -2.0%; a banks-only portfolio stays near -3.2% — no better than holding JPM alone — because the banks fall together. Diversification only helps where co-movement is low."
 mkt = R.mean(axis=1)                       # equal-weight all 14
 bankport = R[BANKS].mean(axis=1)
 items = {
@@ -89,7 +95,7 @@ the name amplifies the market; $\beta < 1$ means it dampens it.
 
 ```{python}
 #| label: fig-beta-scatter
-#| fig-cap: "JPM return vs the equal-weight market factor, with the regression line. The slope is JPM's beta, about 1.33: a 1% market day moves JPM ~1.33% on average. The tight scatter shows how much of JPM is simply 'the market'."
+#| fig-cap: "JPM return vs the equal-weight market factor, with the regression line. The slope is JPM's beta, about 1.42: a 1% market day moves JPM ~1.4% on average. The tight scatter shows how much of JPM is simply 'the market'."
 m = mkt.to_numpy()
 y = R["JPM"].to_numpy()
 beta = np.cov(y, m)[0, 1] / np.var(m)
@@ -111,7 +117,7 @@ amplify the market (high beta), utilities and staples cushion it (low beta).
 
 ```{python}
 #| label: fig-beta-bars
-#| fig-cap: "Market beta by name. Banks (red) lead at 1.3–1.5; defensive utilities and staples (green) sit near 0.4–0.6. Beta and volatility tell the same ranking from two angles."
+#| fig-cap: "Market beta by name. Banks (red) lead at 1.3–1.85; defensive utilities and staples (green) sit near 0.45–0.5. Beta and volatility tell the same ranking from two angles."
 betas = (pd.Series({t: np.cov(R[t], mkt)[0, 1] / np.var(mkt) for t in R.columns})
          .sort_values())
 colors = [CRASH if meta.loc[t, "sector"] == "Banks"

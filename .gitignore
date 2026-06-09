@@ -47,7 +47,7 @@ data/external/*
 # ...except the small, script-derived datasets the rendered site depends on.
 !data/processed/returns_basket.csv
 !data/processed/basket_meta.csv
-!data/processed/adult_like.csv
+!data/processed/credit_acs.csv
 
 # Results (use DVC instead)
 results/figures/*

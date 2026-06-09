@@ -24,8 +24,9 @@ recognise.
 
 ## 1 · The Worst Days Have Names
 
-Average the five banks into one series and ask for its worst days.  Each one lines
-up with a real market event — a vote, a volatility blow-up, a global-growth scare.
+Average the five banks into one series and ask for its worst days.  They bunch
+into two episodes — the **2008–09 financial crisis** and the **March-2020 COVID
+crash**:
 
 ```{python}
 bank_avg = R[BANKS].mean(axis=1)
@@ -35,14 +36,20 @@ for d, v in worst.items():
     print(f"  {d.date()}   {v:+.1%}")
 ```
 
+But deep left-tail days are not confined to those two windows.  Nameable crashes
+recur across the whole period — each tied to a vote, a downgrade, a pandemic, a
+policy shock — and the figure marks five of them, well spread across nineteen
+years.
+
 ```{python}
 #| label: fig-events
-#| fig-cap: "Average bank return with the four worst days marked. Each crash is a nameable event: the Brexit referendum result (2016-06-24), the 'Volmageddon' volatility spike (2018-02-05), China's 'Black Monday' devaluation selloff (2015-08-24), and the bank/oil-price scare that bottomed in February 2016."
+#| fig-cap: "Average bank return, 2007–2025, with five nameable crashes marked: Lehman Brothers' collapse (2008-09-15, −15%), the US credit-rating downgrade (2011-08-08, −13%), the Brexit vote (2016-06-24, −7%), the COVID crash (2020-03-16, −17%), and the 2025 'Liberation Day' tariff shock (2025-04-03, −10%). The very deepest days of all sit in the dense 2008–09 cluster on the left."
 events = {
+    pd.Timestamp("2008-09-15"): "Lehman",
+    pd.Timestamp("2011-08-08"): "US downgrade",
     pd.Timestamp("2016-06-24"): "Brexit",
-    pd.Timestamp("2018-02-05"): "Volmageddon",
-    pd.Timestamp("2015-08-24"): "China selloff",
-    pd.Timestamp("2016-02-11"): "Bank/oil scare",
+    pd.Timestamp("2020-03-16"): "COVID crash",
+    pd.Timestamp("2025-04-03"): "Tariff crash",
 }
 fig, ax = plt.subplots(figsize=(9.2, 4.4))
 ax.plot(bank_avg.index, bank_avg, color=COOL, lw=0.6)
@@ -54,27 +61,38 @@ ax.set_title("The left tail, with names attached", fontsize=12)
 despine(ax); fig.tight_layout(); plt.show()
 ```
 
+The five marked events, with sources:
+
+- **Lehman Brothers' bankruptcy** — 2008-09-15 ([Wikipedia](https://en.wikipedia.org/wiki/Bankruptcy_of_Lehman_Brothers))
+- **Black Monday 2011**, after S&P's US credit-rating downgrade — 2011-08-08 ([Wikipedia](https://en.wikipedia.org/wiki/Black_Monday_%282011%29))
+- **Brexit referendum result** — 2016-06-24 ([Wikipedia](https://en.wikipedia.org/wiki/2016_United_Kingdom_European_Union_membership_referendum))
+- **COVID-19 crash** — 2020-03-16 ([Wikipedia](https://en.wikipedia.org/wiki/2020_stock_market_crash))
+- **"Liberation Day" tariff crash** — 2025-04-03 ([Wikipedia](https://en.wikipedia.org/wiki/2025_stock_market_crash))
+
 ::: {.callout-note icon=false}
 ## A Crash Is a Quantile, Not a Category
 There is no switch in the data that flips to "crash."  We *define* one — say, a day
 below the 5th percentile — and the definition is a dial.  Keep that in mind on the
-next page, where the same dial moves a co-crash headline from 3% to 72%.
+next page, where the same dial moves a co-crash headline from 3% to 67%.
 :::
 
 ## 2 · Drawdown: the Pain of Staying Invested
 
 A single bad day is one thing; the **drawdown** is the cumulative wound — how far
-below its previous peak an investment has fallen, and for how long.  Reconstruct
-JPM's equity curve and shade the *underwater* region between the running peak and
-the price.
+below its previous peak an investment has fallen, and *for how long*.  Reconstruct
+JPM's equity curve and shade the **underwater** region between the running peak and
+the price.  The depth is brutal — but the recovery is the real point, and not every
+bank got one.
 
 ```{python}
 #| label: fig-drawdown
-#| fig-cap: "Top: JPM equity curve (indexed to 100) with its running peak. Bottom: the drawdown — percent below the prior peak — shaded underwater. The deepest trough, about -24%, bottoms on 2016-02-11, the same bank/oil scare flagged above."
+#| fig-cap: "Top: JPM equity curve (indexed to 100) with its running peak. Bottom: the drawdown — percent below the prior peak. JPM's worst, −68%, bottoms on 2009-03-09 in the depths of the crisis, then claws back to new highs by 2013 (the shaded region returns to zero). Citigroup's drawdown (dark line) is the other story: −98% at the trough, and nineteen years later still some −69% below its 2007 peak — a wound that never healed."
 eq = 100 * np.exp(R["JPM"].cumsum())
 peak = eq.cummax()
 dd = eq / peak - 1.0
 trough = dd.idxmin()
+eq_c = 100 * np.exp(R["C"].cumsum())          # Citigroup, for contrast
+dd_c = eq_c / eq_c.cummax() - 1.0
 
 fig, (axT, axB) = plt.subplots(2, 1, figsize=(9.2, 5.4), sharex=True,
                                height_ratios=[2, 1])
@@ -83,15 +101,26 @@ axT.plot(peak.index, peak, color=INK, lw=0.9, ls="--", label="running peak")
 axT.set_ylabel("price"); axT.legend(fontsize=9, frameon=False, loc="upper left")
 axT.set_title("Equity curve and its drawdown", fontsize=12); despine(axT)
 
-axB.fill_between(dd.index, dd * 100, 0, color=CRASH, alpha=0.35)
-axB.plot(dd.index, dd * 100, color=CRASH, lw=0.9)
+axB.fill_between(dd.index, dd * 100, 0, color=CRASH, alpha=0.30)
+axB.plot(dd_c.index, dd_c * 100, color=INK, lw=1.0)
 axB.axvline(trough, color=INK, lw=0.8, ls=":")
-axB.annotate(f"max drawdown {dd.min():.0%}\n{trough.date()}",
+# label the two curves inline, in the calm 2013–16 gap, to avoid a box on the line
+axB.text(pd.Timestamp("2014-06-01"), -16, "JPM", color=CRASH,
+         fontsize=10, fontweight="bold")
+axB.text(pd.Timestamp("2014-06-01"), -72, "Citigroup", color=INK,
+         fontsize=10, fontweight="bold")
+axB.annotate(f"JPM max drawdown {dd.min():.0%}\n{trough.date()}",
              (trough, dd.min() * 100), textcoords="offset points",
-             xytext=(10, 8), fontsize=9, color=INK)
+             xytext=(12, 12), fontsize=9, color=INK)
 axB.set_ylabel("drawdown (%)"); axB.set_xlabel("date"); despine(axB)
 fig.tight_layout(); plt.show()
 ```
+
+Drawdown has two dimensions — **depth** and **duration**.  JPM's was deep but
+temporary.  Citigroup's was near-total and, after the dilution and a 1-for-10
+reverse split that the crisis forced, effectively permanent: an investor who held
+from 2007 has still not seen their money back.  Same sector, same crash, opposite
+endings.
 
 ## 3 · The Same Days, Seen in the Distribution
 
@@ -101,18 +130,23 @@ the fat tail of the last page is *made of* these named days.
 
 ```{python}
 #| label: fig-tail-marks
-#| fig-cap: "Average-bank return histogram with the 5% left tail shaded and the four named crashes marked. The events are not outliers off the chart — they are the residents of the fat left tail."
+#| fig-cap: "Zoomed into the left tail — the bulk of days sits off the right edge, near zero. Bars count how many days landed at each return; the worst 5% (below −3.2%) are shaded. The five named crashes (dashed, labelled) each fall among real, if rare, tail days. They are residents of the fat tail, not outliers off the chart."
 x = bank_avg.to_numpy()
 cut = np.quantile(x, 0.05)
 fig, ax = plt.subplots(figsize=(8.8, 4.2))
-counts, bins, _ = ax.hist(x, bins=70, color=BAND, alpha=0.85)
-ax.axvspan(x.min(), cut, color=CRASH, alpha=0.15, label="worst 5% of days")
+bins = np.arange(x.min() - 0.003, 0.0, 0.004)   # 0.4%-wide bins resolve the tail
+ax.hist(x, bins=bins, color=BAND, alpha=0.85)
+ax.axvspan(x.min() - 0.01, cut, color=CRASH, alpha=0.15, label="worst 5% of days")
 for d, name in events.items():
-    ax.axvline(bank_avg[d], color=CRASH, lw=1.0, ls="--")
+    xpos = bank_avg[d]
+    ax.axvline(xpos, color=CRASH, lw=1.0, ls="--")
+    ax.annotate(name, (xpos, 26), ha="center", va="bottom", fontsize=8,
+                color=CRASH, rotation=90)
+ax.set_xlim(x.min() - 0.01, -0.02)              # zoom: just the left tail
+ax.set_ylim(0, 55)
 ax.set_xlabel("average bank daily return"); ax.set_ylabel("days")
-ax.set_title(f"The left tail (below {cut:.1%}) holds the named crashes",
-             fontsize=12)
-ax.legend(fontsize=9, frameon=False); despine(ax)
+ax.set_title("Inside the worst 5%: the named crashes have company", fontsize=12)
+ax.legend(fontsize=9, frameon=False, loc="upper left"); despine(ax)
 fig.tight_layout(); plt.show()
 ```
 

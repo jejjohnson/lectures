@@ -64,7 +64,7 @@ The installable package lives in [src/lectures](src/lectures/).
 | `configs/` | Hydra configuration hierarchy |
 | `data/` | DVC-managed data directories |
 | `results/` | DVC-managed experiment results |
-| `scripts/` | Data-generation scripts (download_market_data, make_credit_data) |
+| `scripts/` | Data-download scripts (download_market_data, download_credit_data) |
 | `topics/` | Deep evergreen lecture content (Quarto) |
 | `courses/` | Curated courses: slides + demos |
 | `styles/` | Site + slide SCSS themes |

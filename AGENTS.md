@@ -24,7 +24,7 @@ lectures/
 ├── courses/         # Curated courses: reveal.js slide decks + demos
 ├── src/lectures/    # Shared library: plotting, datasets, measures, etc.
 ├── styles/          # Site + slide SCSS themes
-├── scripts/         # Data-generation scripts (download_market_data, make_credit_data)
+├── scripts/         # Data-download scripts (download_market_data, download_credit_data)
 ├── tests/           # Test suite
 └── _freeze/         # Committed Quarto compute cache (fast, reproducible CI)
 ```

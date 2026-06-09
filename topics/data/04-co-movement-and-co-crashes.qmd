@@ -27,12 +27,13 @@ actually counts.
 ## 1 · The Correlation Block
 
 Order the basket by sector and the correlation matrix lights up in blocks.  The
-five banks form a bright square (they move almost as one); utilities and staples
-sit in their own dim corner, nearly indifferent to the banks.
+five banks form a bright square (they move almost as one, ~0.77); utilities and
+staples sit in a dimmer corner, much less tied to the banks (~0.29) — though, as
+the next sections show, a systemic crisis lifts even those cross-sector links.
 
 ```{python}
 #| label: fig-corr-block
-#| fig-cap: "Return correlation matrix, ordered by sector. The bank block (top-left) is uniformly bright — average within-bank correlation ~0.79 — while bank-vs-utility correlation averages ~0.04. Sector membership predicts co-movement."
+#| fig-cap: "Return correlation matrix, ordered by sector. The bank block (top-left) is uniformly bright — average within-bank correlation ~0.77 — while bank-vs-utility correlation averages ~0.29: far lower, but no longer negligible (the 2008 and 2020 crises couple everything to a degree). Sector membership still predicts co-movement."
 order = meta.sort_values("sector").index.tolist()
 C = R[order].corr()
 fig, ax = plt.subplots(figsize=(7.2, 6.2))
@@ -54,11 +55,12 @@ fig.tight_layout(); plt.show()
 Correlation is an average over all days.  Zoom into two pairs and the *shape* of
 the dependence appears.  Two banks fall on a tight diagonal — and crucially their
 points pile into the **lower-left quadrant** (both down hard on the same day).  A
-bank and a utility make a diffuse cloud with that danger corner nearly empty.
+bank and a utility make a diffuse cloud whose danger corner is far sparser —
+though, in this crisis-spanning sample, not empty.
 
 ```{python}
 #| label: fig-scatters
-#| fig-cap: "Daily returns, JPM vs BAC (two banks) and JPM vs DUK (bank vs utility). The shaded lower-left box is the joint-crash quadrant (both below their 10% tail). It is crowded for the banks and almost empty for the bank-utility pair — tail dependence you can see."
+#| fig-cap: "Daily returns, JPM vs BAC (two banks) and JPM vs DUK (bank vs utility). The shaded lower-left box is the joint-crash quadrant (both below their 10% tail). It is crowded for the banks (~70% co-crash) and far sparser — but not empty — for the bank-utility pair (~30%). Tail dependence you can see."
 def lower_tail_box(ax, x, y, q=0.10):
     tx, ty = np.quantile(x, q), np.quantile(y, q)
     ax.axvspan(x.min(), tx, color=CRASH, alpha=0.08)
@@ -70,7 +72,7 @@ fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.6))
 for ax, b, name in [(axL, "BAC", "two banks"), (axR, "DUK", "bank vs utility")]:
     x, y = R["JPM"].to_numpy(), R[b].to_numpy()
     lower_tail_box(ax, x, y)
-    ax.scatter(x, y, s=8, c=COOL, alpha=0.3, edgecolors="none")
+    ax.scatter(x, y, s=7, c=COOL, alpha=0.18, edgecolors="none")
     cc = cocrash_fraction(x, y)
     ax.set_xlabel("JPM return"); ax.set_ylabel(f"{b} return")
     ax.set_title(f"JPM vs {b} ({name})\nco-crash = {cc:.0%}", fontsize=11)
@@ -91,7 +93,7 @@ $P(Y \text{ crashes} \mid X \text{ crashes})$.  An **independent** pair scores ~
 
 ```{python}
 #| label: fig-cocrash-bars
-#| fig-cap: "Co-crash fraction of every name with JPM. Other banks land at 70%+ (when JPM has a worst-10% day, so do they); utilities sit near the 10% independence line. The dashed line is the independent baseline."
+#| fig-cap: "Co-crash fraction of every name with JPM. The other banks land near 65–70% (when JPM has a worst-10% day, so do they). Even defensive utilities sit at ~30% — three times the 10% independence baseline (dashed) — because systemic crises drag everyone down. But the banks still tower over the rest."
 cc = (pd.Series({t: cocrash_fraction(R["JPM"].to_numpy(), R[t].to_numpy())
                  for t in R.columns if t != "JPM"})
       .sort_values())
@@ -103,7 +105,7 @@ fig, ax = plt.subplots(figsize=(8.5, 4.2))
 ax.barh(cc.index, cc.values * 100, color=colors)
 ax.axvline(10, color=INK, lw=1.2, ls="--", label="independent baseline (10%)")
 ax.set_xlabel("co-crash with JPM (%)")
-ax.set_title("Banks crash with JPM; utilities mostly don't", fontsize=12)
+ax.set_title("Banks crash hardest with JPM; defensives aren't immune", fontsize=12)
 ax.legend(fontsize=9, frameon=False, loc="lower right"); despine(ax)
 fig.tight_layout(); plt.show()
 ```
@@ -114,14 +116,15 @@ The same `cocrash_fraction` you see here is what the
 [gaussianization](../gaussianization/index.qmd) and
 [uncertainty](../uncertainty/index.qmd) labs report — there on a *controlled*
 synthetic co-crashing pair, where it lands near **56%**.  On real bank pairs it is
-even higher (~72%); on a bank-utility pair it collapses to ~15%.  One definition,
-three datasets:
+even higher (~70%); on a bank-utility pair it falls to ~30% — lower, but in this
+crisis-spanning sample even utilities are dragged well above independence.  One
+definition, three datasets:
 
 | Pair | Co-crash | |
 |---|---|---|
 | Synthetic co-crashing pair (the labs) | ~56% | the teaching example |
-| Real bank pair (JPM, BAC) | ~72% | contagion in the wild |
-| Real bank-utility pair (JPM, DUK) | ~15% | barely above independence |
+| Real bank pair (JPM, BAC) | ~70% | contagion in the wild |
+| Real bank-utility pair (JPM, DUK) | ~30% | dragged down in crises |
 | Independent baseline | ~10% | the threshold itself |
 
 The number is only meaningful next to its definition and its data.

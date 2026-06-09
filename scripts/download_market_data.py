@@ -1,33 +1,42 @@
 """Download and prepare the real market data the course runs on.
 
-Source: the S&P 500 "5yr" daily OHLCV dataset hosted in the public
-``plotly/datasets`` GitHub repository (~500 names, Feb 2013 - Feb 2018). We pull
-it once, derive daily log-returns, and keep a curated multi-sector *basket* small
-enough to ship inside the repo and to plot legibly.
+Source: daily prices from **Yahoo Finance** via ``yfinance``. We pull a curated
+multi-sector *basket* of large-cap names, take Yahoo's split/dividend-**adjusted**
+close, and derive daily log-returns. The panel is small enough to ship inside the
+repo and to plot legibly.
 
 The basket is chosen so the dependence lessons are visible to the naked eye:
 banks that crash together, a couple of mega-cap tech names, energy, and some
 defensive utilities/staples that march to a different drum.
 
+The window spans several nameable shocks the course leans on: the 2015 China
+"Black Monday", the 2016 Brexit vote, the Feb-2018 "Volmageddon", the Mar-2020
+COVID crash, the 2022 drawdown, and the Mar-2023 SVB banking scare.
+
 Run:  python scripts/download_market_data.py
+      (requires ``yfinance``; install with ``uv run --with yfinance`` or add the
+      dependency to your environment)
 """
 
 from __future__ import annotations
 
-import io
-import urllib.request
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import yfinance as yf
 
 
-SP500_5YR_URL = (
-    "https://raw.githubusercontent.com/plotly/datasets/master/all_stocks_5yr.csv"
-)
+# Inclusive start, exclusive end (Yahoo convention). The window spans both the
+# 2008 global financial crisis and the 2020 COVID crash — the two canonical
+# bank co-crashes the course leans on.
+START = "2007-01-01"
+END = "2025-12-31"
 
 # Curated basket: ticker -> (human label, sector). Sector lets us colour the
-# dependence map and tell a story about *why* some pairs co-move.
+# dependence map and tell a story about *why* some pairs co-move. We use GOOG
+# (Class C) rather than GOOGL: Yahoo's GOOGL history only begins at the Apr-2014
+# share-class split, while GOOG runs continuously from 2004.
 BASKET: dict[str, tuple[str, str]] = {
     "JPM": ("JPMorgan", "Banks"),
     "BAC": ("Bank of Am.", "Banks"),
@@ -36,7 +45,7 @@ BASKET: dict[str, tuple[str, str]] = {
     "GS": ("Goldman", "Banks"),
     "AAPL": ("Apple", "Tech"),
     "MSFT": ("Microsoft", "Tech"),
-    "GOOGL": ("Alphabet", "Tech"),
+    "GOOG": ("Alphabet", "Tech"),
     "XOM": ("Exxon", "Energy"),
     "CVX": ("Chevron", "Energy"),
     "DUK": ("Duke Energy", "Utilities"),
@@ -48,31 +57,39 @@ BASKET: dict[str, tuple[str, str]] = {
 PROCESSED = Path(__file__).resolve().parents[1] / "data" / "processed"
 
 
-def _download_raw() -> pd.DataFrame:
-    """Fetch the raw long-format S&P 5yr price table from GitHub."""
-    print(f"Downloading S&P 5yr data from {SP500_5YR_URL} ...")
-    with urllib.request.urlopen(SP500_5YR_URL) as resp:
-        raw = resp.read().decode("utf-8")
-    df = pd.read_csv(io.StringIO(raw), parse_dates=["date"])
-    print(
-        f"  {len(df):,} rows, {df['Name'].nunique()} tickers, "
-        f"{df['date'].min().date()} -> {df['date'].max().date()}"
+def _download_prices() -> pd.DataFrame:
+    """Fetch split/dividend-adjusted daily closes for the basket from Yahoo."""
+    tickers = list(BASKET)
+    print(f"Downloading {len(tickers)} tickers from Yahoo ({START} -> {END}) ...")
+    raw = yf.download(
+        tickers,
+        start=START,
+        end=END,
+        auto_adjust=True,  # 'Close' becomes the split/dividend-adjusted price
+        progress=False,
+        threads=False,  # serial is slower but far more robust to rate limits
     )
-    return df
+    if raw is None or raw.empty:
+        raise RuntimeError("Yahoo returned no data (rate-limited or offline?)")
+    # Multi-ticker downloads come back with a (field, ticker) column MultiIndex.
+    close = raw["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw[["Close"]]
+    close = close.reindex(columns=tickers)  # stable, basket-ordered columns
+    close.index.name = "date"
+    returned = [t for t in tickers if not close[t].isna().all()]
+    print(
+        f"  {close.shape[0]:,} trading days, "
+        f"{len(returned)} of {len(tickers)} tickers returned, "
+        f"{close.index.min().date()} -> {close.index.max().date()}"
+    )
+    return close
 
 
 def build_returns() -> pd.DataFrame:
-    """Pivot to a wide daily log-return panel for the curated basket."""
-    df = _download_raw()
-    wide = df.pivot(index="date", columns="Name", values="close")
-    have = [t for t in BASKET if t in wide.columns]
-    missing = [t for t in BASKET if t not in wide.columns]
-    if missing:
-        print(f"  note: not in source, dropping: {missing}")
-    prices = wide[have].dropna(how="any")
+    """Build a wide daily log-return panel for the curated basket."""
+    prices = _download_prices().dropna(how="any")
     # daily log-returns: r_t = log(P_t / P_{t-1})
     rets = np.log(prices / prices.shift(1)).dropna(how="any")
-    print(f"  basket returns: {rets.shape[0]} days x {rets.shape[1]} assets")
+    print(f"  basket returns: {rets.shape[0]:,} days x {rets.shape[1]} assets")
     return rets
 
 

@@ -26,7 +26,7 @@ Task-shaped deliverables on real data.
 | Lab | Deliverable |
 |-----|-------------|
 | [Job A — Validate your tools](lab-jobA-validate.qmd) | calibration sheet: each method against a known answer |
-| [Job B — Neutralize a credit model](lab-jobB-neutralize-credit.qmd) | fairness on the Adult-shaped credit data |
+| [Job B — Neutralize an income model](lab-jobB-neutralize-credit.qmd) | fairness on real US Census income data |
 | [Job C — Beta-neutralize a strategy](lab-jobC-beta-neutral.qmd) | factor-neutrality on the real S&P basket |
 
 ## Shared Setup
@@ -43,4 +43,4 @@ plotting.set_style("notes")
 ```
 
 The do-the-job labs additionally load real data with
-`datasets.load_adult_like()` (Job B) and `datasets.load_returns()` (Job C).
+`datasets.load_credit()` (Job B) and `datasets.load_returns()` (Job C).

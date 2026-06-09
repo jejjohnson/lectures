@@ -14,20 +14,25 @@ import numpy as np, matplotlib.pyplot as plt
 ```
 
 Every market example in this course runs on one small table: daily **returns**
-for 14 stocks.  This page shows where that table comes from and how it's built —
-the download, the parse, and the one transformation (prices → log-returns) that
-turns raw quotes into something we can do statistics on.
+for 14 stocks, spanning almost two decades.  This page shows where that table
+comes from and how it's built — the download, the parse, and the one
+transformation (prices → log-returns) that turns raw quotes into something we can
+do statistics on.
 
 ---
 
 ## 1 · The Source and the Basket
 
-The prices come from the public **S&P 500 "5yr"** file in the
-[`plotly/datasets`](https://github.com/plotly/datasets) repository: ~500 names of
-daily close prices from **2013-02-11 to 2018-02-07**.  We keep a curated
-**14-stock basket** spanning five sectors — chosen so the dependence lessons are
-visible to the naked eye: five banks that crash together, two mega-cap tech names,
-energy, and defensive utilities/staples that march to a different drum.
+The prices come from **Yahoo Finance**, pulled with the
+[`yfinance`](https://github.com/ranaroussi/yfinance) library: daily
+**split- and dividend-adjusted** closes from **2007 to 2025**.  That window is
+deliberate — it straddles the **two great bank co-crashes** the course keeps
+returning to: the 2008 global financial crisis and the 2020 COVID crash.
+
+We keep a curated **14-stock basket** across five sectors, chosen so the
+dependence lessons are visible to the naked eye: five banks that crash together,
+three mega-cap tech names, energy, and defensive utilities/staples that march to
+a different drum.
 
 ```{python}
 #| label: tbl-basket
@@ -42,24 +47,33 @@ The **sector** column is the story.  Banks (JPM, BAC, C, WFC, GS) share a risk
 factor and move almost as one; utilities (DUK, SO) and staples (PG, KO) are
 defensive and barely co-move with the banks.  That spread of behaviour is exactly
 what makes correlation, co-crashes, and tail dependence *legible* later.
+
+*(We use `GOOG` — Alphabet's Class C share — rather than `GOOGL`, because
+Yahoo's `GOOGL` history only begins at the 2014 share-class split, while `GOOG`
+runs continuously from 2004.)*
 :::
 
 ## 2 · The Pipeline
 
-The download script does four things: fetch the long-format price file, pivot it
-to a wide *price panel* (one column per ticker), drop days with any missing
-quote, and convert prices to **log-returns**.  The committed script is
+The download script does three things: fetch the **adjusted** close panel for the
+basket (`yfinance` returns it already wide, one column per ticker), drop days with
+any missing quote, and convert prices to **log-returns**.  The committed script is
 [`scripts/download_market_data.py`](../../scripts/download_market_data.py); its
 core is just:
 
 ```python
 # scripts/download_market_data.py (excerpt — runs once, needs network)
-df   = pd.read_csv(SP500_5YR_URL, parse_dates=["date"])      # long format
-wide = df.pivot(index="date", columns="Name", values="close")
-prices = wide[BASKET].dropna(how="any")                      # price panel
-rets   = np.log(prices / prices.shift(1)).dropna(how="any")  # log-returns
+import yfinance as yf
+raw    = yf.download(TICKERS, start="2007-01-01", end="2025-12-31",
+                     auto_adjust=True)               # adjusted for splits/divs
+prices = raw["Close"].dropna(how="any")              # wide price panel
+rets   = np.log(prices / prices.shift(1)).dropna(how="any")   # log-returns
 rets.to_csv("data/processed/returns_basket.csv")
 ```
+
+The `auto_adjust=True` flag matters: it folds **dividends and splits** into the
+price (e.g. Citigroup's 2011 1-for-10 reverse split), so a "return" reflects what
+an investor actually earned — not an artificial jump on the split date.
 
 We don't re-download at page-render time (CI has no network); the result is
 committed as `data/processed/returns_basket.csv` and loaded with
@@ -75,19 +89,62 @@ print(R.iloc[:3, :6].round(4).to_string())   # a corner of the table
 
 ## 3 · Why Log-Returns?
 
-A **return** answers "how much did one dollar grow today?"  We use the *log*
-return $r_t = \log(P_t / P_{t-1})$ rather than the simple percentage change for
-two reasons: log-returns **add up over time** (a week's return is the sum of its
-days), and they're roughly symmetric, which keeps the statistics well-behaved.
+A **return** answers "how much did one dollar grow today?"  The *original* number
+is the **simple return** $P_t/P_{t-1} - 1$ — the everyday percentage change.  We
+instead work with the *log* return $r_t = \log(P_t / P_{t-1})$.  The two are close
+but not identical, and it's worth *seeing* the difference before trusting it.
+
+```{python}
+#| label: fig-simple-vs-log
+#| fig-cap: "Left: Citigroup's simple and log returns day-by-day through the 2008–09 crisis — indistinguishable on ordinary days, parting only on the violent ones. Right: every day of every name. The two agree along the dashed line near the origin but bend away in the tails, where the log return is always the more stabilising of the two (it tames big gains and deepens big losses, symmetrising both)."
+import matplotlib.dates as mdates
+
+simple = np.exp(R) - 1                 # recover the original simple returns
+name = "C"                             # Citigroup — the panel's most violent days
+win = (R.index >= "2008-09-01") & (R.index <= "2009-04-30")
+
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(10, 3.8))
+axL.plot(R.index[win], 100 * simple[name][win], color=plotting.COOL, lw=1.3,
+         label=r"simple  $P_t/P_{t-1}-1$")
+axL.plot(R.index[win], 100 * R[name][win], color=plotting.CRASH, lw=1.3,
+         label=r"log  $\ln(P_t/P_{t-1})$")
+axL.axhline(0, color=INK, lw=0.6)
+axL.set_title("Citigroup, daily — through the GFC", fontsize=11)
+axL.set_ylabel("return (%)"); axL.legend(fontsize=9, frameon=False)
+axL.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
+axL.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+despine(axL)
+
+s_all = simple.to_numpy().ravel() * 100
+l_all = R.to_numpy().ravel() * 100
+axR.scatter(s_all, l_all, s=4, c=plotting.COOL, alpha=0.25, edgecolors="none")
+lim = [s_all.min() - 2, s_all.max() + 2]
+axR.plot(lim, lim, color=INK, lw=1.2, ls="--", label="log = simple")
+axR.set_xlim(lim); axR.set_ylim(lim)
+axR.set_title("Every day, every name", fontsize=11)
+axR.set_xlabel("simple return (%)"); axR.set_ylabel("log return (%)")
+axR.legend(fontsize=9, frameon=False, loc="upper left"); despine(axR)
+fig.tight_layout(); plt.show()
+```
+
+We prefer the log return for two reasons the picture hints at: it **adds up over
+time** (a week's return is the sum of its days — no compounding bookkeeping), and
+it's roughly **symmetric**, which keeps the statistics well-behaved.  The
+additivity is the deeper one: a +50% gain followed by a −50% loss leaves you down
+to 0.75 of where you started, and only the log returns record that honestly — they
+sum to $\ln 1.5 + \ln 0.5 = -0.29 = \ln 0.75$, while the simple returns would
+falsely net to zero.
 
 Because they add up, we can run the transformation **backward** to recover a price
 path from returns — a cumulative sum inside an exponential.  We don't ship prices,
 so we reconstruct an illustrative path here (starting every name at 100) purely to
-*see* what the returns encode:
+*see* what the returns encode.  The vertical axis is **logarithmic**: over 19
+years Apple compounds more than 100-fold while Citigroup falls some 98%, a range
+no linear axis can show at once.
 
 ```{python}
 #| label: fig-price-paths
-#| fig-cap: "Reconstructed price paths (each name indexed to 100 at the start), coloured by sector. Banks move as a tight bundle; utilities and staples drift more calmly. This is the cumulative story the daily returns table encodes."
+#| fig-cap: "Reconstructed price paths (each name indexed to 100 at the start, log scale), coloured by sector. The banks (red) plunge together in 2008 and again in 2020; tech compounds relentlessly; utilities and staples drift calmly through both crises. This is the cumulative story the daily returns table encodes."
 meta = datasets.load_basket_meta().set_index("ticker")
 prices = 100 * np.exp(R.cumsum())            # P_t = 100 * exp(sum of log-returns)
 
@@ -102,8 +159,9 @@ for t in prices.columns:
     ax.plot(prices.index, prices[t], color=sector_color[sec], lw=1.2, alpha=0.8,
             label=sec if sec not in seen else None)
     seen.add(sec)
-ax.set_ylabel("price (indexed to 100)"); ax.set_xlabel("date")
-ax.set_title("Five years, 14 names, coloured by sector", fontsize=12)
+ax.set_yscale("log")
+ax.set_ylabel("price (indexed to 100, log scale)"); ax.set_xlabel("date")
+ax.set_title("Nineteen years, 14 names, coloured by sector", fontsize=12)
 ax.legend(fontsize=9, frameon=False, ncol=5, loc="upper left")
 despine(ax); fig.tight_layout(); plt.show()
 ```

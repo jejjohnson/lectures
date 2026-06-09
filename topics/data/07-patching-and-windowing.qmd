@@ -98,9 +98,10 @@ many large days bunch together — volatility clusters.
 
 ```{python}
 #| label: fig-patch-matrix
-#| fig-cap: "The |returns| patch matrix for JPM (w=21), first 250 windows. Each row is a 21-day window. A single turbulent day appears in 21 successive windows at a sliding position, so it draws a diagonal streak — the signature of the overlap between neighbouring windows. Where streaks bunch into bright regions, volatility is clustering; dark stretches are calm."
+#| fig-cap: "The |returns| patch matrix for JPM (w=21), 250 windows spanning the 2008–09 financial crisis. Each row is a 21-day window. A single turbulent day appears in 21 successive windows at a sliding position, so it draws a diagonal streak — the signature of the overlap between neighbouring windows. Where streaks bunch into bright regions, volatility is clustering (here, the crisis itself); dark stretches are calm."
 A = np.abs(jpm)
-M = windows(A, 21)[:250]
+start = R.index.searchsorted("2008-09-01")     # anchor on the 2008 crisis
+M = windows(A, 21)[start:start + 250]
 fig, ax = plt.subplots(figsize=(9, 4.6))
 im = ax.imshow(M, aspect="auto", cmap="magma", interpolation="nearest")
 ax.set_xlabel("position within window  (day 0 … 20)")
@@ -146,10 +147,11 @@ two aligned matrices — a window of X against the contemporaneous window of Y.
 
 ```{python}
 #| label: fig-two-blocks
-#| fig-cap: "JPM and BAC patched on the same days (w=10), first 120 windows as aligned images (red = up day, blue = down). Both share the diagonal-streak texture of overlap; the point here is the *alignment* — row i is the same 10 calendar days for each bank. A between-block measure compares these aligned rows and finds the banks move together (cross-correlation ≈ 0.83 at matching positions)."
+#| fig-cap: "JPM and BAC patched on the same days (w=10), 120 windows from the 2008 crisis as aligned images (red = up day, blue = down). Both share the diagonal-streak texture of overlap; the point here is the *alignment* — row i is the same 10 calendar days for each bank. The two panels light up in step — a between-block measure compares these aligned rows and finds the banks move together (cross-correlation ≈ 0.83 at matching positions)."
 w = 10
-Pj = windows(jpm, w)[:120]
-Pb = windows(R["BAC"].to_numpy(), w)[:120]
+b_start = R.index.searchsorted("2008-09-01")    # the same crisis window
+Pj = windows(jpm, w)[b_start:b_start + 120]
+Pb = windows(R["BAC"].to_numpy(), w)[b_start:b_start + 120]
 vmax = np.abs(np.concatenate([Pj, Pb])).max()
 fig, (axL, axR) = plt.subplots(1, 2, figsize=(10, 4.6), sharey=True)
 for ax, Pm, name, cmap in [(axL, Pj, "JPM", "RdBu_r"), (axR, Pb, "BAC", "RdBu_r")]:
