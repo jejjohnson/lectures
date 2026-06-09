@@ -212,14 +212,14 @@ fig, ax = plt.subplots(figsize=(11, 3.4))
 ax.fill_between(dates, -2 * sig, 2 * sig, color=COOL, alpha=0.35,
                 label="±2σ̂  (volatility forecast)")
 ax.plot(dates, r, c=INK, lw=0.5, alpha=0.8)
-mark_event(ax, pd.Timestamp("2016-06-24"), "Brexit")
-mark_event(ax, pd.Timestamp("2018-02-05"), "Volmageddon")
-ax.set_ylim(-0.09, 0.09); ax.set_ylabel("JPM daily return")
+mark_event(ax, pd.Timestamp("2008-09-15"), "Lehman")
+mark_event(ax, pd.Timestamp("2020-03-16"), "COVID")
+ax.set_ylim(-0.18, 0.18); ax.set_ylabel("JPM daily return")
 ax.legend(loc="lower left", fontsize=11, frameon=False); despine(ax)
 fig.tight_layout(); plt.show()
 ```
 
-The band widens exactly when it must — yet still misses ~7% of days (it should
+The band widens exactly when it must — yet still misses ~6% of days (it should
 miss 5%): fat tails. Gaussianize the residuals to close the gap (Module 2).
 
 ## Tool B · Ensembles — Does the Model Know?

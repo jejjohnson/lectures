@@ -82,7 +82,7 @@ estimator) already tracks it: $\sigma_t^2 = \lambda\,\sigma_{t-1}^2 +
 
 ```{python}
 #| label: fig-vol-band
-#| fig-cap: "JPM daily returns with a +/- 2 sigma band from a causal EWMA volatility forecast. The band widens through the 2015-16 turbulence and around Brexit and Volmageddon, and tightens in calm 2017 - exactly the heteroscedastic noise the constant bar cannot represent. It still misses a few percent more days than it should: fat tails, which Gaussianizing the residuals (Chapter 2) would absorb."
+#| fig-cap: "JPM daily returns with a +/- 2 sigma band from a causal EWMA volatility forecast. The band balloons through the 2008-09 financial crisis and the 2020 COVID crash, and tightens in the calm mid-2010s - exactly the heteroscedastic noise the constant bar cannot represent. It still misses a few percent more days than it should: fat tails, which Gaussianizing the residuals (Chapter 2) would absorb."
 R = datasets.load_returns()
 r = R["JPM"].to_numpy(); dates = R.index
 lam, v = 0.94, np.empty_like(r)
@@ -97,9 +97,9 @@ fig, ax = plt.subplots(figsize=(11, 3.6))
 ax.fill_between(dates, -2 * sigma_t, 2 * sigma_t, color=COOL, alpha=0.35,
                 label="±2σ̂  (volatility forecast)")
 ax.plot(dates, r, c=INK, lw=0.5, alpha=0.8)
-mark_event(ax, pd.Timestamp("2016-06-24"), "Brexit")
-mark_event(ax, pd.Timestamp("2018-02-05"), "Volmageddon")
-ax.set_ylim(-0.09, 0.09); ax.set_ylabel("JPM daily return")
+mark_event(ax, pd.Timestamp("2008-09-15"), "Lehman")
+mark_event(ax, pd.Timestamp("2020-03-16"), "COVID")
+ax.set_ylim(-0.18, 0.18); ax.set_ylabel("JPM daily return")
 ax.legend(loc="lower left", fontsize=10, frameon=False); despine(ax)
 fig.tight_layout()
 plt.show()
@@ -107,7 +107,7 @@ plt.show()
 
 ::: {.callout-note}
 ## Why It Under-Covers
-A good volatility forecast still lets ~7% of days breach the 2σ band instead of
+A good volatility forecast still lets ~6% of days breach the 2σ band instead of
 5%: returns are **fat-tailed**, and a Gaussian 2σ rule under-counts the extremes.
 Gaussianize the standardized residuals first (the [Chapter 2](../gaussianization/index.qmd)
 move) and the coverage snaps back — the noise model handles *when*, Gaussianization

@@ -862,7 +862,7 @@ The same ladder, now on **real S&P 500 returns**.
 
 . . .
 
-JPMorgan & Bank of America share ~1 bit of information.
+JPMorgan & Bank of America share ~0.7 bits of information.
 
 They fall into their worst days together **~7× more often** than
 independence allows.

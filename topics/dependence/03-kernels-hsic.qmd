@@ -279,7 +279,7 @@ depends on the relationship you fear.
 
 With the ladder in hand, the hands-on lab points these tools at real S&P 500
 returns.  The running characters return as their real selves (JPMorgan, Bank of
-America, ...).  You will find that two banks share roughly **1 bit** of
+America, ...).  You will find that two banks share roughly **0.7 bits** of
 information and fall into their worst days together roughly **7× more often**
 than independence allows — the dependence that correlation cannot see, and the
 one that actually threatens a portfolio.
