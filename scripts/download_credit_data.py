@@ -21,9 +21,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 from folktables import ACSDataSource
+
 
 STATES = ["CA"]
 YEAR = "2018"
@@ -42,11 +42,15 @@ _OCC_RANGES: list[tuple[int, int, str]] = [
     (5000, 5940, "Office & Admin"),
     (6005, 9760, "Blue-collar (build/repair/prod/transport)"),
 ]
-_MARITAL = {1: "Married", 2: "Widowed", 3: "Divorced", 4: "Separated",
-            5: "Never married"}
+_MARITAL = {
+    1: "Married",
+    2: "Widowed",
+    3: "Divorced",
+    4: "Separated",
+    5: "Never married",
+}
 # ACS SCHL attainment code -> approximate years of education.
-_SCHL_YEARS = {16: 12, 17: 12, 18: 13, 19: 14, 20: 14, 21: 16, 22: 18,
-               23: 19, 24: 21}
+_SCHL_YEARS = {16: 12, 17: 12, 18: 13, 19: 14, 20: 14, 21: 16, 22: 18, 23: 19, 24: 21}
 
 
 def _occupation_group(code: float) -> str:
@@ -66,33 +70,42 @@ def _schl_years(code: float) -> int:
 
 def _acsincome_filter(df: pd.DataFrame) -> pd.DataFrame:
     """The standard ACSIncome row filter (working-age, employed, with income)."""
-    return df[(df["AGEP"] > 16) & (df["PINCP"] > 100)
-              & (df["WKHP"] > 0) & (df["PWGTP"] >= 1)]
+    return df[
+        (df["AGEP"] > 16) & (df["PINCP"] > 100) & (df["WKHP"] > 0) & (df["PWGTP"] >= 1)
+    ]
 
 
 def build_credit() -> pd.DataFrame:
     """Download ACS, decode to readable features, and sample a fixed panel."""
-    src = ACSDataSource(survey_year=YEAR, horizon="1-Year", survey="person",
-                        root_dir=str(PROCESSED.parent / "external" / "acs"))
+    src = ACSDataSource(
+        survey_year=YEAR,
+        horizon="1-Year",
+        survey="person",
+        root_dir=str(PROCESSED.parent / "external" / "acs"),
+    )
     print(f"Downloading ACS {YEAR} 1-year person data for {STATES} ...")
     raw = src.get_data(states=STATES, download=True)
     df = _acsincome_filter(raw)
     print(f"  {len(raw):,} raw rows -> {len(df):,} after the ACSIncome filter")
 
-    out = pd.DataFrame({
-        "age": df["AGEP"].astype(int),
-        "education_years": df["SCHL"].map(_schl_years).astype(int),
-        "hours_per_week": df["WKHP"].astype(int),
-        "occupation": df["OCCP"].map(_occupation_group),
-        "marital": df["MAR"].map(_MARITAL),
-        "sex": (df["SEX"] == 1).astype(int),       # 1 = male
-        "income_high": (df["PINCP"] > 50_000).astype(int),
-    })
+    out = pd.DataFrame(
+        {
+            "age": df["AGEP"].astype(int),
+            "education_years": df["SCHL"].map(_schl_years).astype(int),
+            "hours_per_week": df["WKHP"].astype(int),
+            "occupation": df["OCCP"].map(_occupation_group),
+            "marital": df["MAR"].map(_MARITAL),
+            "sex": (df["SEX"] == 1).astype(int),  # 1 = male
+            "income_high": (df["PINCP"] > 50_000).astype(int),
+        }
+    )
     out = out.sample(n=N_SAMPLE, random_state=SEED).reset_index(drop=True)
     gm = out.loc[out.sex == 1, "income_high"].mean()
     gf = out.loc[out.sex == 0, "income_high"].mean()
-    print(f"  sampled {len(out):,} | {out.sex.mean():.0%} male | "
-          f"{out.income_high.mean():.0%} high-income | gap {gm - gf:+.0%}")
+    print(
+        f"  sampled {len(out):,} | {out.sex.mean():.0%} male | "
+        f"{out.income_high.mean():.0%} high-income | gap {gm - gf:+.0%}"
+    )
     return out
 
 
