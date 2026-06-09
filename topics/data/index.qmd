@@ -14,12 +14,12 @@ actual data** first, with the preprocessing laid bare, so that when a lab prints
 ## The Two Datasets
 
 1. **A market basket** — daily returns of 14 S&P 500 stocks across five sectors
-   (2013–2018), derived from public price data.  This drives every *dependence*,
-   *gaussianization*, and *uncertainty* example.  Real data.
-2. **A credit table** — an Adult-census-*shaped* dataset: a protected attribute,
-   a high-income target, and proxy features that leak the attribute.  This drives
-   the *fairness* module.  Synthetic, by necessity (the real mirrors are
-   network-blocked), but built to behave like the real thing.
+   (2007–2025, Yahoo Finance), spanning the 2008 and 2020 crashes.  This drives
+   every *dependence*, *gaussianization*, and *uncertainty* example.  Real data.
+2. **An income table** — real US Census data (the ACSIncome task): a protected
+   attribute (`sex`), a high-income target, and proxy features — above all
+   `occupation` — that leak the attribute even when it is dropped.  This drives the
+   *fairness* module.  Real data.
 :::
 
 ## Why Show the Data First?
@@ -29,7 +29,7 @@ together" is a claim about a **scatter plot**; "returns have fat tails" is a cla
 about a **histogram**; "the strategy carries market beta" is a claim about a
 **regression line**.  When we can see the picture, we can sanity-check the number
 — and spot when a single definition choice (which tail? which threshold?) moves a
-headline figure from 3% to 72%.
+headline figure from 3% to 67%.
 
 ## What Each Page Grounds
 
@@ -39,17 +39,18 @@ headline figure from 3% to 72%.
 | crash, drawdown, left tail, *nameable events* | [Crashes & Drawdowns](03-crashes-and-drawdowns.qmd) |
 | co-crash, tail dependence, contagion | [Co-Movement & Co-Crashes](04-co-movement-and-co-crashes.qmd) |
 | VaR, market factor, beta, beta-neutral | [Risk Measures](05-risk-measures.qmd) |
-| group gap, proxy leakage, protected attribute | [The Credit Dataset](06-the-credit-dataset.qmd) |
+| group gap, proxy leakage, protected attribute | [The Income Dataset](06-the-credit-dataset.qmd) |
 
 ## Provenance & Reproducibility
 
 The data is built by two small, committed scripts — nothing is hand-edited:
 
 - [`scripts/download_market_data.py`](../../scripts/download_market_data.py) pulls
-  the public S&P "5yr" price file, derives log-returns for the curated basket, and
-  writes `data/processed/returns_basket.csv` + `basket_meta.csv`.
-- [`scripts/make_credit_data.py`](../../scripts/make_credit_data.py) synthesises
-  the credit table to `data/processed/adult_like.csv`.
+  adjusted daily prices from Yahoo Finance (2007–2025), derives log-returns for the
+  curated basket, and writes `data/processed/returns_basket.csv` + `basket_meta.csv`.
+- [`scripts/download_credit_data.py`](../../scripts/download_credit_data.py)
+  downloads the US Census ACSIncome data, decodes it, and writes
+  `data/processed/credit_acs.csv`.
 
 The first page walks through that pipeline step by step.
 
@@ -65,8 +66,8 @@ The first page walks through that pipeline step by step.
    the correlation block, and the conditional co-crash that headlines the course.
 5. **[Risk: VaR, the Market Factor & Beta](05-risk-measures.qmd)** — the loss you
    plan for, the market everything loads on, and how much each name loads.
-6. **[The Credit & Fairness Dataset](06-the-credit-dataset.qmd)** — columns, the
-   group gap, the proxy channels, and how it's generated.
+6. **[The Income & Fairness Dataset](06-the-credit-dataset.qmd)** — real Census
+   data: columns, the group gap, the proxy channels, and how it's downloaded.
 7. **[Patching & Windowing](07-patching-and-windowing.qmd)** — a hands-on tutorial:
    cut a series into windows, visualize the patch matrix, and see what becomes
    measurable (within a window, between two blocks, across variables).

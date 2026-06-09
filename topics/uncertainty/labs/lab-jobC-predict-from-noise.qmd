@@ -38,10 +38,13 @@ for t in range(1, len(r)):
     v[t] = lam * v[t - 1] + (1 - lam) * r[t - 1] ** 2   # causal: only the past
 sigma_t = np.sqrt(v)
 
-split = int(0.5 * len(r))                 # evaluate out of sample (second half)
-const = r[:split].std()                   # the one-number alternative
-print(f"constant σ (train)  : {const:.3f}")
-print(f"forecast σ_t (test) : {sigma_t[split:].min():.3f} (calm) .. {sigma_t[split:].max():.3f} (crisis)")
+# Train the constant bar on the calm post-GFC, pre-COVID years; test on 2020+,
+# so the COVID crisis is genuinely out of sample.
+train = (dates >= "2012-01-01") & (dates < "2020-01-01")
+te = np.where(dates >= "2020-01-01")[0]
+const = r[train].std()                     # the one-number alternative
+print(f"constant σ (calm 2012–19 train) : {const:.3f}")
+print(f"forecast σ_t (2020+ test)       : {sigma_t[te].min():.3f} (calm) .. {sigma_t[te].max():.3f} (crisis)")
 ```
 
 ## 2 · Calibration — Where Each Band Holds
@@ -50,7 +53,6 @@ Returns are ~zero-mean, so the 95% interval is $\pm 1.96\,\sigma$.  Split the
 out-of-sample days into calm and turbulent thirds and check coverage of each band.
 
 ```{python}
-te = np.arange(split, len(r))
 z = 1.96
 st = sigma_t[te]
 calm = te[st <= np.quantile(st, 1 / 3)]
@@ -63,16 +65,16 @@ for name, idx in [("all test", te), ("calm", calm), ("turbulent", turb)]:
     print(f"{name:>16}  {cov_c:>11.0%}  {cov_f:>13.0%}")
 ```
 
-The headline is the last row: on **turbulent days the constant band covers ~84%**
-when it promises 95% — it gets pierced exactly in a crisis — while the
-**forecast-σ band stays ~94%**.  Predicting the noise keeps the interval honest
+The headline is the last row: on **turbulent days the constant band covers only
+~79%** when it promises 95% — it gets pierced exactly in the crisis — while the
+**forecast-σ band stays ~95%**.  Predicting the noise keeps the interval honest
 when it matters most.
 
 ```{python}
 #| label: fig-jobC-vol-band
-#| fig-cap: "Out-of-sample JPM returns. The forecast +/- 2 sigma_t band (blue) breathes with volatility and contains the crisis days; the constant +/- 2 sigma band (dashed) is too wide in calm 2017 and is repeatedly pierced in the 2015-16 and 2018 stress."
-te_dates = dates[split:]
-rt = r[split:]; sg = sigma_t[split:]
+#| fig-cap: "Out-of-sample JPM returns (2020 on). The forecast +/- 1.96 sigma_t band (blue) breathes with volatility and contains the crisis days; the constant +/- 1.96 sigma band (dashed), fixed on the calm 2012-19 years, is repeatedly pierced through the 2020 COVID stress."
+te_dates = dates[te]
+rt = r[te]; sg = sigma_t[te]
 fig, ax = plt.subplots(figsize=(10, 3.8))
 ax.fill_between(te_dates, -z * sg, z * sg, color=COOL, alpha=0.35,
                 label="±1.96 σ̂$_t$  (forecast)")
@@ -82,8 +84,8 @@ ax.plot(te_dates, rt, c=INK, lw=0.5, alpha=0.8)
 breach = np.abs(rt) > z * const
 ax.scatter(te_dates[breach], rt[breach], s=14, c=CRASH, zorder=5,
            label="pierces constant band")
-mark_event(ax, pd.Timestamp("2018-02-05"), "Volmageddon")
-ax.set_ylim(-0.09, 0.09); ax.set_ylabel("JPM daily return")
+mark_event(ax, pd.Timestamp("2020-03-16"), "COVID")
+ax.set_ylim(-0.18, 0.18); ax.set_ylabel("JPM daily return")
 ax.legend(loc="lower left", fontsize=9, frameon=False); despine(ax)
 fig.tight_layout()
 plt.show()

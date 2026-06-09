@@ -31,7 +31,7 @@ deviation is in its top fifth).
 
 ```{python}
 #| label: fig-return-series
-#| fig-cap: "JPM daily log-returns over five years. Most days sit in a thin zero-centred band; volatility arrives in clusters (shaded), not evenly. The cluster in early 2016 and the spike in early 2018 are the turbulent episodes the later pages name."
+#| fig-cap: "JPM daily log-returns over nineteen years. Most days sit in a thin zero-centred band; volatility arrives in clusters (shaded), not evenly. The dense cluster in 2008–09 (the financial crisis) and the spike in 2020 (COVID) are the turbulent episodes the later pages name."
 r = R["JPM"]
 roll = r.rolling(21).std()
 hi = roll > roll.quantile(0.80)            # high-volatility days
@@ -55,12 +55,13 @@ typically swing in a year?"
 
 ## 2 · Who Wobbles Most?
 
-Annualised volatility ranks the basket exactly as intuition predicts: banks and
-tech swing hardest; defensive utilities and staples are the calmest.
+Annualised volatility ranks the basket exactly as intuition predicts: banks swing
+hardest — the financial crisis is baked into their numbers — with tech and energy
+next; defensive utilities and staples are the calmest.
 
 ```{python}
 #| label: fig-vol-bars
-#| fig-cap: "Annualised volatility by name. Banks (red) and tech swing ~20–25% a year; defensive staples and utilities (green) sit near 14–16%. The same ordering returns when we measure market beta."
+#| fig-cap: "Annualised volatility by name. Banks (red) swing 35–50% a year — the 2008 crisis lives in those numbers; tech and energy (blue) sit near 27–31%; defensive staples and utilities (green) are the calmest at ~18–20%. The same ordering returns when we measure market beta."
 meta = datasets.load_basket_meta().set_index("ticker")
 vol = (R.std() * np.sqrt(252)).sort_values()
 colors = [CRASH if meta.loc[t, "sector"] == "Banks"
@@ -70,46 +71,71 @@ colors = [CRASH if meta.loc[t, "sector"] == "Banks"
 fig, ax = plt.subplots(figsize=(8.5, 4.0))
 ax.barh(vol.index, vol.values, color=colors)
 ax.set_xlabel("annualised volatility"); ax.set_title(
-    "Banks and tech swing hardest; staples are calm", fontsize=12)
+    "Banks swing hardest; staples stay calm", fontsize=12)
 despine(ax); fig.tight_layout(); plt.show()
 ```
 
 ## 3 · The Tails Are Too Fat for a Bell Curve
 
-If returns were Gaussian, days beyond a few standard deviations would essentially
-never happen.  They happen often.  Overlay a fitted normal on the return histogram
-and the data pokes out **past it on both ends** — the *fat tails* that make crashes
-a recurring feature, not a freak.
+If returns were Gaussian, days far from the average would essentially never
+happen.  They happen all the time.  A **fat-tailed** distribution does two things
+the bell curve doesn't — it is *more peaked in the middle* (more quiet days than
+the bell expects) and it has *heavier extremes* (more violent ones).  The two
+panels below show each in turn.
 
 ```{python}
 #| label: fig-fat-tails
-#| fig-cap: "JPM return histogram (bars) vs a fitted Gaussian (line). The data has a taller peak and heavier tails: the shaded regions beyond ±2.5 std hold far more mass than the bell curve allows. Excess kurtosis is 0 for a Gaussian; here it is 3.3."
+#| fig-cap: "Left: JPM's return histogram (zoomed to the centre) against a fitted bell curve — the real peak is twice as tall, because calm days pile up more than a bell allows. Right: a quantile–quantile plot. If returns were Gaussian the dots would lie on the dashed line; instead they peel away at both ends — down past −9 std for the crash days, up past +9 std for the rallies. That peeling-away is the fat tail."
 r = R["JPM"].to_numpy()
 mu, sd = r.mean(), r.std()
-grid = np.linspace(r.min(), r.max(), 400)
-fig, ax = plt.subplots(figsize=(8.5, 4.2))
-ax.hist(r, bins=80, density=True, color=BAND, alpha=0.8, label="JPM returns")
-ax.plot(grid, norm.pdf(grid, mu, sd), color=INK, lw=2,
-        label="fitted Gaussian")
-# shade the fat tails (beyond +/- 2.5 std)
-for lo, hi in [(grid.min(), mu - 2.5 * sd), (mu + 2.5 * sd, grid.max())]:
-    m = (grid >= lo) & (grid <= hi)
-    ax.fill_between(grid[m], norm.pdf(grid[m], mu, sd), color=CRASH, alpha=0.35)
-ax.set_yscale("log")        # log-y makes the tail gap unmissable
-ax.set_xlabel("daily log-return"); ax.set_ylabel("density (log scale)")
-ax.set_title(f"Fat tails: excess kurtosis = {kurtosis(r):.1f}  (Gaussian = 0)",
-             fontsize=12)
-ax.legend(fontsize=9, frameon=False); despine(ax)
+n = len(r); z = (r - mu) / sd
+
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(10, 4.0))
+
+# Left — the peak, on a plain linear axis, zoomed to the centre
+grid = np.linspace(-0.06, 0.06, 400)
+axL.hist(r, bins=200, density=True, color=BAND, alpha=0.85, label="JPM returns")
+axL.plot(grid, norm.pdf(grid, mu, sd), color=INK, lw=2, label="fitted bell curve")
+axL.set_xlim(-0.06, 0.06)
+axL.set_xlabel("daily return"); axL.set_ylabel("density")
+axL.set_title("The peak is taller than the bell", fontsize=11)
+axL.legend(fontsize=9, frameon=False); despine(axL)
+
+# Right — the tails, as a quantile–quantile plot
+theo = norm.ppf((np.arange(1, n + 1) - 0.5) / n)
+axR.scatter(theo, np.sort(z), s=5, c=COOL, alpha=0.5, edgecolors="none")
+axR.plot([-4, 4], [-4, 4], color=INK, lw=1.2, ls="--",
+         label="what a bell curve would give")
+axR.set_xlim(-4, 4)
+axR.set_xlabel("if returns were Gaussian (std devs)")
+axR.set_ylabel("actual return (std devs)")
+axR.set_title("The extremes peel away", fontsize=11)
+axR.legend(fontsize=9, frameon=False, loc="upper left"); despine(axR)
 fig.tight_layout(); plt.show()
 ```
 
-The heaviness varies a lot by name — a single earnings shock can dominate:
+The right panel is the honest one, and the counts behind it are stark.  A bell
+curve fitted to JPM expects about **13** days beyond 3 std in this 19-year sample;
+there were **88**.  Beyond 4 std it expects **0.3** days; there were **48**.  JPM's
+worst single day was a **−9.9 std** move — a Gaussian says a day that bad arrives
+once in $10^{22}$ days, far longer than the universe has existed.  It happened once
+in nineteen years.  **Excess kurtosis** is the one number that summarises this gap
+(0 for a bell curve, **16.8** for JPM), and the heaviness varies a lot by name:
 
 ```{python}
 k = R.apply(kurtosis).sort_values(ascending=False)
 print("excess kurtosis (0 = Gaussian):")
 print(k.round(1).to_string())
 ```
+
+Notice this is **not** the volatility ranking.  Citigroup (≈38) and Bank of
+America (≈25) wear the crisis in their tails, as you'd expect — but Chevron and
+Southern Co., an oil major and a utility, sit near the top too, fattened by a
+handful of rare shocks (the 2020 oil-price war, isolated utility sell-offs).
+Meanwhile Apple — the most volatile name *outside the banks* — has the thinnest
+tails of all.
+Kurtosis measures the rare shock, not the everyday wobble; a name can swing a lot
+without ever doing anything truly strange, and a calm name can hide one violent day.
 
 ::: {.callout-tip}
 ## Why Fat Tails Matter Later

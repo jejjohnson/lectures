@@ -58,7 +58,7 @@ website:
             href: topics/data/04-co-movement-and-co-crashes.qmd
           - text: "Risk Measures"
             href: topics/data/05-risk-measures.qmd
-          - text: "Credit Data"
+          - text: "Income Data"
             href: topics/data/06-the-credit-dataset.qmd
           - text: "Patching & Windowing"
             href: topics/data/07-patching-and-windowing.qmd
@@ -172,7 +172,7 @@ website:
                 href: topics/fairness/labs/lab-tool3-adversarial.qmd
               - text: "Job A · Validate"
                 href: topics/fairness/labs/lab-jobA-validate.qmd
-              - text: "Job B · Credit"
+              - text: "Job B · Income"
                 href: topics/fairness/labs/lab-jobB-neutralize-credit.qmd
               - text: "Job C · Beta-neutral"
                 href: topics/fairness/labs/lab-jobC-beta-neutral.qmd

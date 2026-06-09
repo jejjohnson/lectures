@@ -222,17 +222,19 @@ def load_basket_meta():  # -> pd.DataFrame
     return pd.read_csv(path)
 
 
-def load_adult_like():  # -> pd.DataFrame
-    """Load the Adult-census-shaped credit/fairness dataset.
+def load_credit():  # -> pd.DataFrame
+    """Load the real income/fairness dataset (US Census ACS, via folktables).
 
-    A protected attribute ``sex`` (0/1), a binary ``income_high`` target, and
-    correlated proxy features (``education_num``, ``hours_per_week``,
-    ``occupation_prestige``, ``age``) that leak the sensitive attribute even
-    when ``sex`` is dropped.  An offline stand-in for the UCI Adult data.
+    A protected attribute ``sex`` (1 = male), a binary ``income_high`` target
+    (personal income over $50k), and real proxy features that leak the protected
+    attribute even when ``sex`` is dropped — above all ``occupation`` (strongly
+    sex-segregated), plus ``education_years``, ``hours_per_week``, ``marital``,
+    and a near-neutral ``age`` control.  Sourced from the ACSIncome task on the
+    2018 ACS (California, 1-year) by ``scripts/download_credit_data.py``.
 
-    Requires ``pandas`` and ``data/processed/adult_like.csv``.
+    Requires ``pandas`` and ``data/processed/credit_acs.csv``.
     """
     import pandas as pd
 
-    path = _DATA_DIR / "adult_like.csv"
+    path = _DATA_DIR / "credit_acs.csv"
     return pd.read_csv(path)
