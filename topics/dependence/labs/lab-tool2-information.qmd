@@ -9,10 +9,13 @@ import sys, pathlib
 sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
 from lectures import plotting, datasets
 from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
-from lectures.measures import mutual_information_bits, linfoot_r, nats_to_bits
+from lectures.measures import mutual_information_bits, mutual_information_xy, linfoot_r, nats_to_bits
 plotting.set_style("notes")
 import numpy as np, matplotlib.pyplot as plt
-from scipy.stats import pearsonr, spearmanr
+from scipy.stats import multivariate_normal, pearsonr, spearmanr
+from jaxtyping import Float      # shape annotations: Float[Array, "n_days"]
+
+Array = np.ndarray
 ```
 
 *Learn-the-tool track · Lab 2 of 3.*
@@ -43,6 +46,49 @@ print(f"Loaded {len(R)} days × {len(tickers)} stocks")
 
 ---
 
+## 0 · Warm-up — Entropy of the Basket, in Bits
+
+Before sharing information, each asset *carries* information: its entropy, the
+average surprise of one day's return.  Discretise every stock's history into
+the **same** bins (entropy comparisons are only fair on a common grid) and
+rank the basket:
+
+```{python}
+#| label: fig-basket-entropy
+#| fig-cap: "Average surprise per asset. Volatile financials take the most bits to describe; quiet staples and utilities the fewest. Entropy is the budget mutual information spends from — two assets can only share as much surprise as each one carries."
+bins = np.linspace(-0.12, 0.12, 49)   # one shared grid: ±12% daily return, 48 bins
+
+
+def entropy_bits(returns: Float[Array, "n_days"]) -> float:
+    """Average surprise of one day's return.
+
+    H(X) = −Σᵢ pᵢ · log₂(pᵢ)     [bits]   where pᵢ = (days in bin i) / n_days
+    """
+    counts, _ = np.histogram(returns, bins=bins)   # days per return bin
+    p = counts / counts.sum()                      # pᵢ — empirical probabilities
+    p = p[p > 0]                                   # 0·log(0) = 0 by convention
+    return -(p * np.log2(p)).sum()
+
+
+H_per = {t: entropy_bits(R[t].to_numpy()) for t in tickers}
+order = sorted(H_per, key=H_per.get)
+fig, ax = plt.subplots(figsize=(10, 3.6))
+ax.bar(range(len(order)), [H_per[t] for t in order], color=COOL)
+ax.set_xticks(range(len(order)))
+ax.set_xticklabels(order, fontsize=9)
+ax.set_ylabel("entropy  H  (bits)")
+despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+Sanity-check the ranking against what you know: the noisiest names should be
+the ones whose daily move is genuinely hardest to predict.  Hold on to the
+intuition **entropy = budget**: a pair's mutual information below can never
+exceed the entropy of its quieter member.
+
+---
+
 ## 1 · A Known Answer — The Gaussian Closed Form
 
 For a bivariate Gaussian with correlation $\rho$:
@@ -53,9 +99,12 @@ This is our calibration target.  If the estimator gets this right, we can
 trust it on harder data.
 
 ```{python}
-def mi_gaussian_nats(rho):
-    """Theoretical MI for a bivariate Gaussian."""
-    return -0.5 * np.log(1 - rho**2)
+def mi_gaussian_nats(ρ: float) -> float:
+    """Theoretical MI for a bivariate Gaussian with correlation ρ.
+
+    I(X;Y) = −½ · ln(1 − ρ²)     [nats]   (× 1/ln 2 for bits)
+    """
+    return -0.5 * np.log(1 - ρ**2)
 
 # Test cases
 for rho in [0.0, 0.3, 0.6, 0.9]:
@@ -71,10 +120,15 @@ The simplest estimator: bin both variables into a 2-D histogram, then compute
 MI from the joint frequency table.
 
 ```{python}
-def mi_histogram_bits(x, y, bins=25):
-    """MI in bits via a 2-D histogram estimator."""
-    H, _, _ = np.histogram2d(x, y, bins=bins, density=False)
-    return mutual_information_bits(H)
+def mi_histogram_bits(
+    x: Float[Array, "n_days"], y: Float[Array, "n_days"], bins: int = 25
+) -> float:
+    """I(X;Y) via a 2-D histogram estimator     [bits].
+
+    Bin both series jointly, then I = Σᵢⱼ pᵢⱼ · log₂[ pᵢⱼ / (pᵢ.·p.ⱼ) ].
+    """
+    joint_counts, _, _ = np.histogram2d(x, y, bins=bins, density=False)  # (bins, bins)
+    return mutual_information_bits(joint_counts)
 ```
 
 **Validate on synthetic Gaussian data:**
@@ -175,6 +229,41 @@ despine(ax)
 plt.tight_layout()
 plt.show()
 ```
+
+### The Shadow Test on the Worst Offender
+
+The Linfoot scatter says *which* pairs hide non-Gaussian dependence; the
+shadow test shows *what it looks like*.  Take the pair with the largest excess
+MI, fit a Gaussian to it (mean and covariance — everything Pearson uses), and
+draw the contours over the data:
+
+```{python}
+#| label: fig-shadow-real
+#| fig-cap: "The Gaussian shadow on the worst offender. The contours are the Gaussian implied by the pair's covariance. The data leaves the contours exactly where the risk lives — the joint crash quadrant — and that escape is the excess MI in the table above."
+worst = max(results, key=lambda r: r["excess"])
+t1, t2 = worst["pair"].split("/")
+x_w, y_w = R[t1].to_numpy(), R[t2].to_numpy()
+XY = np.column_stack([x_w, y_w])
+gpts = np.linspace(XY.min(), XY.max(), 160)
+XX, YY = np.meshgrid(gpts, gpts)
+Z = multivariate_normal(XY.mean(0), np.cov(XY.T)).pdf(np.dstack([XX, YY]))
+r_w = pearsonr(x_w, y_w)[0]
+R_w = linfoot_r(mutual_information_xy(x_w, y_w))
+
+fig, ax = plt.subplots(figsize=(7.5, 6))
+ax.scatter(x_w, y_w, s=8, c=COOL, alpha=0.4, edgecolors="none")
+ax.contour(XX, YY, Z, levels=6, colors=INK, linewidths=1.0, alpha=0.7)
+ax.set_title(f"{worst['pair']} — shadow r = {r_w:+.2f} · information R = {R_w:.2f}",
+             fontsize=12)
+ax.set_xlabel(t1); ax.set_ylabel(t2)
+despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+The gap $R - |r|$ is dependence the Gaussian family cannot represent — for
+equity pairs, almost always **joint tails**.  Job C turns exactly this gap
+into a co-crash count.
 
 ---
 

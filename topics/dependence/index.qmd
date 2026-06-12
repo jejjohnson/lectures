@@ -47,22 +47,30 @@ the number miss?**  That question drives the whole chapter.
 | 1 | Pearson $r$ | no density | linear only |
 | 2 | Spearman $\rho$ | no density | monotonic |
 | 3 | Distance correlation | no density | any dependence |
-| 4 | Mutual information | via density | any dependence |
-| 5 | Linfoot R | via density | any (on $[-1,1]$ scale) |
-| 6 | HSIC | no density | any (kernel test) |
-| 7 | Gaussianization | via learned density | all of the above + generation |
+| 4 | HSIC / CKA | no density | any (kernel test) |
+| 5 | Entropy | via density | one variable's budget |
+| 6 | Mutual information | via density | any dependence, in **bits** |
+| 7 | Linfoot R | via density | any (on $[0,1]$ scale) |
+| 8 | Gaussianization | via learned density | all of the above + generation |
 
 ## Pages in This Chapter
 
 1. **[Correlation: Pearson and Spearman](01-correlation.qmd)** — the
    comfortable defaults and their blind spots.  Includes the *running
    characters* (two banks; a convex payoff) and the independence reference.
-2. **[Mutual Information](02-mutual-information.qmd)** — entropy, surprise, and
-   the honest measure.  Linfoot's bridge back to the correlation scale.
-3. **[Kernel Measures: HSIC](03-kernels-hsic.qmd)** — independence without a
-   density, and the synthesis of the two roads.
-4. **[Causality](04-causality.qmd)** — correlation ≠ causation; directed
+2. **[Kernel Measures: HSIC & CKA](02-kernels-hsic.qmd)** — Road 1 completed:
+   independence without a density, why CKA is the readable form of HSIC, and
+   how the kernel/bandwidth choice works.
+3. **[Mutual Information](03-mutual-information.qmd)** — surprise, entropy, the
+   honest measure, and Linfoot's bridge back to the correlation scale.
+4. **[From Points to Time Series](04-windows-and-blocks.qmd)** — the window
+   dial: scalars → vectors → blocks, with total correlation and block MI
+   computed on the real basket.
+5. **[Gaussianization](05-gaussianization.qmd)** — learn the density, then
+   measure; the two-roads synthesis and the final scorecard.
+6. **[Causality](06-causality.qmd)** — correlation ≠ causation; directed
    information and Granger causality.
 
-The hands-on [labs](labs/index.qmd) build each rung in isolation, then hunt the
-**hidden risk** in a book the correlation matrix called *diversified*.
+The hands-on [labs](labs/index.qmd) build each rung in isolation, benchmark
+them all together in the **measure zoo**, then hunt the **hidden risk** in a
+book the correlation matrix called *diversified*.

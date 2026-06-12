@@ -1,0 +1,243 @@
+---
+title: "Gaussianization: Learn the Density, Then Measure"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
+from lectures.measures import (hsic_rbf, distance_correlation,
+                               mutual_information_bits, mutual_information_xy)
+from lectures.gaussianization import gaussianize_1d
+plotting.set_style("notes")
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import pearsonr, spearmanr
+import einx                      # linear algebra with the axes spelled out
+from jaxtyping import Float      # shape annotations: Float[Array, "n_days"]
+
+Array = np.ndarray
+```
+
+Road 2 keeps hitting the same wall.  The
+[mutual information page](03-mutual-information.qmd) estimated $p(x,y)$ with
+a crude histogram; the [windows page](04-windows-and-blocks.qmd) fell back on
+Gaussian closed forms and admitted they were *lower bounds*.  Both are
+versions of one compromise: **assume** the density's shape.  This page takes
+the other branch of the fork — **learn** the shape — and in doing so closes
+the ladder.
+
+The trick sounds too simple to work: *transform the data until it is
+Gaussian, and keep the receipts.*
+
+---
+
+## Rung 8 · The Iteration
+
+Reshaping each marginal to a bell curve is easy (a rank map does it exactly).
+But dependence lives *between* the axes, beyond any per-axis map — reshape
+both marginals of a V and the V survives.  The fix: **rotate** the axes, so
+leftover dependence resurfaces as non-Gaussian marginals, which the 1-D move
+can flatten.  Alternate the two and the structure has nowhere left to hide:
+
+```{python}
+#| label: fig-gaussianization-iterate
+#| fig-cap: "Gaussianization, step by step. Panel 1: the convex pair, carrying over a bit of mutual information. Panel 2: reshaping each marginal to a perfect Gaussian leaves the V — and the MI — untouched. Panel 3: rotate 45° and reshape again; the structure starts to dissolve. Panel 4: a few dozen rotate-reshape rounds later the joint is a round Gaussian ball and the mutual information is gone. What the loop had to remove IS the dependence."
+u_g, v_g = datasets.convex_payoff(n=1200, seed=0)
+XG = np.column_stack([u_g, v_g])              # (n_days, 2)
+XG = (XG - XG.mean(0)) / XG.std(0)            # standardize each column
+
+
+def gauss_marginals(D: Float[Array, "n_days 2"]) -> Float[Array, "n_days 2"]:
+    """The 1-D move, applied per axis: each marginal → exactly 𝒩(0, 1)."""
+    return np.column_stack([gaussianize_1d(D[:, 0]), gaussianize_1d(D[:, 1])])
+
+
+def rotate(D: Float[Array, "n_days 2"], deg: float) -> Float[Array, "n_days 2"]:
+    """Rotate the cloud by θ: x ↦ R(θ)·x, with R = [[cos θ, −sin θ], [sin θ, cos θ]]."""
+    θ = np.deg2rad(deg)
+    R_θ = np.array([[np.cos(θ), -np.sin(θ)],
+                    [np.sin(θ),  np.cos(θ)]])        # (2, 2) rotation matrix
+    return einx.dot("n d, k d -> n k", D, R_θ)       # apply R to every day's pair
+
+
+rng_g = np.random.default_rng(0)
+P2 = gauss_marginals(XG)                      # reshape marginals — V survives
+P3 = gauss_marginals(rotate(P2, 45))          # rotate, reshape — V starts to melt
+P4 = P3
+for _ in range(25):                           # …repeat until round
+    P4 = gauss_marginals(rotate(P4, rng_g.uniform(20, 70)))
+# I(X;Y) before and after, in bits (helper returns nats → ÷ ln 2)
+mi0 = mutual_information_xy(XG[:, 0], XG[:, 1]) / np.log(2)
+mi1 = mutual_information_xy(P4[:, 0], P4[:, 1]) / np.log(2)
+
+fig, axes = plt.subplots(1, 4, figsize=(12.5, 3.5))
+for ax, (ttl, Dk) in zip(axes, [(f"the data — a V\nMI = {mi0:.2f} bits", XG),
+                                ("reshape marginals\n(still a V)", P2),
+                                ("rotate, reshape again", P3),
+                                (f"…repeat → a Gaussian ball\nMI = {mi1:.2f} bits", P4)]):
+    ax.scatter(Dk[:, 0], Dk[:, 1], s=6, c=WARM, alpha=0.4, edgecolors="none")
+    ax.set_title(ttl, fontsize=10)
+    ax.set_aspect("equal")
+    ax.set_xticks([]); ax.set_yticks([])
+    despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+::: {.callout-note}
+The loop above is the real mechanism, written in four lines: the 1-D
+rank-to-Gaussian map (`lectures.gaussianization.gaussianize_1d`) alternated
+with rotations.  The production RBIG (the `rbig` package) chooses rotations
+more cleverly, tracks the exact change-of-variables Jacobian, and thereby
+yields exact log-likelihoods and MI estimates — see the
+[Gaussianization chapter](../gaussianization/index.qmd) for the full machine.
+:::
+
+### Why This Measures Anything
+
+Because every step is **invertible**, the procedure is bookkeeping, not
+destruction.  The bits of mutual information that vanish between panel 1 and
+panel 4 did not disappear — they were *paid out* by the transform, and the
+change-of-variables formula records the price exactly.  **The dependence the
+loop must remove is the data's total correlation.**  That turns a generative
+trick into an estimator: run the loop, sum the receipts, read off
+$T(\mathbf{x})$ in bits — in any dimension, with no histogram in sight.
+
+### The Idea Underneath
+
+A Gaussian is the *least-committal* distribution consistent with a given
+covariance — it assumes nothing beyond the correlations measured.  So whatever
+Gaussianization must *work* to remove is exactly the structure that correlation
+never implied: the nonlinear, tail-driven dependence.
+
+This is the first appearance of the principle the whole course turns on:
+**claim only what your evidence justifies.**  The same invertible machine —
+re-implemented in JAX as `gauss_flows` — runs *backward* in Lecture 3 to
+generate scenarios and propagate risk.
+
+---
+
+## Synthesis — The Two Roads, Grown
+
+Look back at the ladder.  Every tool was one of two roads:
+
+**Road 1 — no density needed:**
+```
+measure = compare( transform(x) , transform(y) )
+```
+Pearson, Spearman, distance correlation, and HSIC/CKA all fit this template.
+They differ only in the transform and the distance/kernel used.
+
+**Road 2 — through the density:**
+```
+measure = D_KL( p(x,y) || p(x)·p(y) )
+```
+Mutual information, total correlation.  The density must come from somewhere:
+*assume* its shape (parametric — cheap, wrong in tails) or *learn* it
+(generative — Gaussianization, flows).
+
+The *transform* is the thread: a fixed, hand-picked map on Road 1; a learned,
+invertible map on the generative branch of Road 2.  An invertible transform
+that simplifies the data hands you the density for free.
+
+```{python}
+#| label: fig-two-roads
+#| fig-cap: "The two-roads decision tree. Both branches end at a measure; only the right branch needs a density."
+fig, ax = plt.subplots(figsize=(11, 5))
+ax.axis("off")
+
+nodes = {
+    "q":   (0.50, 0.90, "How much do these move together?",  14, INK),
+    "q1":  (0.50, 0.68, "Do you need the distribution?",     12, INK),
+    "r1a": (0.18, 0.46, "NO → compare directly\n"
+                        "compare(T(x), T(y))",                11, COOL),
+    "r1b": (0.82, 0.46, "YES → go through p(x,y)\n"
+                        "= KL-divergence",                     11, WARM),
+    "r2a": (0.18, 0.20, "Pearson   Spearman\n"
+                        "dist corr   HSIC / CKA\n"
+                        "(differ only in T and metric)",       10, COOL),
+    "r2b": (0.58, 0.20, "Assume shape\n(parametric, fast,\n"
+                        "wrong in tails)",                     10, WARM),
+    "r2c": (0.90, 0.20, "Learn shape\n(Gaussianization,\n"
+                        "flows — exact)",                      10, CRASH),
+}
+
+for key, (x, y, text, fs, col) in nodes.items():
+    ax.text(x, y, text, ha="center", va="center", fontsize=fs, color=col,
+            fontweight="bold" if key in ("q", "q1") else "normal",
+            bbox=dict(boxstyle="round,pad=0.4", fc="white", ec=col, lw=1.4))
+
+arrow_kw = dict(arrowstyle="->", lw=1.4, color=INK)
+for (x0, y0), (x1, y1) in [
+    ((0.50, 0.85), (0.50, 0.74)),
+    ((0.50, 0.63), (0.22, 0.52)),
+    ((0.50, 0.63), (0.78, 0.52)),
+    ((0.18, 0.40), (0.18, 0.26)),
+    ((0.82, 0.40), (0.62, 0.26)),
+    ((0.82, 0.40), (0.88, 0.26)),
+]:
+    ax.annotate("", xy=(x1, y1), xytext=(x0, y0),
+                xycoords="axes fraction", textcoords="axes fraction",
+                arrowprops=arrow_kw)
+
+fig.tight_layout()
+plt.show()
+```
+
+---
+
+## Final Scorecard — All Measures on Both Characters
+
+```{python}
+#| label: tbl-final-scorecard
+#| tbl-cap: "Every measure we met, applied to both running characters."
+a, b, crash = datasets.two_banks(n=1000)
+u, v = datasets.convex_payoff(n=1000)
+
+def full_score(x: Float[Array, "n_days"], y: Float[Array, "n_days"], label: str):
+    """Print the whole ladder for one pair."""
+    p = pearsonr(x, y)[0]                       # r ∈ [−1, 1] — linear only
+    s = spearmanr(x, y)[0]                      # ρₛ ∈ [−1, 1] — monotone
+    dc = distance_correlation(x, y)             # dCor ∈ [0, 1] — any shape
+    joint_counts = np.histogram2d(x, y, bins=25)[0]
+    mi = mutual_information_bits(joint_counts)  # I(X;Y) [bits] — any shape
+    h = hsic_rbf(x[:300], y[:300])              # HSIC — kernel test (subsampled)
+    print(f"\n{label}")
+    print(f"  Pearson          {p:+.3f}")
+    print(f"  Spearman         {s:+.3f}")
+    print(f"  distance corr    {dc:.3f}")
+    print(f"  MI (bits, hist)  {mi:.3f}")
+    print(f"  HSIC (RBF)       {h:.4f}")
+
+full_score(a, b, "Banks")
+full_score(u, v, "Convex payoff")
+```
+
+**Opposite blind spots, made concrete.**  The banks score high on every
+measure; the convex pair is invisible to Pearson yet obvious once we leave the
+no-distribution road.  No single number is the whole truth — the right tool
+depends on the relationship you fear.
+
+---
+
+## The Punchline — For the Lab
+
+With the ladder in hand, the hands-on labs point these tools at real S&P 500
+returns.  The running characters return as their real selves (JPMorgan, Bank of
+America, ...).  You will find that two banks share roughly **0.7 bits** of
+information and fall into their worst days together roughly **7× more often**
+than independence allows — the dependence that correlation cannot see, and the
+one that actually threatens a portfolio.
+
+The [wrap-up lab](labs/lab-wrapup-zoo.qmd) closes the chapter the way every
+benchmark should: all the measures, side by side, on a zoo of relationships
+where you know the right answer.
+
+*Next: [Causality](06-causality.qmd) — when does dependence imply direction?*
+
+*And in Lecture 2: we stop **measuring** dependence and start **removing** it —
+the HSIC of the [kernel page](02-kernels-hsic.qmd) becomes a penalty that
+forces a model to be blind to a chosen variable.*

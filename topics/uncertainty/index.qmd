@@ -23,6 +23,33 @@ dependent world — tails and all — which the naive "sample each variable on i
 own" can never do.
 :::
 
+## Two Questions, Two Acts
+
+Every uncertainty here is one of two questions, and the chapter is two acts:
+
+- **Act 1 — What could the world do?**  Sample the **joint**, price the tail.
+  The ladder of scenario generators, graded on one exam: *reproduce the
+  co-crash, price the 1% VaR.*
+- **Act 2 — How wrong is my prediction?**  A band around $\hat y = f(x)$:
+  noise you must **predict** (aleatoric), ignorance you must **admit**
+  (epistemic).
+
+## The Ladder of Propagation
+
+Act 1's rungs — each a way to *generate* the joint, mirroring the dependence
+chapter's measurement ladder run in reverse:
+
+| Rung | Method | Captures | Misses |
+|------|--------|----------|--------|
+| 1 | Independent resampling | marginals | all the joint structure |
+| 2 | Gaussian Monte-Carlo | linear co-movement | the fat, skewed joint tail |
+| 3 | Student-t Monte-Carlo | fat tails, tail dependence | the *shape* is still assumed |
+| 4 | RBIG backward | the learned, real joint tail | (the hero) |
+| 5 | Normalizing flows | rich learned joints | (training cost) |
+
+Act 2's tools: predict the noise $\sigma(x)$ (in markets: **volatility**),
+ensembles for model doubt, and **calibration** to check the promise was kept.
+
 ## Why It Sits Here
 
 - **Probability under transformation** — the change-of-variables / Jacobian rule
@@ -34,31 +61,24 @@ own" can never do.
   primitives, if you want the formal version behind the ensemble.  Figures here
   use NumPy so they render without the heavy libs.
 
-## The Ladder of Propagation
-
-Each rung is a way to *generate* the joint — mirroring Chapter 1's measurement
-ladder, run in reverse to sample.
-
-| Rung | Method | Captures | Misses |
-|------|--------|----------|--------|
-| 1 | Independent sampling | marginals | all the joint structure |
-| 2 | Gaussian Monte-Carlo | linear co-movement | the fat joint tail |
-| 3 | RBIG backward | the real joint tail | (the hero) |
-| 4 | Normalizing flows | rich learned joints | (training cost) |
-| 5 | Predict-the-noise + ensemble | data **and** model noise | — |
-
 ## Pages in This Chapter
 
-1. **[Uncertainty is probability](01-uncertainty-is-probability.qmd)** — point
-   estimates lie; entropy; learning *changes* uncertainty, it doesn't only shrink
-   it.
+1. **[Uncertainty is probability](01-uncertainty-is-probability.qmd)** — the
+   broken 95% promise; point estimates hide the tail; entropy; the two acts and
+   their running characters.
 2. **[Probability under transformation](02-probability-under-transformation.qmd)**
-   — the Jacobian rule; noise scales with the derivative.
-3. **[Noise and propagation](03-noise-and-propagation.qmd)** — independent
-   sampling fails; Gaussian Monte-Carlo thins the tail; RBIG backward keeps it.
-4. **[Predictive bands: noise & ensembles](04-predictive-bands.qmd)** — aleatoric
-   (predict the noise / volatility) vs epistemic (ensembles) by sampling; and the
-   capstone — one machine, three uses.
+   — the Jacobian rule; noise scales with the derivative; why nonlinearity
+   manufactures skew.
+3. **[Noise and propagation](03-noise-and-propagation.qmd)** — Act 1: the VaR
+   target and the four-generator ladder (independent → Gaussian → Student-t →
+   RBIG), graded on synthetic *and* real banks.
+4. **[The regression recipe](04-regression-recipe.qmd)** — the mechanics under
+   every fit: data, model, loss, optimizer; why a loss is a noise model in
+   disguise; choosing capacity on unseen data.
+5. **[Predictive bands: noise & ensembles](05-predictive-bands.qmd)** — Act 2,
+   with neural networks: a Keras net that predicts its own noise σ(x) (the
+   Gaussian-NLL loss), volatility, deep ensembles for model doubt;
+   calibration; and the capstone — one machine, three uses.
 
 The hands-on [labs](labs/index.qmd) build each rung and propagate a real portfolio
 to its tail risk.

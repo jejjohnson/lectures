@@ -17,14 +17,30 @@ from scipy.stats import pearsonr
 
 ## Rung 1 · Drop the Feature — And Watch It Fail
 
-The naive fix: remove $S$ from the inputs.  It fails, because other features
-*proxy* for $S$ — zip code for a protected attribute, a sector dummy for market
-beta — so the dependence walks right back in.  **Removing the column is not
-removing the dependence.**
+The naive fix writes itself: if the model must not depend on $S$, delete the
+$S$ column.  It is also the fix every regulator first encounters, because it
+*sounds* airtight — how can a model discriminate on information it never
+receives?
+
+Because other features **proxy** for it.  Zip code carries race; occupation
+and hours-per-week carry sex; a sector dummy carries market beta.  The
+mechanics are one line of regression algebra: the model fits
+
+$$
+\hat y = X\beta, \qquad\text{so}\qquad
+\operatorname{Cov}(\hat y, S) = \beta^\top \operatorname{Cov}(X, S),
+$$
+
+and deleting the $S$ column only zeroes *one entry* of
+$\operatorname{Cov}(X, S)$.  Every remaining feature that co-varies with $S$
+keeps its channel open — and if $S$ genuinely predicts the target, the
+optimizer will *actively recruit* those channels, because they carry signal
+it is being paid to find.  Dropping the column does not remove the
+dependence; it just reroutes it.
 
 ```{python}
 #| label: fig-drop-fail
-#| fig-cap: "We dropped S from the model, yet a kept proxy feature tracks it (left), so the predictions stay strongly dependent on S (right)."
+#| fig-cap: "We dropped S from the model, yet a kept proxy feature tracks it (left) — so the fitted predictions reconstruct the dependence anyway (right). The model never saw S; the optimizer found it regardless, because the proxy carried signal."
 rng = np.random.default_rng(1)
 n = 600
 S = rng.normal(0, 1, n)                       # sensitive — to be "dropped"
@@ -56,23 +72,39 @@ fig.tight_layout()
 plt.show()
 ```
 
+This is not a toy pathology.  In the
+[real Census income data](../data/06-the-credit-dataset.qmd) the protected
+attribute `sex` is dropped and the score reconstructs most of the income
+gap anyway, riding chiefly on `occupation` — the
+[credit lab](labs/lab-jobB-neutralize-credit.qmd) measures the leak
+end-to-end.  And the leak is *distributed*: drop the worst proxy and the
+others pick up the slack, which is why whacking proxies one at a time never
+converges.
+
 ::: {.callout-tip}
 ## The Lesson in One Line
 You cannot remove a dependence you refuse to look at.  Neutrality has to be
 *measured against $S$* and optimized — which means $S$ must be available at
-training time, even though it is never a model input.
+**training** time, even though it is never a model **input**.  That sounds
+paradoxical until you see the
+[three-layers picture](01-what-is-fair.qmd#the-three-layers): the audit
+needs $S$ to test the dashed link; the model itself never touches it at
+prediction time.
 :::
 
 ## Algorithmic Bias — Balancing Errors *Within* Groups
 
-"Don't use $S$" is not the only notion of fairness, and the failure above shows
-why a second view matters: bias often shows up as **unequal error rates across
-groups**.  A score can have the same average for two groups yet be far more
-*wrong* for one of them.
+"Don't use $S$" is not the only notion of fairness, and the failure above
+shows why a second view matters: bias often shows up as **unequal error
+rates across groups**.  A score can have the same average for two groups
+yet be far more *wrong* for one of them — approving the uncreditworthy in
+one group while declining the creditworthy in the other.  Criteria like
+**equalized odds** target exactly this: independence of the *error*, not
+the score, conditional on the true outcome.
 
 ```{python}
 #| label: fig-group-errors
-#| fig-cap: "A scorecard with a group gap: the same threshold yields different approval and error rates per group."
+#| fig-cap: "A scorecard with a group gap. Left: the score distributions sit at different heights, so one threshold cuts them differently. Right: the same threshold yields a lower approval rate AND a higher false-decline rate (creditworthy applicants wrongly refused) for Group B — the harm is concentrated, not averaged away."
 data = datasets.credit_scores_by_group(n=1500, gap=0.9, seed=0)
 score, group, repaid = data["score"], data["group"], data["repaid"]
 thr = 0.5
@@ -112,10 +144,13 @@ fig.tight_layout()
 plt.show()
 ```
 
-The two views connect: a prediction that is independent of $S$
-($\operatorname{Dep}(\hat y, S)=0$) cannot, by construction, carry a systematic
-group gap.  Driving the dependence term to zero is the lever; the group-rate
-table is how you *report* the result.
+The two views connect, and in the direction that matters for this chapter:
+a prediction that is genuinely independent of $S$
+($\operatorname{Dep}(\hat y, S) = 0$) cannot, by construction, carry a
+systematic group gap in its scores.  Driving the dependence term to zero is
+the **lever**; the group-rate table is how you **report** the result to the
+people the model affects.  Keep both in view — the lab deliverables always
+pair the dependence number with the per-group rates.
 
 Next: the methods that actually remove the dependence —
 [fair kernel learning](03-fair-kernel-learning.qmd).

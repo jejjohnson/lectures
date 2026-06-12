@@ -1,0 +1,405 @@
+---
+title: "The Regression Recipe"
+subtitle: "Data · Model · Loss · Optimize"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, GRID, PANEL, despine, annotate_box
+plotting.set_style("notes")
+import numpy as np
+import matplotlib.pyplot as plt
+import einx                      # linear algebra with the axes spelled out
+from jaxtyping import Float      # shape annotations: Float[Array, "n_obs"]
+
+Array = np.ndarray
+GREEN = plotting.PALETTE["green"]
+```
+
+Every band in the [next page](05-predictive-bands.qmd) wraps a *fitted
+model* — and so far the fitting itself has hidden inside one black box,
+`np.polyfit`.  Before we put uncertainty around a prediction, open the box.
+Every supervised fit you will ever run — polynomial, neural network,
+volatility forecaster — is the same four-ingredient recipe:
+
+1. **Data** — pairs $(x_i, y_i)$ the model must explain.
+2. **Model** — a family of functions $f_\theta$, indexed by parameters $\theta$.
+3. **Loss** — one number scoring how badly $f_\theta$ explains the data.
+4. **Optimizer** — a procedure that moves $\theta$ to shrink the loss.
+
+```{python}
+#| label: fig-recipe-loop
+#| fig-cap: "The supervised-learning loop. The data is fixed; the parameters move. Each pass, the model makes predictions, the loss scores them against the targets, and the optimizer nudges θ downhill. 'Training' is nothing more than running this loop until the loss stops improving."
+fig, ax = plt.subplots(figsize=(11, 3.6))
+ax.axis("off")
+
+boxes = {
+    "data":  (0.08, 0.72, "DATA\n(xᵢ, yᵢ)", COOL),
+    "model": (0.36, 0.72, "MODEL\nŷᵢ = f_θ(xᵢ)", INK),
+    "loss":  (0.64, 0.72, "LOSS\nL(θ) = score(ŷ, y)", WARM),
+    "opt":   (0.64, 0.22, "OPTIMIZER\nθ ← θ − η·∇L", CRASH),
+    "fit":   (0.92, 0.72, "fitted\nmodel", GREEN),
+}
+for key, (x, y, text, col) in boxes.items():
+    ax.text(x, y, text, ha="center", va="center", fontsize=12, color=col,
+            fontweight="bold", family="monospace",
+            bbox=dict(boxstyle="round,pad=0.5", fc="white", ec=col, lw=1.6))
+
+arrow_kw = dict(arrowstyle="-|>", lw=1.8, color=INK)
+for (x0, y0), (x1, y1) in [
+    ((0.14, 0.72), (0.28, 0.72)),   # data → model
+    ((0.44, 0.72), (0.56, 0.72)),   # model → loss
+    ((0.64, 0.58), (0.64, 0.38)),   # loss → optimizer
+    ((0.72, 0.72), (0.86, 0.72)),   # loss → fitted (when converged)
+]:
+    ax.annotate("", xy=(x1, y1), xytext=(x0, y0),
+                xycoords="axes fraction", textcoords="axes fraction",
+                arrowprops=arrow_kw)
+# the feedback arrow: optimizer → model (update θ)
+ax.annotate("", xy=(0.36, 0.58), xytext=(0.55, 0.22),
+            xycoords="axes fraction", textcoords="axes fraction",
+            arrowprops=dict(arrowstyle="-|>", lw=1.8, color=CRASH,
+                            connectionstyle="arc3,rad=0.25"))
+ax.text(0.40, 0.32, "update θ, repeat", fontsize=10, color=CRASH,
+        fontstyle="italic")
+ax.text(0.79, 0.60, "when converged", fontsize=9, color=INK,
+        fontstyle="italic", ha="center")
+plt.show()
+```
+
+The rest of this page walks the loop once, slowly, on Act 2's running
+character — and ends at the observation that ties the whole chapter
+together: **the loss you minimize is a probability model in disguise.**
+
+## Ingredient 1 · Data
+
+The character again: 60 observations of a curve, noise growing to the
+right, nothing observed in the middle.
+
+```{python}
+#| label: make-data
+# y = sin(1.3·x) + σ(x)·ε, observed only OUTSIDE |x| < 1.4
+rng = np.random.default_rng(5)
+half = 30
+x_obs = np.sort(np.concatenate([rng.uniform(-3.2, -1.4, half),
+                                rng.uniform(1.4, 3.2, half)]))
+σ_true = 0.05 + 0.45 * (x_obs + 3.2) / 6.4   # noise level, rising with x
+y_obs = np.sin(1.3 * x_obs) + σ_true * rng.standard_normal(x_obs.size)
+print(f"data: {x_obs.size} pairs (xᵢ, yᵢ)")
+```
+
+That is all "data" means here: a fixed set of input–target pairs.
+Everything the model will ever know about the world is in these 60 numbers —
+a fact worth staring at, because the model will happily make predictions at
+$x = 0$ where it has seen *nothing*, and nothing in the loop below will warn
+us.  (That warning is the next page's job.)
+
+## Ingredient 2 · Model
+
+A model is a *family* of functions, indexed by parameters.  The workhorse of
+this chapter is the polynomial:
+
+$$
+f_\theta(x) = \theta_0 + \theta_1 x + \theta_2 x^2 + \cdots + \theta_d x^d ,
+$$
+
+a family with $d{+}1$ knobs.  The degree $d$ sets the family's **capacity**
+— how much shape it *can* express.  Capacity is a dial, and both ends of it
+fail:
+
+```{python}
+#| label: fig-capacity
+#| fig-cap: "One family, three capacities. Degree 1 cannot bend — it misses the curve everywhere (underfit). Degree 6 has enough knobs to follow the trend and no more. Degree 15 has so many it spends them memorizing the noise — and detonates over the data gap, where nothing constrains it (overfit)."
+x_grid = np.linspace(-3.4, 3.4, 400)
+
+fig, axes = plt.subplots(1, 3, figsize=(12.5, 3.4), sharey=True)
+for ax, (d, verdict) in zip(axes, [(1, "underfit"), (6, "about right"), (15, "overfit")]):
+    θ_d = np.polyfit(x_obs, y_obs, d)        # fit this capacity (box still closed)
+    ax.plot(x_grid, np.polyval(θ_d, x_grid), c=WARM, lw=2.2)
+    ax.scatter(x_obs, y_obs, s=14, c=INK, alpha=0.7)
+    ax.set_ylim(-2.6, 2.6)
+    ax.set_title(f"degree {d} — {verdict}", fontsize=12)
+    ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+How to *choose* the capacity is a question the loss alone cannot answer —
+we return to it at the end of the page.
+
+## Ingredient 3 · Loss
+
+The loss compresses "how badly does $f_\theta$ explain the data" into one
+number the optimizer can push on.  The default for regression is
+**mean squared error** — average the squared residuals:
+
+$$
+L(\theta) \;=\; \frac{1}{n}\sum_{i=1}^{n} \big(y_i - f_\theta(x_i)\big)^2 .
+$$
+
+```{python}
+#| label: mse-fn
+def mse(θ: Float[Array, "n_params"],
+        x: Float[Array, "n_obs"], y: Float[Array, "n_obs"]) -> float:
+    """L(θ) = (1/n)·Σᵢ (yᵢ − f_θ(xᵢ))²   [y units²] — mean squared error."""
+    residuals = y - np.polyval(θ, x)         # what the model fails to explain
+    return float(np.mean(residuals**2))
+
+
+θ_under, θ_right = np.polyfit(x_obs, y_obs, 1), np.polyfit(x_obs, y_obs, 6)
+print(f"MSE, degree 1: {mse(θ_under, x_obs, y_obs):.3f}")
+print(f"MSE, degree 6: {mse(θ_right, x_obs, y_obs):.3f}   ← lower loss = better fit (on THIS data)")
+```
+
+Why *squared*?  Convenience is part of it (smooth, differentiable, convex in
+$\theta$ for linear-in-$\theta$ models) — but the deeper reason is the one
+this chapter runs on:
+
+::: {.callout-note icon=false}
+## A Loss Is a Noise Model in Disguise
+
+Assume the data was generated as
+$y = f_\theta(x) + \varepsilon$ with Gaussian noise
+$\varepsilon \sim \mathcal N(0, \sigma^2)$.  The log-likelihood of the data is
+
+$$
+\log p(\text{data}\mid\theta)
+= -\frac{1}{2\sigma^2}\sum_i \big(y_i - f_\theta(x_i)\big)^2 + \text{const},
+$$
+
+so **maximizing likelihood = minimizing MSE**.  Every time you minimized a
+squared error you were silently asserting "the noise is Gaussian, with the
+same $\sigma$ everywhere."  Change the assertion and the loss changes with
+it: let the noise depend on $x$ — $\varepsilon \sim \mathcal N(0, \sigma(x)^2)$
+— and the negative log-likelihood becomes
+
+$$
+L(\theta) = \frac{1}{n}\sum_i \left[
+\frac{\big(y_i - f_\theta(x_i)\big)^2}{2\,\sigma(x_i)^2} + \log \sigma(x_i)
+\right],
+$$
+
+which *rewards the model for predicting its own noise level* — large errors
+are forgiven where $\sigma(x)$ is declared big, but declaring big $\sigma$
+everywhere is taxed by the $\log\sigma$ term.  That loss **is** Tool A of
+the [next page](05-predictive-bands.qmd): "predict the noise" is not a
+trick, it is maximum likelihood with an honest noise model.
+:::
+
+One more distinction, small but load-bearing: the **loss** is what the
+optimizer minimizes; a **metric** is what you report and act on.  They need
+not be the same.  We train on MSE, but judge a risk band on its
+**coverage** — the fraction of days inside — which is not differentiable
+and is never optimized directly.  The
+[calibration check](05-predictive-bands.qmd#calibration--keeping-the-95-promise)
+of the next page is a metric doing its job: auditing a model that was
+trained on something else.
+
+## Ingredient 4 · Optimize
+
+The loss defines a landscape over parameter space; the optimizer descends
+it.  For the polynomial family there are two routes to the bottom, and it
+pays to see both.
+
+**The closed form.**  A polynomial is *linear in its parameters*: stack the
+powers of $x$ into a design matrix $\Phi$ (one row per observation, one
+column per power) and $f_\theta(x) = \Phi\,\theta$.  Setting
+$\nabla_\theta L = 0$ gives the **normal equations**
+$(\Phi^\top\Phi)\,\theta = \Phi^\top y$ — one linear solve, no iteration:
+
+```{python}
+#| label: normal-eqs
+def fit_polynomial(
+    x: Float[Array, "n_obs"], y: Float[Array, "n_obs"], degree: int
+) -> Float[Array, "n_params"]:
+    """Least squares by the normal equations: θ = (ΦᵀΦ)⁻¹·Φᵀ·y.
+
+    Φ[i, p] = xᵢᵖ — each row holds the powers (1, x, x², …) of one input.
+    """
+    Φ = np.vander(x, degree + 1, increasing=True)       # (n_obs, n_params)
+    gram = einx.dot("n p, n q -> p q", Φ, Φ)            # ΦᵀΦ  (n_params, n_params)
+    moment = einx.dot("n p, n -> p", Φ, y)              # Φᵀy  (n_params,)
+    return np.linalg.solve(gram, moment)                # θ, lowest power first
+
+
+θ_ours = fit_polynomial(x_obs, y_obs, 6)
+θ_blackbox = np.polyfit(x_obs, y_obs, 6)[::-1]          # polyfit: highest power first
+print("ours    :", np.round(θ_ours[:4], 4))
+print("polyfit :", np.round(θ_blackbox[:4], 4), "  ← the box was this all along")
+```
+
+`np.polyfit` was never magic — it is these two `einx.dot` calls and a solve.
+
+**Gradient descent.**  Most models are *not* linear in their parameters
+(a neural network is the canonical case), and then there is no solve — only
+the loop from the recipe diagram: compute the gradient, step downhill,
+repeat.  Watch it work on the simplest slice of our problem, a degree-1
+model $f_{w,b}(x) = w\,x + b$ with two parameters we can draw:
+
+```{python}
+#| label: fig-gradient-descent
+#| fig-cap: "The MSE landscape over (w, b) for the degree-1 model, with 60 gradient-descent steps from a deliberately bad start. The surface is a convex bowl, so the path rolls straight to the bottom — and the bottom (red dot) is exactly the closed-form solution (white star). For non-convex models the landscape has valleys and ridges, but the move is the same: follow −∇L."
+def mse_grad(w: float, b: float,
+             x: Float[Array, "n_obs"], y: Float[Array, "n_obs"]) -> tuple[float, float]:
+    """∇L for L = mean((y − (w·x + b))²):  ∂L/∂w = −2·mean(x·r),  ∂L/∂b = −2·mean(r)."""
+    r = y - (w * x + b)                      # residuals at the current (w, b)
+    return float(-2 * np.mean(x * r)), float(-2 * np.mean(r))
+
+
+η = 0.05                                     # learning rate (step size)
+w, b = 1.6, 1.8                              # a deliberately bad start
+path = [(w, b)]
+for _ in range(60):
+    grad_w, grad_b = mse_grad(w, b, x_obs, y_obs)
+    w, b = w - η * grad_w, b - η * grad_b    # θ ← θ − η·∇L
+    path.append((w, b))
+path = np.asarray(path)                      # (n_steps + 1, 2)
+
+# the loss surface: L(w, b) evaluated on a 120×120 grid of parameter values
+w_grid, b_grid = np.meshgrid(np.linspace(-1.6, 2.0, 120), np.linspace(-1.2, 2.2, 120))
+pred_grid = einx.add("a b n, a b -> a b n",
+                     einx.multiply("a b, n -> a b n", w_grid, x_obs),   # w·xᵢ
+                     b_grid)                                            # … + b
+resid_grid = einx.subtract("n, a b n -> a b n", y_obs, pred_grid)       # yᵢ − ŷᵢ
+loss_grid = einx.mean("a b n -> a b", resid_grid**2)                    # L at each (w, b)
+b_star, w_star = fit_polynomial(x_obs, y_obs, 1)        # closed form: (θ₀, θ₁) = (b, w)
+
+fig, ax = plt.subplots(figsize=(8, 5))
+ax.contourf(w_grid, b_grid, loss_grid, levels=30, cmap="BuPu")
+ax.plot(path[:, 0], path[:, 1], "-o", c=CRASH, lw=1.6, ms=3.5, label="gradient descent")
+ax.plot(w_star, b_star, "*", c="white", ms=18, mec=INK, label="closed form (normal equations)")
+ax.set_xlabel("w  (slope)"); ax.set_ylabel("b  (intercept)")
+ax.set_title("descending the loss landscape", fontsize=12)
+ax.legend(fontsize=10, loc="lower left")
+fig.tight_layout()
+plt.show()
+```
+
+Two routes, one destination — because this landscape is a convex bowl.  Keep
+the picture: when the [next page](05-predictive-bands.qmd) refits the model
+many times on resampled data and the fits *disagree*, that disagreement is
+many descents ending in different places because each saw different data.
+Ensemble spread is this figure, run in parallel.
+
+## The Same Recipe, More Knobs — a Neural Network
+
+Nothing about the recipe was polynomial-specific.  Swap the model family for
+a small **neural network** — stacked linear maps with a squashing
+nonlinearity between them — and the other three ingredients do not move: same
+data, same MSE loss, and the optimizer *must* be gradient descent, because a
+network is not linear in its parameters and the normal equations no longer
+exist.  In Keras the recipe reads off almost line for line:
+
+```{python}
+#| label: keras-mlp
+import os
+os.environ["KERAS_BACKEND"] = "jax"          # Keras 3 on the CPU JAX backend
+import keras
+from keras import layers
+
+
+def make_mlp(n_out: int = 1, seed: int = 0) -> keras.Model:
+    """x → Dense(64, tanh) → Dense(64, tanh) → Dense(n_out).
+
+    The same idea as the polynomial family — a flexible f_θ built from
+    simple pieces — but the capacity dial is now width × depth, not degree.
+    """
+    keras.utils.set_random_seed(seed)        # reproducible weight init
+    return keras.Sequential([
+        layers.Dense(64, activation="tanh"),
+        layers.Dense(64, activation="tanh"),
+        layers.Dense(n_out),
+    ])
+
+
+net = make_mlp(seed=0)
+net.compile(optimizer=keras.optimizers.Adam(0.01),   # the OPTIMIZER ingredient
+            loss="mse")                              # the LOSS ingredient
+net.fit(x_obs[:, None], y_obs[:, None],              # the DATA ingredient
+        epochs=600, batch_size=x_obs.size, verbose=0)  # run the loop 600 times
+print(f"parameters: θ has {net.count_params():,} entries (the degree-6 polynomial had 7)")
+```
+
+`model.compile` *is* choosing the loss and the optimizer; `model.fit` *is*
+the loop from the diagram, run 600 times.  Adam is gradient descent with a
+per-parameter step size — a better descender of the same landscape, which is
+no longer a convex bowl.
+
+```{python}
+#| label: fig-keras-vs-poly
+#| fig-cap: "The 4,000-knob network and the 7-knob polynomial, fitted by the same recipe. Where there is data they agree almost everywhere. Where there is none, each invents its own story — the polynomial swings, the network glides through a guess — and nothing in the training loss prefers the truth. Capacity changed by three orders of magnitude; the recipe, and its blindness over the gap, did not."
+y_net = net.predict(x_grid[:, None], verbose=0)[:, 0]
+θ_poly = np.polyfit(x_obs, y_obs, 6)
+
+fig, ax = plt.subplots(figsize=(10, 3.8))
+ax.plot(x_grid, y_net, c=WARM, lw=2.2, label=f"neural net ({net.count_params():,} params)")
+ax.plot(x_grid, np.polyval(θ_poly, x_grid), c=COOL, lw=2.2, ls="--",
+        label="degree-6 polynomial (7 params)")
+ax.scatter(x_obs, y_obs, s=14, c=INK, alpha=0.7)
+ax.axvspan(-1.4, 1.4, color=GREEN, alpha=0.08)
+ax.set_ylim(-2.6, 2.6)
+ax.legend(fontsize=10, frameon=False)
+ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+This is the model family the [next page](05-predictive-bands.qmd) builds
+its uncertainty around — and the figure already whispers why uncertainty is
+needed: two models, equally happy on the training data, telling different
+stories everywhere else.
+
+## Choosing Capacity — The Loss Can't Do It Alone
+
+Back to the dial that the loss cannot set.  Training loss *always* falls as
+capacity rises — a degree-59 polynomial threads all 60 points and scores
+zero.  The number that tells the truth is the error on data the fit **never
+saw**.  Hold out every other point and ask both numbers, across the whole
+dial:
+
+```{python}
+#| label: fig-capacity-ucurve
+#| fig-cap: "Train error falls forever as capacity grows — that is memorization, not learning. Held-out error traces the honest curve: falling while added capacity captures real structure, then turning up when the extra knobs start fitting noise. The minimum is the right capacity for THIS amount of data and THIS split — the exact winner wobbles between runs (here 9, near the capacity figure's degree-6 ballpark), but the shape of the curve never does."
+train_idx = np.arange(x_obs.size) % 2 == 0   # every other point trains…
+val_idx = ~train_idx                         # …the rest only judges
+
+degrees = np.arange(1, 17)
+rmse_train, rmse_val = [], []
+for d in degrees:
+    θ_d = np.polyfit(x_obs[train_idx], y_obs[train_idx], d)
+    pred_train = np.polyval(θ_d, x_obs[train_idx])
+    pred_val = np.polyval(θ_d, x_obs[val_idx])
+    rmse_train.append(np.sqrt(np.mean((y_obs[train_idx] - pred_train)**2)))
+    rmse_val.append(np.sqrt(np.mean((y_obs[val_idx] - pred_val)**2)))
+
+best_d = degrees[int(np.argmin(rmse_val))]
+fig, ax = plt.subplots(figsize=(9, 3.8))
+ax.plot(degrees, rmse_train, "-o", c=COOL, ms=5, label="train RMSE (seen data)")
+ax.plot(degrees, rmse_val, "-o", c=CRASH, ms=5, label="held-out RMSE (unseen data)")
+ax.axvline(best_d, color=INK, lw=1.2, ls="--")
+ax.annotate(f"best capacity ≈ degree {best_d}", (best_d, max(rmse_val) * 0.7),
+            xytext=(8, 0), textcoords="offset points", fontsize=10)
+ax.set_yscale("log")
+ax.set_xlabel("polynomial degree (capacity)"); ax.set_ylabel("RMSE  [y units]")
+ax.legend(fontsize=10, frameon=False); despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+This is the recipe's fifth ingredient hiding in plain sight: **evaluation on
+unseen data**.  It is also where this page hands off.  The held-out curve
+says *how wrong* the model is on average — one number for the whole x-axis.
+The [next page](05-predictive-bands.qmd) asks the sharper question this
+chapter exists for: how wrong is it **here, at this $x$** — and how much of
+that wrongness is the world's noise ($\sigma(x)$, a *loss term* as we saw
+above) versus the model's own ignorance (forty descents disagreeing)?
+
+::: {.eli5}
+**One-liner recap.**  Data is fixed, parameters move: the model predicts,
+the loss scores, the optimizer descends — and the loss you chose was a noise
+model all along, which is why putting honest uncertainty around the fit is a
+continuation of fitting, not a new subject.
+:::

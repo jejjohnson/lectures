@@ -12,7 +12,11 @@ from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
 from lectures.measures import distance_correlation, measure_trio
 plotting.set_style("notes")
 import numpy as np, matplotlib.pyplot as plt
-from scipy.stats import pearsonr, spearmanr
+from scipy.stats import pearsonr, rankdata, spearmanr
+import einx                      # linear algebra with the axes spelled out
+from jaxtyping import Float      # shape annotations: Float[Array, "n_days"]
+
+Array = np.ndarray
 ```
 
 *Learn-the-tool track · Lab 1 of 3.*
@@ -145,7 +149,112 @@ plt.show()
 
 ---
 
-## 3 · Full Basket Ranking
+## 3 · See the Transforms
+
+Every rung is `compare(transform(x), transform(y))`.  In this section you make
+each transform *visible* on data you just loaded — the same pictures as the
+lecture, built by your own hands.
+
+### Spearman Is Pearson After Ranking
+
+First verify the claim numerically — they are not approximately equal, they
+are **the same number**:
+
+```{python}
+x, y = R["JPM"].values, R["BAC"].values
+rx, ry = rankdata(x), rankdata(y)
+print(f"Spearman(x, y)          = {spearmanr(x, y)[0]:.6f}")
+print(f"Pearson(rank x, rank y) = {pearsonr(rx, ry)[0]:.6f}")
+```
+
+Then look at what the transform does to real returns:
+
+```{python}
+#| label: fig-rank-real
+#| fig-cap: "The rank transform on a real pair. Left: raw JPM/BAC returns — a fat-tailed cloud whose extremes dominate the eye. Right: the same days after ranking — the marginals are now uniform by construction, so what remains is *pure dependence structure*. This panel is your first copula."
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.4))
+axL.scatter(x, y, s=8, c=COOL, alpha=0.35, edgecolors="none")
+axL.set_title("Raw returns — tails dominate", fontsize=11)
+axR.scatter(rx, ry, s=8, c=WARM, alpha=0.35, edgecolors="none")
+axR.set_title("rank(x) vs rank(y) — pure dependence", fontsize=11)
+for ax in (axL, axR):
+    ax.set_xticks([]); ax.set_yticks([])
+    despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+Note what ranking *removed*: the marginal distributions.  The right panel
+would look identical no matter how fat the tails are — only the *coupling*
+between the two columns survives.  (When you meet copulas later, this is one.)
+
+### Distance Correlation Is Pearson After the Distance Transform
+
+The lecture's claim: build the pairwise distance matrices, double-center them,
+and the correlation of their entries **is** $\operatorname{dCor}^2$.  Verify
+it on the U-shape from Section 2:
+
+```{python}
+def centered_distances(z: Float[Array, "n_days"]) -> Float[Array, "n_days n_days"]:
+    """The dCor transform: double-centered pairwise distances.
+
+    Dᵢⱼ = |zᵢ − zⱼ|                      [same units as z]
+    Aᵢⱼ = Dᵢⱼ − D̄ᵢ. − D̄.ⱼ + D̄..         (row, column, grand means removed)
+    """
+    D = np.abs(einx.subtract("i, j -> i j", z, z))   # (n_days, n_days)
+    row_mean = einx.mean("i j -> i", D)              # D̄ᵢ. — day i's mean distance
+    col_mean = einx.mean("i j -> j", D)              # D̄.ⱼ — day j's mean distance
+    A = einx.subtract("i j, i -> i j", D, row_mean)
+    A = einx.subtract("i j, j -> i j", A, col_mean)
+    return A + D.mean()                              # add back the grand mean D̄..
+
+
+A = centered_distances(x_u)
+B = centered_distances(y_u)
+# dCor² = corr(Aᵢⱼ, Bᵢⱼ) over all n² matrix entries — verify the identity:
+corr_entries = pearsonr(A.ravel(), B.ravel())[0]
+dcor = distance_correlation(x_u, y_u)
+print(f"corr of centered distance entries = {corr_entries:.4f}")
+print(f"dCor²                             = {dcor**2:.4f}")
+```
+
+And draw the transform itself.  Sorting the days by $x$ makes the matrix
+structure readable:
+
+```{python}
+#| label: fig-distance-matrices
+#| fig-cap: "The distance transform on the U-shape, days sorted by x. The X-distances form a smooth gradient; the Y-distances show the U as a cross — days on opposite arms have similar y. dCor is the correlation of these two patterns; Pearson on the raw values sees nothing."
+order = np.argsort(x_u)[::3]          # sort days by x, keep every 3rd — readable matrix
+xs_, ys_ = x_u[order], y_u[order]
+# Aᵢⱼ = |xᵢ − xⱼ|  and  Bᵢⱼ = |yᵢ − yⱼ|       shape: (n_days, n_days)
+A_show = np.abs(einx.subtract("i, j -> i j", xs_, xs_))
+B_show = np.abs(einx.subtract("i, j -> i j", ys_, ys_))
+
+fig, (ax0, ax1, ax2) = plt.subplots(1, 3, figsize=(12.5, 4.0))
+ax0.scatter(xs_, ys_, s=12, c=WARM, alpha=0.55, edgecolors="none")
+ax0.set_title("the U-shape (sorted by x)", fontsize=11)
+despine(ax0)
+for ax, M, ttl, cmap in [(ax1, A_show, "pairwise distances in X", "Blues"),
+                         (ax2, B_show, "pairwise distances in Y", "Oranges")]:
+    ax.imshow(M, cmap=cmap, origin="lower")
+    ax.set_title(ttl, fontsize=11)
+for ax in (ax0, ax1, ax2):
+    ax.set_xticks([]); ax.set_yticks([])
+fig.tight_layout()
+plt.show()
+```
+
+::: {.callout-tip}
+## Your Turn — Real Pair, Same Check
+Repeat the `corr of centered distances = dCor²` verification on **JPM/BAC**
+(subsample ~500 days first — the matrices are $n \times n$).  Then try a pair
+from different sectors.  The identity holds every time; what changes is how
+much of the dependence survives each transform.
+:::
+
+---
+
+## 4 · Full Basket Ranking
 
 Compute all three measures for every pair; rank by distance correlation.
 
@@ -181,7 +290,7 @@ non-linear or tail dependence — worth investigating with mutual information
 
 ---
 
-## 4 · Your Turn — The Cheapest Tool That Suffices
+## 5 · Your Turn — The Cheapest Tool That Suffices
 
 For each pair below, decide: does Pearson already tell the story, or do you
 need to climb the ladder?

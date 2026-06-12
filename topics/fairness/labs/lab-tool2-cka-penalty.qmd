@@ -72,12 +72,27 @@ for mu in sweep:
 
 ```{python}
 #| label: fig-tool2-frontier
-#| fig-cap: "Accuracy vs neutrality. The elbow marks where neutrality starts to get expensive."
+#| fig-cap: "Accuracy vs neutrality, elbow circled. Right of the elbow, neutrality is nearly free; left of it, every further drop in CKA costs real accuracy."
+dep_arr, acc_arr = np.array(dep), np.array(acc)
+
+# the elbow: the sweep point farthest from the chord joining the two endpoints
+dep_unit = (dep_arr - dep_arr.min()) / (np.ptp(dep_arr) + 1e-9)
+acc_unit = (acc_arr - acc_arr.min()) / (np.ptp(acc_arr) + 1e-9)
+start = np.array([dep_unit[0], acc_unit[0]])
+chord = np.array([dep_unit[-1] - dep_unit[0], acc_unit[-1] - acc_unit[0]])
+chord = chord / np.linalg.norm(chord)
+offsets = np.column_stack([dep_unit, acc_unit]) - start
+dist = np.linalg.norm(offsets - (offsets @ chord)[:, None] * chord, axis=1)
+knee = int(np.argmax(dist))
+print(f"elbow at μ = {sweep[knee]:g}  (CKA {dep_arr[knee]:.2f}, R² {acc_arr[knee]:.2f})")
+
 fig, ax = plt.subplots(figsize=(7.5, 4.4))
-ax.plot(dep, acc, "-o", c=COOL, lw=2.2)
-for mu, dx, ay in zip(sweep, dep, acc):
+ax.plot(dep_arr, acc_arr, "-o", c=COOL, lw=2.2)
+for mu, dx, ay in zip(sweep, dep_arr, acc_arr):
     ax.annotate(f"μ={mu:g}", (dx, ay), textcoords="offset points",
                 xytext=(6, 6), fontsize=9, color=INK)
+ax.scatter([dep_arr[knee]], [acc_arr[knee]], s=240, facecolors="none",
+           edgecolors=CRASH, lw=2.6, zorder=5)
 ax.set_xlabel("CKA(ŷ, S)  →  less neutral"); ax.set_ylabel("accuracy (R²)")
 ax.set_title("The accuracy–neutrality frontier", fontsize=12)
 despine(ax)
@@ -94,11 +109,49 @@ may not need at an accuracy cost you do pay.
 
 ---
 
-## 3 · Your Turn
+## 3 · The Real Thing — `keras-fairkl`
+
+`fair_fit` is the closed-form teaching stand-in.  The production version
+trains the penalty **end to end**: `FairModelWrapper` adds $\mu \cdot
+\operatorname{CKA}(\hat y, S)$ to whatever task loss you compile, and the
+sensitive attribute rides in at `fit` time only — never as a model input.
+
+```{python}
+import os
+os.environ["KERAS_BACKEND"] = "jax"
+import keras
+from keras import layers
+from fairkl import FairModelWrapper
+
+X_in = np.column_stack([x, S])     # the net SEES S — the penalty polices it
+
+for mu in (0.0, 4.0):
+    keras.utils.set_random_seed(0)
+    mlp = keras.Sequential([layers.Dense(32, activation="tanh"),
+                            layers.Dense(32, activation="tanh"),
+                            layers.Dense(1)])
+    model = FairModelWrapper(mlp, mu=mu)     # loss = mse + μ·CKA(ŷ, S)
+    model.compile(optimizer=keras.optimizers.Adam(0.01), loss="mse")
+    model.fit(X_in, y[:, None], q=S[:, None],
+              epochs=400, batch_size=len(x), verbose=0)
+    pred = model.predict(X_in, verbose=0)[:, 0]
+    r2 = max(1 - np.mean((pred - y) ** 2) / np.var(y), 0.0)
+    print(f"μ={mu:g}:  CKA(ŷ,S) = {cka_rbf(pred, S):.3f}   R² = {r2:.3f}")
+```
+
+Same frontier, real optimizer, any architecture — this is the API the
+[credit job](lab-jobB-neutralize-credit.qmd) scales to real data.
+
+---
+
+## 4 · Your Turn
 
 - Find the $\mu$ that brings CKA below 0.05.  What accuracy do you keep?
 - Re-run with `datasets.fair_regression(seed=...)` for several seeds: how stable
   is the elbow location?
+- In the Keras version, swap `CKALoss` for `HSICLoss`
+  (`FairModelWrapper(mlp, mu=..., fairness_loss=fairkl.HSICLoss())`).  Why does
+  the same $\mu$ now behave differently?  (Hint: which of the two is bounded?)
 
 Next: [Tool 3 — adversarial removal](lab-tool3-adversarial.qmd), the learned
 alternative to a fixed kernel.

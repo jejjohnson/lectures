@@ -1,0 +1,474 @@
+---
+title: "From Points to Time Series: Scalars, Windows, and Blocks"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, GRID, PANEL, despine, annotate_box
+plotting.set_style("notes")
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.patches import Circle, FancyBboxPatch, Rectangle
+from matplotlib.gridspec import GridSpec
+from scipy.stats import pearsonr
+import einx                      # linear algebra with the axes spelled out
+from jaxtyping import Float      # shape annotations: Float[Array, "n_days"]
+
+Array = np.ndarray
+
+
+def _venn_circle(ax, xy, r, color, alpha=0.32):
+    """A filled circle with a crisp matching outline (information-Venn style)."""
+    ax.add_patch(Circle(xy, r, facecolor=color, edgecolor=color, lw=2.2,
+                        alpha=alpha, zorder=2))
+    ax.add_patch(Circle(xy, r, facecolor="none", edgecolor=color, lw=2.2, zorder=3))
+```
+
+Every measure so far treated a variable as a **scalar**: one value per day,
+compared day by day.  Real financial data is not a bag of points — it is a
+*time series*, and a portfolio is not two columns but many.  This page makes
+the step from samples to series explicit, with one idea: the **window** is a
+dial, and turning it changes which measure you are computing.  By the end the
+abstract pictures are cashed out on the real 14-stock basket.
+
+---
+
+## One Dial, Three Readings
+
+Take two coupled series and slide a window over them.  At width $w=1$ each
+timestep is a scalar and the question is Pearson (or the
+[mutual information](03-mutual-information.qmd) of two scalars).  Widen the
+window and each *sample* becomes a vector, with redundancy *within* it (total
+correlation).  Compare a window of one series against a window of the other
+and you read the information *between* two blocks.  The window size is the
+knob.
+
+```{python}
+#| label: fig-patch-dial
+#| fig-cap: "One dial, three readings of the *same* two series. w=1 — every timestep is a scalar, so the question is Pearson (right: the scatter). w=3 — a sample is now a 3-day window (a vector), with redundancy WITHIN it: total correlation T(x). Two windows, one of X and one of Y — the information BETWEEN the blocks: I(X;Y). Widening the highlighted patch is the only thing that changes."
+rng = np.random.default_rng(7)
+T = 26
+t = np.arange(T)
+common = np.cumsum(rng.normal(0, 1, T))
+x_series = 0.7 * common + np.cumsum(rng.normal(0, 0.5, T))
+y_series = 0.7 * np.roll(common, 1) + np.cumsum(rng.normal(0, 0.5, T))
+x_series = (x_series - x_series.mean()) / x_series.std()
+y_series = (y_series - y_series.mean()) / y_series.std()
+
+
+def _strip(ax, highlight=None, hl_color=COOL, second_hl=None):
+    ax.plot(t, x_series, color=COOL, lw=1.6, marker="o", ms=3, label="series X")
+    ax.plot(t, y_series, color=WARM, lw=1.6, marker="o", ms=3, label="series Y")
+    if highlight is not None:
+        s, w = highlight
+        y0, y1 = ax.get_ylim()
+        ax.axvspan(s - 0.4, s + w - 0.6, color=hl_color, alpha=0.15, lw=0)
+        ax.add_patch(FancyBboxPatch((s - 0.4, y0), w - 0.2, y1 - y0,
+                                    boxstyle="round,pad=0", fill=False,
+                                    edgecolor=hl_color, lw=2, zorder=5))
+    if second_hl is not None:
+        s, w = second_hl
+        ax.axvspan(s - 0.4, s + w - 0.6, color=WARM, alpha=0.15, lw=0)
+    ax.set_xticks([]); ax.set_yticks([])
+    for sp in ax.spines.values():
+        sp.set_edgecolor(GRID)
+
+
+fig = plt.figure(figsize=(10.5, 7.0))
+gs = GridSpec(3, 2, figure=fig, width_ratios=[1.5, 1], hspace=0.5, wspace=0.22)
+
+axS1 = fig.add_subplot(gs[0, 0]); _strip(axS1, highlight=(8, 1))
+axS1.set_title("w = 1 — every timestep is one sample", fontsize=11,
+               fontweight="bold", loc="left")
+axS1.legend(loc="upper right", fontsize=8, frameon=False, ncol=2)
+axR1 = fig.add_subplot(gs[0, 1])
+axR1.scatter(x_series, y_series, s=18, c=COOL, alpha=0.6, edgecolors="none")
+r = pearsonr(x_series, y_series)[0]
+axR1.set_title(f"two scalars  →  Pearson = {r:+.2f}", fontsize=10, fontweight="bold")
+axR1.set_xlabel("X today", fontsize=9); axR1.set_ylabel("Y today", fontsize=9)
+axR1.set_xticks([]); axR1.set_yticks([])
+for sp in axR1.spines.values():
+    sp.set_edgecolor(GRID)
+
+axS2 = fig.add_subplot(gs[1, 0]); _strip(axS2, highlight=(8, 3))
+axS2.set_title("w = 3 — a sample is now a 3-day window (a vector)", fontsize=11,
+               fontweight="bold", loc="left")
+axR2 = fig.add_subplot(gs[1, 1]); axR2.axis("off")
+axR2.text(0.5, 0.72, "one window = ( x[t], x[t+1], x[t+2] )", family="monospace",
+          ha="center", fontsize=10, color=INK)
+axR2.text(0.5, 0.46, "redundancy WITHIN the window:", ha="center", fontsize=10, color="#555")
+axR2.text(0.5, 0.16, "T(x)  —  total correlation", family="monospace", ha="center",
+          fontsize=13, fontweight="bold", color=COOL,
+          bbox=dict(boxstyle="round,pad=0.4", fc=PANEL, ec=GRID))
+
+axS3 = fig.add_subplot(gs[2, 0])
+_strip(axS3, highlight=(6, 3), hl_color=COOL, second_hl=(16, 3))
+axS3.set_title("compare a window of X against a window of Y", fontsize=11,
+               fontweight="bold", loc="left")
+axR3 = fig.add_subplot(gs[2, 1]); axR3.axis("off")
+axR3.text(0.5, 0.72, "two windows, two vectors", ha="center", fontsize=10, color=INK)
+axR3.text(0.5, 0.46, "shared information BETWEEN them:", ha="center", fontsize=10, color="#555")
+axR3.text(0.5, 0.16, "I(X;Y)  —  mutual information", family="monospace", ha="center",
+          fontsize=13, fontweight="bold", color="#7d6b8f",
+          bbox=dict(boxstyle="round,pad=0.4", fc=PANEL, ec=GRID))
+plt.show()
+```
+
+As the window grows, a "variable" grows from a scalar to a vector, and the
+same question climbs Pearson → total correlation → mutual information.  In
+pseudocode:
+
+```
+T(X)   = sum_i H(Xi) - H(X1..Xd)      # redundancy WITHIN a block
+I(X;Y) = H(X) + H(Y) - H(X,Y)         # shared info BETWEEN two blocks
+```
+
+---
+
+## Why Pairs Are Not Enough
+
+A pairwise view cannot see the redundancy three-or-more variables share in
+common — which is why a portfolio needs the multivariate measure.  A basket of
+$d$ names has $\binom{d}{2}$ pairs, and checking each pair *still* misses any
+structure shared by three or more names at once:
+
+```{python}
+#| label: fig-venn-why-multi
+#| fig-cap: "A portfolio is not two columns. Eight names already make 28 pairs (every edge); worse, redundancy shared by three or more names is invisible to any single pair. We need one number for the whole basket."
+fig, ax = plt.subplots(figsize=(8.4, 4.8))
+ax.set_xlim(0, 10); ax.set_ylim(0, 6); ax.axis("off")
+d = 8
+cx, cy, Rr = 5.0, 3.1, 2.2
+pts = [(cx + Rr * np.cos(2 * np.pi * k / d + np.pi / 2),
+        cy + Rr * np.sin(2 * np.pi * k / d + np.pi / 2)) for k in range(d)]
+for i in range(d):
+    for j in range(i + 1, d):
+        ax.plot([pts[i][0], pts[j][0]], [pts[i][1], pts[j][1]],
+                color=GRID, lw=0.6, alpha=0.7, zorder=1)
+for (x, y) in pts:
+    ax.add_patch(Circle((x, y), 0.22, facecolor=COOL, edgecolor=INK,
+                        lw=1.2, zorder=3))
+ax.text(cx, cy, f"{d * (d - 1) // 2}\npairs", fontsize=12, color=CRASH,
+        fontweight="bold", ha="center", va="center", zorder=5,
+        bbox=dict(boxstyle="round,pad=0.3", fc="white", ec=CRASH))
+fig.tight_layout(); plt.show()
+```
+
+The fix is to stop thinking in pairs.  Stack the $d$ variables and ask for the
+single overlap shared by **all** of them — the **total correlation** $T(x)$, the
+multivariate generalization of mutual information:
+
+```{python}
+#| label: fig-venn-multi
+#| fig-cap: "Many variables: the core shared by all the circles is total correlation T(x) = Σ H(Xi) − H(X1…Xd) — the redundancy binding the whole basket together."
+fig, ax = plt.subplots(figsize=(7.6, 5.6))
+ax.set_xlim(0, 10); ax.set_ylim(0, 8.6); ax.axis("off"); ax.set_aspect("equal")
+cols = [COOL, WARM, plotting.PALETTE["green"]]
+names = ["X1", "X2", "X3"]
+cx, cy, R, r = 5.0, 4.4, 1.15, 2.0
+for k in range(3):
+    ang = np.pi / 2 + k * 2 * np.pi / 3
+    _venn_circle(ax, (cx + R * np.cos(ang), cy + R * np.sin(ang)), r,
+                 cols[k], alpha=0.30)
+label_pos = [(cx, cy + R + r + 0.5),
+             (cx - (R + r) * 0.92, cy - R * 0.5 - 0.2),
+             (cx + (R + r) * 0.92, cy - R * 0.5 - 0.2)]
+for (lx, ly), nm, col in zip(label_pos, names, cols):
+    ax.text(lx, ly, f"H({nm})", family="monospace", fontsize=13, color=col,
+            fontweight="bold", ha="center", va="center")
+ax.text(cx, cy, "T(x)", family="monospace", fontsize=16, color=INK,
+        fontweight="bold", ha="center", va="center", zorder=8)
+ax.text(cx, 1.15, "T(x) = sum_i H(Xi) - H(X1...Xd)", family="monospace",
+        fontsize=12, color=INK, ha="center",
+        bbox=dict(boxstyle="round,pad=0.4", fc=PANEL, ec=GRID))
+fig.tight_layout(); plt.show()
+```
+
+And the most general view: two **blocks** of variables — a sector vs. another
+sector, or features vs. a target — each with its own internal redundancy $T$, and
+a lens where they meet, the mutual information *between* the blocks:
+
+```{python}
+#| label: fig-venn-between
+#| fig-cap: "The full picture: dependence WITHIN each block (its internal total correlation T) and BETWEEN the two blocks (the shared lens I(X;Y)). This single diagram underlies every measure in the chapter."
+fig, ax = plt.subplots(figsize=(10.5, 5.8))
+ax.set_xlim(0, 11); ax.set_ylim(0, 7.2); ax.axis("off"); ax.set_aspect("equal")
+
+def _block(center, tagcol):
+    bx, by = center
+    for k in range(3):
+        ang = np.pi / 2 + k * 2 * np.pi / 3
+        pos = (bx + 0.55 * np.cos(ang), by + 0.55 * np.sin(ang))
+        ax.add_patch(Circle(pos, 1.05, facecolor=tagcol, edgecolor=tagcol,
+                            lw=1.8, alpha=0.22, zorder=2))
+        ax.add_patch(Circle(pos, 1.05, facecolor="none", edgecolor=tagcol,
+                            lw=1.8, alpha=0.6, zorder=3))
+    ax.text(bx, by, "T", family="monospace", fontsize=13, color=tagcol,
+            fontweight="bold", ha="center", va="center", zorder=6)
+
+_block((3.2, 3.9), COOL)
+_block((7.8, 3.9), WARM)
+ax.add_patch(Circle((5.5, 3.9), 1.35, facecolor="#7d6b8f",
+                    edgecolor="#5e4f6e", lw=1.6, alpha=0.30, zorder=4))
+ax.text(5.5, 3.9, "I(X;Y)", family="monospace", fontsize=13, color=INK,
+        fontweight="bold", ha="center", va="center", zorder=7)
+ax.text(3.2, 6.0, "X = ( X1, X2, ..., Xp )", family="monospace", fontsize=12,
+        color=COOL, fontweight="bold", ha="center")
+ax.text(7.8, 6.0, "Y = ( Y1, Y2, ..., Yq )", family="monospace", fontsize=12,
+        color=WARM, fontweight="bold", ha="center")
+fig.tight_layout(); plt.show()
+```
+
+This is the picture behind the whole chapter: dependence **within** a group and
+**between** groups, both read off the same information diagram.
+
+### The Whole Story in One Grid
+
+Put the three pieces in a line.  Each row is one **finance question**; the middle
+column is the **data manipulation** it forces (the actual array reshape — a column
+becoming a matrix of overlapping, day-sharing patches); the last column is the
+**picture** that names the measure.  *The question drives the manipulation; the
+manipulation drives the picture.*
+
+```{python}
+#| label: fig-story-grid
+#| fig-cap: "The story in one grid. Row 1: two columns of scalars → the 2-circle Venn (Pearson / MI). Row 2: one series chunked into w-day patches that share days (the shaded overlap IS the redundancy) → the core T(x). Row 3: X and Y both patched on the same days → two blocks and the lens I(X;Y). The middle column is the one thing the other figures leave implicit — the data manipulation itself."
+def _cell_grid(ax, x0, y0, ncol, nrow, cw, ch, color, alpha=0.5, gap=0.04, labels=None):
+    for i in range(nrow):
+        for j in range(ncol):
+            cx = x0 + j * (cw + gap)
+            cy = y0 - i * (ch + gap)
+            ax.add_patch(Rectangle((cx, cy), cw, ch, facecolor=color,
+                                   edgecolor="white", lw=1, alpha=alpha))
+            if labels is not None:
+                ax.text(cx + cw / 2, cy + ch / 2, str(labels[i][j]), ha="center",
+                        va="center", fontsize=8.5, color="white", fontweight="bold",
+                        zorder=5)
+
+
+LENS = "#7d6b8f"
+fig = plt.figure(figsize=(13.5, 8.3))
+gs = GridSpec(3, 3, figure=fig, width_ratios=[1.0, 1.25, 1.1], hspace=0.35, wspace=0.15)
+
+for c, h in enumerate(["THE QUESTION", "THE MANIPULATION", "THE PICTURE"]):
+    ax = fig.add_subplot(gs[0, c]); ax.axis("off")
+    ax.text(0.5, 1.18, h, transform=ax.transAxes, ha="center", fontsize=11,
+            fontweight="bold", color=COOL)
+
+# Row 1 — two scalar columns → 2-circle MI
+axQ = fig.add_subplot(gs[0, 0]); axQ.axis("off")
+axQ.text(0.5, 0.62, "Do these two\nmove together,\nday to day?", ha="center",
+         va="center", transform=axQ.transAxes, fontsize=14, color=INK, fontweight="bold")
+axQ.text(0.5, 0.16, "e.g. two stocks' daily returns", ha="center",
+         transform=axQ.transAxes, fontsize=9, style="italic", color="#666")
+axM = fig.add_subplot(gs[0, 1]); axM.axis("off"); axM.set_xlim(0, 10); axM.set_ylim(0, 10)
+_cell_grid(axM, 2.5, 8, 1, 6, 0.7, 0.7, COOL)
+_cell_grid(axM, 5.5, 8, 1, 6, 0.7, 0.7, WARM)
+axM.text(2.85, 9.4, "X", ha="center", fontsize=11, color=COOL, fontweight="bold")
+axM.text(5.85, 9.4, "Y", ha="center", fontsize=11, color=WARM, fontweight="bold")
+axM.text(5, 1.2, "each row = one day (a scalar)", ha="center", fontsize=8.5,
+         style="italic", color="#666")
+axP = fig.add_subplot(gs[0, 2]); axP.axis("off"); axP.set_xlim(0, 10); axP.set_ylim(0, 10)
+axP.set_aspect("equal")
+for cxx, col in [(4.2, COOL), (5.8, WARM)]:
+    axP.add_patch(Circle((cxx, 5.5), 2.0, facecolor=col, edgecolor=col, lw=2, alpha=0.30))
+axP.text(5.0, 5.5, "I(X;Y)", family="monospace", ha="center", va="center",
+         fontsize=11, fontweight="bold", color=INK)
+axP.text(5.0, 1.6, "Pearson / MI", ha="center", fontsize=9.5, color=INK, fontweight="bold")
+
+# Row 2 — one series chunked into w-day patches → core T(x)
+axQ2 = fig.add_subplot(gs[1, 0]); axQ2.axis("off")
+axQ2.text(0.5, 0.62, "Is there structure\nacross a window\nof days?", ha="center",
+          va="center", transform=axQ2.transAxes, fontsize=14, color=INK, fontweight="bold")
+axQ2.text(0.5, 0.16, "chunk the series into\nw-day patches", ha="center",
+          transform=axQ2.transAxes, fontsize=9, style="italic", color="#666")
+axM2 = fig.add_subplot(gs[1, 1]); axM2.axis("off"); axM2.set_xlim(0, 10); axM2.set_ylim(0, 10)
+_cell_grid(axM2, 1.2, 8, 1, 6, 0.6, 0.6, COOL, alpha=0.45, labels=[[d] for d in range(1, 7)])
+axM2.annotate("", xy=(4.3, 5), xytext=(2.4, 5),
+              arrowprops=dict(arrowstyle="-|>", color=INK, lw=2))
+axM2.text(3.35, 5.6, "window\nw=3", ha="center", fontsize=8, color=INK)
+_cell_grid(axM2, 5.0, 8, 3, 4, 0.7, 0.7, COOL, alpha=0.6,
+           labels=[[1, 2, 3], [2, 3, 4], [3, 4, 5], [4, 5, 6]])
+axM2.text(6.05, 9.4, "days in window →", ha="center", fontsize=8, color=COOL)
+axM2.text(4.55, 6.5, "patches ↓", ha="center", fontsize=8, color=COOL, rotation=90)
+axM2.text(5.7, 0.9, "consecutive windows SHARE days →\nthat overlap is the redundancy",
+          ha="center", fontsize=8, style="italic", color="#666")
+axP2 = fig.add_subplot(gs[1, 2]); axP2.axis("off"); axP2.set_xlim(0, 10); axP2.set_ylim(0, 10)
+axP2.set_aspect("equal")
+for k in range(3):
+    ang = np.pi / 2 + k * 2 * np.pi / 3
+    axP2.add_patch(Circle((5 + 0.8 * np.cos(ang), 5.5 + 0.8 * np.sin(ang)), 1.5,
+                          facecolor=COOL, edgecolor=COOL, lw=1.6, alpha=0.25))
+axP2.text(5, 5.5, "T(x)", family="monospace", ha="center", va="center",
+          fontsize=12, fontweight="bold", color=INK)
+axP2.text(5, 1.6, "total correlation\n(redundancy WITHIN)", ha="center", fontsize=9,
+          color=INK, fontweight="bold")
+
+# Row 3 — X and Y patched on the same days → two blocks + lens
+axQ3 = fig.add_subplot(gs[2, 0]); axQ3.axis("off")
+axQ3.text(0.5, 0.62, "Do two windowed\nseries share\nstructure?", ha="center",
+          va="center", transform=axQ3.transAxes, fontsize=14, color=INK, fontweight="bold")
+axQ3.text(0.5, 0.16, "patch X and Y,\nthen compare blocks", ha="center",
+          transform=axQ3.transAxes, fontsize=9, style="italic", color="#666")
+axM3 = fig.add_subplot(gs[2, 1]); axM3.axis("off"); axM3.set_xlim(0, 10); axM3.set_ylim(0, 10)
+blk = [[1, 2, 3], [2, 3, 4], [3, 4, 5], [4, 5, 6]]
+_cell_grid(axM3, 1.0, 8, 3, 4, 0.62, 0.62, COOL, alpha=0.6, labels=blk)
+_cell_grid(axM3, 5.6, 8, 3, 4, 0.62, 0.62, WARM, alpha=0.6, labels=blk)
+axM3.text(2.3, 9.5, "X patched", ha="center", fontsize=8.5, color=COOL, fontweight="bold")
+axM3.text(6.9, 9.5, "Y patched", ha="center", fontsize=8.5, color=WARM, fontweight="bold")
+axM3.text(5, 0.9, "same days, two series — compare the blocks", ha="center",
+          fontsize=8, style="italic", color="#666")
+axP3 = fig.add_subplot(gs[2, 2]); axP3.axis("off"); axP3.set_xlim(0, 10); axP3.set_ylim(0, 10)
+axP3.set_aspect("equal")
+for cx0, col in [(3.4, COOL), (6.6, WARM)]:
+    for k in range(3):
+        ang = np.pi / 2 + k * 2 * np.pi / 3
+        axP3.add_patch(Circle((cx0 + 0.45 * np.cos(ang), 5.5 + 0.45 * np.sin(ang)), 1.15,
+                              facecolor=col, edgecolor=col, lw=1.2, alpha=0.22))
+axP3.add_patch(Circle((5.0, 5.5), 1.0, facecolor=LENS, edgecolor="#5e4f6e",
+                      lw=1.4, alpha=0.32))
+axP3.text(5.0, 5.5, "I(X;Y)", family="monospace", ha="center", va="center",
+          fontsize=10.5, fontweight="bold", color=INK)
+axP3.text(5.0, 1.6, "MI BETWEEN blocks", ha="center", fontsize=9.5, color=INK, fontweight="bold")
+
+fig.suptitle("The question drives the manipulation; the manipulation drives the picture",
+             fontsize=15, fontweight="bold", y=0.99)
+plt.show()
+```
+
+---
+
+## Now With Real Data
+
+Histograms cannot estimate the entropy of a 5-day window (a 5-dimensional
+density!), but the **Gaussian closed forms** can — and for these illustrations
+they are exactly the right crude-but-honest tool.  For a Gaussian vector with
+correlation matrix $R$:
+
+$$
+T(\mathbf{x}) = -\tfrac{1}{2}\,\log_2 \det R
+\qquad [\text{bits}]
+$$
+
+$$
+I(\mathbf{x}; \mathbf{y})
+  = \tfrac{1}{2}\,\log_2
+    \frac{\det R_{xx} \cdot \det R_{yy}}{\det R_{\text{full}}}
+\qquad [\text{bits}]
+$$
+
+```{python}
+#| label: tc-helpers
+def total_correlation_gauss_bits(X: Float[Array, "n_samples d"]) -> float:
+    """T(x) = −½ · log₂ det(R)     [bits]   (Gaussian closed form)
+
+    R is the d×d correlation matrix; det(R) = 1 ⇔ no redundancy ⇔ T = 0.
+    """
+    R_corr = np.corrcoef(X.T)                    # (d, d)
+    return -0.5 * np.log2(np.linalg.det(R_corr))
+
+
+def block_mi_gauss_bits(
+    X: Float[Array, "n_samples p"], Y: Float[Array, "n_samples q"]
+) -> float:
+    """I(x; y) = ½ · log₂ [ det(Rxx)·det(Ryy) / det(R_full) ]     [bits]"""
+    R_full = np.corrcoef(np.column_stack([X, Y]).T)   # ((p+q), (p+q))
+    p = X.shape[1]
+    R_xx = R_full[:p, :p]                             # within-X correlations
+    R_yy = R_full[p:, p:]                             # within-Y correlations
+    det_ratio = np.linalg.det(R_xx) * np.linalg.det(R_yy) / np.linalg.det(R_full)
+    return 0.5 * np.log2(det_ratio)
+```
+
+### The Redundancy Binding the Basket
+
+```{python}
+#| label: basket-tc
+R = datasets.load_returns()
+META = datasets.load_basket_meta()
+print(f"Loaded {len(R)} days × {R.shape[1]} stocks")
+
+tc_basket = total_correlation_gauss_bits(R.to_numpy())
+print(f"\nTotal correlation of the whole basket: {tc_basket:.2f} bits")
+print(f"  → the basket behaves like far fewer than {R.shape[1]} independent names.")
+```
+
+Seven-plus bits of redundancy: a "diversified" 14-name basket is, in
+information terms, dramatically smaller than it looks on paper.  This single
+number is the multivariate version of the [bad
+morning](01-correlation.qmd#the-motivating-failure) — and squeezing it out is
+exactly what [Gaussianization](05-gaussianization.qmd) will do.
+
+### Windows: Returns Forget, Volatility Remembers
+
+Now turn the dial on a *single* series.  Cut JPM's history into 5-day
+windows — each sample is now a vector $(r_t, r_{t+1}, \dots, r_{t+4})$ — and
+ask how much the days inside a window share:
+
+```{python}
+#| label: window-tc
+jpm = R["JPM"].to_numpy()
+
+
+def sliding_windows(z: Float[Array, "n_days"], w: int = 5) -> Float[Array, "n_windows w"]:
+    """Each row = one w-day window: (z_t, z_{t+1}, …, z_{t+w−1})."""
+    return np.lib.stride_tricks.sliding_window_view(z, w)
+
+
+tc_returns = total_correlation_gauss_bits(sliding_windows(jpm))
+tc_magnitudes = total_correlation_gauss_bits(sliding_windows(np.abs(jpm)))
+
+print(f"T(5-day window of returns)    = {tc_returns:.3f} bits   — near zero")
+print(f"T(5-day window of |returns|)  = {tc_magnitudes:.3f} bits   — ~20× more")
+```
+
+This is one of the cleanest facts in market microdata, found with one dial
+turn: **the sign of tomorrow's return is almost unpredictable (returns carry
+~0.03 bits per window), but its *size* is not (volatility clusters — the
+magnitudes share ~0.75 bits).**  The EWMA volatility bands of the uncertainty
+module are built directly on this redundancy.
+
+### Blocks: Sector vs Sector
+
+Finally the block view — whole sectors as vectors, compared through the lens:
+
+```{python}
+#| label: block-mi
+sector = dict(zip(META["ticker"], META["sector"]))
+banks_cols = [t for t in R.columns if sector.get(t) == "Banks"]
+tech_cols = [t for t in R.columns if sector.get(t) == "Tech"]
+
+banks_block = R[banks_cols].to_numpy()    # (n_days, p) — the X block
+tech_block = R[tech_cols].to_numpy()      # (n_days, q) — the Y block
+
+print(f"banks block: {banks_cols}")
+print(f"tech block:  {tech_cols}\n")
+print(f"T within banks block       = {total_correlation_gauss_bits(banks_block):.2f} bits")
+print(f"T within tech block        = {total_correlation_gauss_bits(tech_block):.2f} bits")
+print(f"I(banks ; tech) between    = {block_mi_gauss_bits(banks_block, tech_block):.2f} bits")
+```
+
+Read it off the Venn: each sector is internally *very* redundant (bits of
+shared structure within the block), while the lens between the sectors is
+thinner — cross-sector diversification is real, but it is **not** the many
+independent bets the pair count suggests.
+
+::: {.callout-note}
+All three numbers used the Gaussian closed form, so they inherit its blind
+spot: anything non-Gaussian (the tails!) is invisible.  Treat them as **lower
+bounds** on the true information.  Estimating the rest honestly is the job of
+[Gaussianization](05-gaussianization.qmd).
+:::
+
+---
+
+## What's Next
+
+The window dial gave us measures for vectors and blocks — all still computed
+through a density we *assumed* (Gaussian) or binned crudely.  The
+[next page](05-gaussianization.qmd) learns the density instead, which turns
+every estimate on this page exact — and hands back an invertible map as a
+bonus.

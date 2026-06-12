@@ -11,12 +11,15 @@ from lectures.plotting import INK, COOL, WARM, CRASH, despine
 plotting.set_style("notes")
 import numpy as np
 import matplotlib.pyplot as plt
+
+GREEN = plotting.PALETTE["green"]
 ```
 
 ## Removal Is Measurement, Run Backward
 
-Chapter 1 asked *how much* two variables move together.  This chapter asked how
-to *cancel* that movement.  They are the same object seen from two sides:
+The dependence chapter asked *how much* two variables move together.  This
+chapter asked how to *cancel* that movement.  They are the same object seen
+from two sides:
 
 | | [Measure](../dependence/index.qmd) (Ch. 1) | Remove (Ch. 4) |
 |---|---|---|
@@ -26,36 +29,79 @@ to *cancel* that movement.  They are the same object seen from two sides:
 
 Every rung of the removal ladder is a measurement rung used as a loss:
 
-```
-loss = fit(y_hat, y) + mu * Dep(y_hat, S)
-                            └────────────┘
-                     a Chapter-1 measure, differentiated
-```
+$$
+\text{loss} = \text{fit}(\hat y, y) +
+\mu \cdot \underbrace{\operatorname{Dep}(\hat y, S)}_{\text{a Ch.-1 measure, differentiated}}
+$$
+
+And the failures map across too.  Pearson's blindness to curves
+(measurement) *is* linear neutrality's hole (removal).  The histogram's
+curse of dimensionality (measurement) *is* why density-based removal needs
+[Gaussianization](../gaussianization/index.qmd).  If a measure cannot *see*
+a shape of dependence, no penalty built on it can *remove* that shape.
 
 ## The Two Roads, Once More
 
 The dependence chapter's fork — *do you need the distribution?* — reappears,
 now about *removing* rather than measuring:
 
-```
-Do you need the density to remove the dependence?
-│
-├── NO  →  kernel removal:  Dep = CKA / HSIC(y_hat, S)
-│          no density, differentiable, bounded — the workhorse
-│
-└── YES →  information removal:  Dep = MI / total correlation
-           needs a learned density → Gaussianization / flows
+```{python}
+#| label: fig-two-roads-removal
+#| fig-cap: "The removal decision tree — the dependence chapter's fork, run in reverse. Both branches end at a neutral model; only the right branch needs a density, and only its conditional form yields a fair predictor."
+fig, ax = plt.subplots(figsize=(11, 5))
+ax.axis("off")
+
+nodes = {
+    "q":   (0.50, 0.90, "Make ŷ independent of S",            14, INK),
+    "q1":  (0.50, 0.68, "Do you need the density?",            12, INK),
+    "r1a": (0.18, 0.46, "NO → kernel removal\n"
+                        "Dep = CKA / HSIC(ŷ, S)",              11, COOL),
+    "r1b": (0.82, 0.46, "YES → information removal\n"
+                        "Dep = MI / total correlation",         11, WARM),
+    "r2a": (0.18, 0.18, "differentiable · bounded\n"
+                        "no density needed\n"
+                        "(the workhorse — keras-fairkl)",       10, COOL),
+    "r2b": (0.60, 0.18, "marginal / joint\nGaussianize\n"
+                        "(NOT enough — leaks)",                 10, CRASH),
+    "r2c": (0.92, 0.18, "conditional ŷ | S\n"
+                        "(genuine independence,\n"
+                        "needs the density)",                   10, GREEN),
+}
+
+for key, (x0, y0, text, fs, col) in nodes.items():
+    ax.text(x0, y0, text, ha="center", va="center", fontsize=fs, color=col,
+            fontweight="bold" if key in ("q", "q1") else "normal",
+            bbox=dict(boxstyle="round,pad=0.4", fc="white", ec=col, lw=1.4))
+
+arrow_kw = dict(arrowstyle="->", lw=1.4, color=INK)
+for (x0, y0), (x1, y1) in [
+    ((0.50, 0.85), (0.50, 0.74)),
+    ((0.50, 0.63), (0.22, 0.52)),
+    ((0.50, 0.63), (0.78, 0.52)),
+    ((0.18, 0.40), (0.18, 0.25)),
+    ((0.82, 0.40), (0.63, 0.25)),
+    ((0.82, 0.40), (0.90, 0.25)),
+]:
+    ax.annotate("", xy=(x1, y1), xytext=(x0, y0),
+                xycoords="axes fraction", textcoords="axes fraction",
+                arrowprops=arrow_kw)
+
+fig.tight_layout()
+plt.show()
 ```
 
-The kernel road is the practical default; the information road reconnects
-fairness to [Gaussianization](../gaussianization/index.qmd) — but it must be
-**conditional** (Gaussianize $\hat y$ given $S$) to yield a fair model, as the
-[Gaussianize-first lab](labs/lab-tool2.5-gaussianize-first.qmd) shows; marginal
-or joint Gaussianization alone is not enough.
+The kernel road is the practical default — differentiable, bounded,
+density-free.  The information road reconnects fairness to
+[Gaussianization](../gaussianization/index.qmd), with one sharp caveat the
+[Gaussianize-first lab](labs/lab-tool2.5-gaussianize-first.qmd) proves:
+marginal or joint Gaussianization is *not* enough; only the **conditional**
+transform — Gaussianize $\hat y$ *given* $S$ — yields a fair model.
+
+## What Each Rung Can Cancel
 
 ```{python}
 #| label: fig-shape-removed
-#| fig-cap: "What each rung can cancel. Drop removes nothing; linear removes the line; CKA removes line and curve."
+#| fig-cap: "What each rung can cancel. Drop removes nothing (proxies leak); linear removes the line; CKA and adversarial remove line and curve. Pick the cheapest Dep that sees what you fear — the same advice as the measurement ladder, mirrored."
 fig, ax = plt.subplots(figsize=(8, 3.6))
 rungs = ["drop\nfeature", "linear\n(cka_linear)", "CKA\n(cka_rbf)",
          "adversarial"]
@@ -76,19 +122,21 @@ plt.show()
 
 ::: {.callout-note icon=false}
 ## The Through-Line
-The **transform** that threads the measurement ladder threads this one too: a
-hand-picked map (ranks, kernels) on the no-density road, a learned invertible map
-(Gaussianization) on the density road.  Measuring it, removing it, and — next —
-*propagating* it are one operation seen three ways.
+The **transform** that threads the measurement ladder threads this one too:
+a hand-picked map (ranks, kernels) on the no-density road, a learned
+invertible map (Gaussianization) on the density road.  Measuring it,
+removing it, and *propagating* it are
+[one operation seen three ways](../uncertainty/05-predictive-bands.qmd#the-capstone--one-machine-three-uses).
 :::
 
 ## Hand-Off
 
 You can now force a model to be blind to a chosen variable — fairness and
 factor-neutrality, one operation.  The companion move is to stop *removing*
-dependence and start **propagating** it: carrying uncertainty and risk through a
-model, where the same Gaussianization machine runs *backward* to generate
-scenarios.  See [Uncertainty](../uncertainty/index.qmd).
+dependence and start **propagating** it: carrying uncertainty and risk
+through a model, where the same Gaussianization machine runs *backward* to
+generate scenarios.  See [Uncertainty](../uncertainty/index.qmd).
 
-The hands-on [labs](labs/index.qmd) put all of this on real data: a credit model
-neutralized against `sex`, and a strategy neutralized against the market.
+The hands-on [labs](labs/index.qmd) put all of this on real data: a credit
+model neutralized against `sex`, and a strategy neutralized against the
+market — with the identical objective, and the identical code.

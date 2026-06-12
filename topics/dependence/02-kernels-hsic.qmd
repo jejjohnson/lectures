@@ -1,0 +1,296 @@
+---
+title: "Kernel Measures: HSIC, CKA, and the Choice of Similarity"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, BAND, despine, annotate_box
+from lectures.measures import hsic_rbf, cka_rbf, cka_linear, distance_correlation
+plotting.set_style("notes")
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import pearsonr, spearmanr
+import einx                      # linear algebra with the axes spelled out
+from jaxtyping import Float      # shape annotations: Float[Array, "n_days"]
+
+Array = np.ndarray
+```
+
+The [previous page](01-correlation.qmd) climbed three rungs of the no-density
+road — Pearson, Spearman, distance correlation — and ended with a promise:
+the same `compare(transform(x), transform(y))` template has one more, most
+general rung.  Distance correlation turned each day into its *distances* to
+every other day.  This page swaps distance for **kernel similarity** and
+completes Road 1.
+
+---
+
+## Rung 4 · HSIC — Dependence Without a Density
+
+The kernel idea: embed the data in a richer feature space, then test for
+dependence *there*.  In pseudocode:
+
+```
+HSIC(X, Y) = dependence( kernel(X) , kernel(Y) )
+```
+
+With a characteristic kernel (e.g. RBF / Gaussian), HSIC is zero *exactly*
+under independence — and it never estimates a density.
+
+$$
+\operatorname{HSIC}(X, Y)
+  = \frac{1}{(n-1)^2}\operatorname{tr}(K_X H K_Y H)
+$$
+
+where $K_X$, $K_Y$ are the kernel matrices and $H$ is the centring matrix
+$I - \frac{1}{n}\mathbf{1}\mathbf{1}^\top$.
+
+```{python}
+#| label: fig-hsic-demo
+#| fig-cap: "HSIC on three pairs: strongly dependent (banks), weakly linked, and shuffled (independent). Shuffling destroys the signal."
+rng = np.random.default_rng(5)
+
+a, b, _ = datasets.two_banks(n=600)
+u, v = datasets.convex_payoff(n=600)
+ind_x, ind_y = rng.normal(size=600), rng.permutation(a)
+
+pairs = [
+    ("Banks (dependent)", a, b),
+    ("Convex payoff (non-linear)", u, v),
+    ("Shuffled banks (independent)", a, ind_y),
+]
+
+fig, axes = plt.subplots(1, 3, figsize=(13, 4))
+colors = [CRASH, WARM, COOL]
+for ax, (title, x, y), col in zip(axes, pairs, colors):
+    h = hsic_rbf(x, y)
+    ax.scatter(x, y, s=10, c=col, alpha=0.4, edgecolors="none")
+    ax.set_title(title, fontsize=11)
+    annotate_box(ax, 0.5, -0.10, f"HSIC = {h:.4f}")
+    ax.set_xticks([]); ax.set_yticks([])
+    despine(ax)
+
+fig.suptitle("HSIC: zero only under independence, no density required",
+             fontsize=12, fontweight="bold", y=1.02)
+fig.tight_layout()
+plt.show()
+```
+
+### The Anatomy of HSIC
+
+The trace formula looks opaque until you draw its ingredients.  The kernel
+matrix $K_{ij}$ answers "how *alike* are days $i$ and $j$?" — it is the
+[distance matrix of the previous page](01-correlation.qmd#the-transform-seen)
+with the comparison flipped from far/near to alike/unlike.  Sort the convex
+pair by $x$ and draw both kernel matrices, plus the elementwise product of
+their centered versions:
+
+```{python}
+#| label: fig-hsic-kernels
+#| fig-cap: "HSIC, drawn. Left: kernel similarity between every pair of days in X (a smooth band — neighbours in x are alike). Centre: the same for Y — the V-shape appears as a cross, because days on opposite arms have similar |x| and hence similar y. Right: the elementwise product of the centered matrices; tr(KₓHKᵧH) just sums this panel, so HSIC is large exactly when the two similarity patterns light up in the same places."
+def convex_clean(
+    n: int = 120, noise: float = 0.08, seed: int = 42
+) -> tuple[Float[Array, "n_days"], Float[Array, "n_days"]]:
+    # the convex pair v = |u| + noise·ε, noise turned down for readable matrices
+    rng = np.random.default_rng(seed)
+    u = rng.normal(0, 1, n)
+    return u, np.abs(u) + noise * rng.normal(0, 1, n)
+
+
+u_k, v_k = convex_clean()
+order = np.argsort(u_k)            # sort days by u so the matrices are readable
+us, vs = u_k[order], v_k[order]
+
+
+def rbf_gram(z: Float[Array, "n_days"]) -> Float[Array, "n_days n_days"]:
+    """RBF (Gaussian) kernel matrix: how ALIKE are days i and j?
+
+    Kᵢⱼ = exp( −(zᵢ − zⱼ)² / 2σ² )  ∈ (0, 1]    (1 = identical days)
+    """
+    sq_dist = einx.subtract("i, j -> i j", z, z) ** 2    # (zᵢ − zⱼ)², (n_days, n_days)
+    σ = np.sqrt(np.median(sq_dist[sq_dist > 0]) / 2)     # bandwidth: median heuristic
+    return np.exp(-sq_dist / (2 * σ**2))
+
+
+K = rbf_gram(us)                   # similarity pattern of X
+L = rbf_gram(vs)                   # similarity pattern of Y
+n_days = len(us)
+
+# H = I − 𝟙𝟙ᵀ/n  centers a matrix: HKH has zero row and column means.
+H = np.eye(n_days) - np.ones((n_days, n_days)) / n_days
+K_centered = einx.dot("i j, j k -> i k", einx.dot("i j, j k -> i k", H, K), H)   # HKH
+L_centered = einx.dot("i j, j k -> i k", einx.dot("i j, j k -> i k", H, L), H)   # HLH
+
+# tr(K_X H K_Y H) = Σᵢⱼ (HKH)ᵢⱼ · (HLH)ᵢⱼ — the sum of this elementwise product:
+agree = K_centered * L_centered
+vmax = np.percentile(np.abs(agree), 98)   # clip the color scale for contrast
+
+fig, (ax0, ax1, ax2) = plt.subplots(1, 3, figsize=(12.5, 4.0))
+for ax, M, ttl, cmap, kw in [
+    (ax0, K, "similar days in X", "Blues", {}),
+    (ax1, L, "similar days in Y", "Oranges", {}),
+    (ax2, agree, f"where the patterns agree\nCKA = {cka_rbf(u_k, v_k):.2f}", "PuOr",
+     {"vmin": -vmax, "vmax": vmax}),
+]:
+    ax.imshow(M, cmap=cmap, origin="lower", **kw)
+    ax.set_title(ttl, fontsize=11)
+    ax.set_xticks([]); ax.set_yticks([])
+fig.tight_layout()
+plt.show()
+```
+
+The construction is the *same template* as every other rung —
+`compare(transform(x), transform(y))` — with the transform now mapping each
+day to its row of kernel similarities.
+
+---
+
+## HSIC vs CKA — Why Normalize?
+
+Look back at the first figure on this page: HSIC printed numbers like
+`0.01`.  Is that large?  **You cannot tell.**  Raw HSIC carries the units of
+the kernel, squared — its scale depends on the kernel, the bandwidth, and the
+sample size.  It can *rank* pairs measured the same way, but the number
+itself is unreadable in isolation.
+
+The fix is the same one Pearson applied to covariance a century ago.
+Covariance has units of $x \cdot y$; dividing by the standard deviations
+makes it the dimensionless $r \in [-1, 1]$.  Apply the identical move to HSIC:
+
+$$
+\operatorname{CKA}(X, Y)
+  = \frac{\operatorname{HSIC}(X, Y)}
+         {\sqrt{\operatorname{HSIC}(X, X)\,\operatorname{HSIC}(Y, Y)}}
+  \;\in\; [0, 1].
+$$
+
+| | covariance world | kernel world |
+|---|---|---|
+| raw, unit-laden | $\operatorname{cov}(X,Y)$ | $\operatorname{HSIC}(X,Y)$ |
+| self-normalizer | $\sigma_X\,\sigma_Y$ | $\sqrt{\operatorname{HSIC}(X,X)\,\operatorname{HSIC}(Y,Y)}$ |
+| interpretable | $r \in [-1, 1]$ | $\operatorname{CKA} \in [0, 1]$ |
+
+```{python}
+#| label: cka-vs-hsic
+# The same three pairs as the opening figure — raw HSIC next to CKA.
+print(f"{'Pair':<30s}  {'HSIC (raw)':>12s}  {'CKA':>6s}")
+print("-" * 54)
+for name, x, y in pairs:
+    print(f"  {name:<28s}  {hsic_rbf(x, y):12.5f}  {cka_rbf(x, y):6.2f}")
+```
+
+Now the numbers *speak*: the banks share a large fraction of their kernel
+structure, the convex pair a solid one, the shuffled pair essentially none.
+CKA's $[0,1]$ scale is what makes it the right choice whenever a human must
+read the value — and, in Lecture 2, what makes the fairness weight $\mu$
+interpretable: penalizing "CKA = 0.3" means the same thing on every dataset,
+while "HSIC = 0.003" means nothing in isolation.
+
+::: {.callout-tip}
+## Rule of Thumb
+Use **HSIC** inside optimizers and statistical tests (constants cancel and
+its null distribution is well studied).  Use **CKA** whenever the number must
+be *read* — dashboards, scorecards, penalties with interpretable weights.
+:::
+
+---
+
+## The Zoo — Choosing the Distance and the Kernel
+
+Every rung of Road 1 made a choice you can now see as one dial:
+
+| Rung | Transform of a day | Comparison |
+|------|--------------------|------------|
+| Pearson | the value itself | product of deviations |
+| Spearman | its rank | product of deviations |
+| distance corr | its distances to all days | product of centered distances |
+| HSIC / CKA | its kernel similarities to all days | product of centered similarities |
+
+Two of those choices deserve a closer look.
+
+**The linear kernel recovers the classics.**  Set $k(z_i, z_j) = z_i z_j$ and
+CKA collapses to the squared Pearson correlation (for 1-D data) — the kernel
+road *contains* the correlation road as its simplest setting:
+
+```{python}
+#| label: linear-kernel-check
+# Linear-kernel CKA = r²: the kernel ladder contains Pearson as a special case.
+r_banks = pearsonr(a, b)[0]
+print(f"banks:  linear CKA = {cka_linear(a, b):.4f}   vs   Pearson r² = {r_banks**2:.4f}")
+print(f"convex: linear CKA = {cka_linear(u, v):.4f}   (blind, like Pearson)"
+      f"   vs   RBF CKA = {cka_rbf(u, v):.2f}")
+```
+
+**The RBF bandwidth is a magnifying glass.**  The bandwidth $\sigma$ sets the
+scale at which "similar" means anything.  Too small and every day is similar
+only to itself ($K \to I$ — nothing to compare); too large and every day is
+similar to every other ($K \to \mathbf{1}\mathbf{1}^\top$ — centering wipes
+it out).  Dependence is only visible in between:
+
+```{python}
+#| label: fig-bandwidth-sweep
+#| fig-cap: "CKA of the convex pair as the RBF bandwidth σ sweeps five orders of magnitude. Too narrow (left): each day resembles only itself, the kernel matrix tends to the identity, and there is no pattern to align. Too wide (right): every day resembles every other, and centering removes everything. The median heuristic (dashed) lands comfortably on the plateau."
+σ_grid = np.logspace(-1.6, 2.5, 41)
+cka_vals = [cka_rbf(u, v, sigma=σ) for σ in σ_grid]
+
+# the median heuristic used everywhere on this page: σ = √( median(d²) / 2 )
+sq_dist = einx.subtract("i, j -> i j", u, u) ** 2
+σ_median = np.sqrt(np.median(sq_dist[sq_dist > 0]) / 2)
+
+fig, ax = plt.subplots(figsize=(9, 4))
+ax.plot(σ_grid, cka_vals, color=COOL, lw=2.4)
+ax.axvline(σ_median, color=CRASH, lw=1.6, ls="--", label="median heuristic")
+ax.set_xscale("log")
+ax.set_xlabel("RBF bandwidth  σ   (log scale)")
+ax.set_ylabel("CKA(u, v)")
+ax.set_title("Bandwidth is a magnifying glass — structure is only visible in between",
+             fontsize=12, fontweight="bold")
+ax.legend(frameon=False)
+despine(ax)
+plt.tight_layout()
+plt.show()
+```
+
+(Push $\sigma$ *far* below the plotted range and CKA turns degenerate rather
+than zero: every kernel matrix collapses toward the identity, and the CKA of
+two near-identical matrices is trivially high — a spurious match, not a
+detection.  One more reason the median heuristic is the sane default.)
+
+The same dial exists on the distance side: distance correlation built on
+*squared* Euclidean distances degrades into plain covariance-style
+association, while the default $|x_i - x_j|$ keeps the zero-iff-independence
+guarantee.  The lesson is general — **the transform is a modelling choice**,
+and *characteristic* kernels (RBF among them) are the choices that cost no
+blind spots.
+
+---
+
+## Why HSIC Matters Beyond This Lecture
+
+HSIC is differentiable with respect to model parameters.  That makes it
+usable as a *penalty* — you can train a model to minimise HSIC (in practice
+CKA, for an interpretable weight) between its predictions and a sensitive
+attribute.  This is exactly the **fairness penalty** in Lecture 2:
+
+$$
+\mathcal{L} = \text{fit loss} + \mu \cdot \operatorname{HSIC}(\hat{y}, S).
+$$
+
+Measuring a dependence and *forbidding* it are the same idea, just with the
+sign flipped.
+
+---
+
+## Where Road 1 Ends
+
+Road 1 is now complete: four rungs, one template, no density anywhere.  What
+it hands you is a **score** — *how much* dependence — but never what that
+dependence is worth in units of information, and never an object you can
+sample from or invert.
+
+For that you must cross to the second road and pay its toll: the
+[next page](03-mutual-information.qmd) measures dependence *through the
+density*, in **bits**.
