@@ -108,7 +108,11 @@ points.
   — does turbulent-day coverage drop?
 - Standardize $r_t/\sigma_t$ and histogram it: still fat-tailed?  Gaussianize and
   re-band, then re-check the table.
-- Add **epistemic** uncertainty: forecast σ from several windows and widen the band
-  by their spread; re-check calibration.
+- **Learn the forecaster**: replace EWMA with the
+  [NLL net from Tool 3](lab-tool3-bands.qmd) — inputs $(|r_{t-1}|, \ldots, |r_{t-5}|)$,
+  outputs $(\mu_t, \log\sigma_t)$, trained on the pre-2020 years only.  Does a
+  learned $\sigma_t$ beat the one-line recursion on turbulent-day coverage?
+- Add **epistemic** uncertainty: retrain that net on bootstrap resamples of the
+  training years and widen the band by the committee's spread; re-check calibration.
 
 Back to the chapter: [Uncertainty overview](../index.qmd).

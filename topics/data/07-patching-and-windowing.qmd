@@ -229,7 +229,7 @@ the Gaussian information across those off-diagonals gives **total correlation**;
 doing the same *between* two blocks gives **block mutual information**.  Both — and
 the honest check that overlap isn't manufacturing the result — are worked through
 in [Tool 3 · Windows](../dependence/labs/lab-tool3-windows.qmd) and the
-[mutual information](../dependence/02-mutual-information.qmd) chapter.
+[mutual information](../dependence/04-windows-and-blocks.qmd) chapter.
 :::
 
 ---

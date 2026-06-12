@@ -37,7 +37,7 @@ layer (read off the Jacobian) is the total correlation that was there.
 
 For a bivariate Gaussian with correlation $\rho$, the mutual information has a
 closed form, $I = -\tfrac12 \ln(1 - \rho^2)$ — the same quantity that
-[Linfoot's R](../dependence/02-mutual-information.qmd) rescales onto the
+[Linfoot's R](../dependence/03-mutual-information.qmd) rescales onto the
 correlation axis.  A trustworthy estimator must reproduce it.
 
 ```{python}

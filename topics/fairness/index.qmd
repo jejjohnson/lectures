@@ -41,7 +41,7 @@ and a variable you have chosen to be blind to.
 ## Why It Sits Here
 
 - Fairness = *minimizing a dependence measure* — it reuses
-  [HSIC / CKA](../dependence/03-kernels-hsic.qmd) from the dependence chapter as
+  [HSIC / CKA](../dependence/02-kernels-hsic.qmd) from the dependence chapter as
   a trainable penalty.
 - The "assume vs. learn the density" fork from Chapter 1 reappears: kernel
   removal needs no density; information-theoretic removal does and reconnects to
@@ -70,8 +70,9 @@ Chapter 1, now run in reverse to *remove* rather than measure.
 2. **[Bias and proxies](02-bias-and-proxies.qmd)** — why dropping the sensitive
    feature fails, and how to balance errors *within* groups.
 3. **[Fair kernel learning](03-fair-kernel-learning.qmd)** — linear neutrality
-   and its hole, the Gaussianize-first trap, the CKA penalty hero, adversarial
-   removal, and the accuracy-vs-neutrality trade-off curve.
+   and its hole, the Gaussianize-first trap (and the conditional fix), the CKA
+   penalty hero — trained end to end with `keras-fairkl` — adversarial removal,
+   and the accuracy-vs-neutrality frontier with its elbow.
 4. **[Tie-back: (in)dependence and information](04-tie-back.qmd)** — fairness as
    the mirror of measurement; the two roads, once more.
 

@@ -14,6 +14,7 @@ know the right answer, before touching real returns.
 | [Tool 1 — The ladder](lab-tool1-ladder.qmd) | Pearson · Spearman · distance correlation |
 | [Tool 2 — Information measures](lab-tool2-information.qmd) | Mutual information in bits · validating estimators |
 | [Tool 3 — Windows](lab-tool3-windows.qmd) | Scalar → vector → block; total correlation |
+| [Wrap-up — The Measure Zoo](lab-wrapup-zoo.qmd) | Every measure × every relationship shape, one benchmark grid |
 
 ## Do-the-Job Track
 
@@ -35,6 +36,19 @@ sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
 from lectures import datasets, measures, plotting
 from lectures.plotting import COOL, WARM, CRASH, INK, despine, annotate_box
 
+import numpy as np
+import einx                      # linear algebra with the axes spelled out
+from jaxtyping import Float      # shape annotations: Float[Array, "n_days"]
+
+Array = np.ndarray               # alias used in all shape annotations
+
 R = datasets.load_returns()     # 14-stock daily returns DataFrame
 META = datasets.load_basket_meta()
 ```
+
+Two style conventions you will see in every snippet:
+
+- **Shapes are documented**, e.g. `def f(z: Float[Array, "n_days"]) ->
+  Float[Array, "n_days n_days"]` — you always know what goes in and out.
+- **Linear algebra uses `einx`**, e.g. `einx.subtract("i, j -> i j", x, x)`
+  instead of `x[:, None] - x[None, :]` — the axes are spelled out, not implied.

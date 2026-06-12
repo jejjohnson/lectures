@@ -68,12 +68,16 @@ website:
             href: topics/dependence/index.qmd
           - text: "Correlation"
             href: topics/dependence/01-correlation.qmd
+          - text: "Kernels: HSIC & CKA"
+            href: topics/dependence/02-kernels-hsic.qmd
           - text: "Mutual Information"
-            href: topics/dependence/02-mutual-information.qmd
-          - text: "Kernels & HSIC"
-            href: topics/dependence/03-kernels-hsic.qmd
+            href: topics/dependence/03-mutual-information.qmd
+          - text: "Windows & Blocks"
+            href: topics/dependence/04-windows-and-blocks.qmd
+          - text: "Gaussianization"
+            href: topics/dependence/05-gaussianization.qmd
           - text: "Causality"
-            href: topics/dependence/04-causality.qmd
+            href: topics/dependence/06-causality.qmd
           - section: "Labs"
             contents:
               - text: "Overview"
@@ -84,6 +88,8 @@ website:
                 href: topics/dependence/labs/lab-tool2-information.qmd
               - text: "Tool 3 · Windows"
                 href: topics/dependence/labs/lab-tool3-windows.qmd
+              - text: "Wrap-up · Measure Zoo"
+                href: topics/dependence/labs/lab-wrapup-zoo.qmd
               - text: "Job A · Validate"
                 href: topics/dependence/labs/lab-jobA-validate.qmd
               - text: "Job B · Measure Book"
@@ -128,8 +134,10 @@ website:
             href: topics/uncertainty/02-probability-under-transformation.qmd
           - text: "Noise & Propagation"
             href: topics/uncertainty/03-noise-and-propagation.qmd
+          - text: "The Regression Recipe"
+            href: topics/uncertainty/04-regression-recipe.qmd
           - text: "Predictive Bands"
-            href: topics/uncertainty/04-predictive-bands.qmd
+            href: topics/uncertainty/05-predictive-bands.qmd
           - section: "Labs"
             contents:
               - text: "Overview"

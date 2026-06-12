@@ -1,5 +1,6 @@
 ---
 title: "Noise and Propagation"
+subtitle: "Act 1 · Scenarios for a Portfolio"
 ---
 
 ```{python}
@@ -13,133 +14,428 @@ from lectures.measures import cocrash_fraction
 plotting.set_style("notes")
 import numpy as np
 import matplotlib.pyplot as plt
+from scipy.stats import multivariate_t
+import einx                      # linear algebra with the axes spelled out
+from jaxtyping import Float      # shape annotations: Float[Array, "n_days 2"]
+
+Array = np.ndarray
+GREEN = plotting.PALETTE["green"]
+PURPLE = plotting.PALETTE["purple"]
 ```
 
-To carry uncertainty forward you must **sample**.  This page climbs the ladder of
-ways to sample a *joint* distribution — and shows that only the ones built on
-[Gaussianization](../gaussianization/index.qmd) keep the co-crash that risk cares
-about.
+The [transformation rule](02-probability-under-transformation.qmd) ended at a
+fork: when the function bends and the inputs are wide, the only honest way to
+carry uncertainty forward is to **sample** — draw scenarios from the input
+distribution and push each one through.  For a portfolio, "the input
+distribution" means the **joint** distribution of all the assets at once, and
+sampling it *jointly* is the whole game.  Get every marginal right but the
+joint wrong and your scenarios will systematically miss the one event a
+portfolio fears: the day everything falls together.
 
-## Rung 1 · Independent Sampling — Fails
+This page climbs a ladder of four scenario generators, in rising order of
+honesty: **#1 independent → #2 Gaussian → #3 Student-t → #4 RBIG**.  Each
+rung takes the same exam — *reproduce the co-crash, price the tail* — on Act
+1's running character, the fat-tailed bank pair from the
+[chapter opener](01-uncertainty-is-probability.qmd#two-questions-two-acts).
 
-The obvious move is to sample each variable from its own (correct) marginal.  It
-gets every marginal right and the **joint catastrophically wrong**: independence
-*by construction* can never produce the co-crash.
+```{python}
+#| label: load-character
+# Act 1's running character: a fat-tailed pair whose worst days arrive together
+a, b = datasets.tail_dependent_pair(n=2000, seed=0)
+X = np.column_stack([a, b])                  # (n_days, 2)
+
+rng = np.random.default_rng(1)
+n_draw = 20_000                              # scenarios per generator
+```
+
+## The Target — VaR, the 1-in-100 Morning
+
+Before grading generators, fix the quantity they must reproduce.
+**Value at Risk** is a quantile of the portfolio's daily P&L — the loss that
+a 1-in-100 morning meets or beats:
+
+$$
+\text{VaR}_{1\%} : \qquad \Pr\big[\,r_{\text{portfolio}} \le \text{VaR}_{1\%}\,\big] = 1\%.
+$$
+
+On the real 14-stock basket it looks like this:
+
+```{python}
+#| label: fig-var-target
+#| fig-cap: "Daily returns of the equal-weight S&P basket (real data, 2007–2025). The 1% VaR is the quantile marking off the worst 1-in-100 mornings — the red sliver. A scenario generator is only as good as the tail of the scenarios it produces, because this is the part of the distribution it must price."
+R = datasets.load_returns()                  # 14-stock daily returns DataFrame
+port = R.mean(axis=1).to_numpy()             # equal-weight basket [daily return]
+var_1pct = np.quantile(port, 0.01)           # the 1-in-100 morning
+
+fig, ax = plt.subplots(figsize=(10, 3.2))
+bins = np.linspace(port.min(), port.max(), 120)
+ax.hist(port[port > var_1pct], bins=bins, color=COOL, alpha=0.7)
+ax.hist(port[port <= var_1pct], bins=bins, color=CRASH, alpha=0.9)
+ax.axvline(var_1pct, color=CRASH, lw=2.5, ls="--")
+ax.annotate(f"1% VaR = {var_1pct:.1%}\nthe 1-in-100 morning",
+            (var_1pct, ax.get_ylim()[1] * 0.55),
+            xytext=(-10, 0), textcoords="offset points", ha="right",
+            fontsize=11, color=CRASH, fontweight="bold")
+ax.set_xlabel("daily return — equal-weight S&P basket (real data)")
+ax.set_yticks([]); despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+Alongside VaR we track a second exam question, borrowed straight from the
+[dependence chapter](../dependence/index.qmd): the **co-crash rate** — given
+that one asset is having a worst-5% day, how often is the other one too?
+Under independence the answer is just 5% (knowing about the first tells you
+nothing about the second); the real pair answers far higher, and a generator
+that cannot reproduce the co-crash cannot price the joint tail.
+
+## Rung 1 · Independent Resampling — Fails
+
+The obvious move: resample each asset's own history, separately.
+
+```{python}
+#| label: indep-draws
+# scenario = ( resample(a) , resample(b) ) — each column drawn on its own,
+# i.e. sampling from p(a)·p(b): the dependence chapter's SHUFFLED REFERENCE
+idx = rng.integers(0, len(a), size=(n_draw, 2))    # (n_draw, 2) day indices
+indep_draws = np.column_stack([a[idx[:, 0]], b[idx[:, 1]]])
+```
+
+Every **marginal** is exactly right — by construction, each column is the
+true history.  But the pairing of the columns is random, so the draws come
+from the product $p(a)\,p(b)$.  That product is precisely the
+[independence reference](../dependence/01-correlation.qmd#the-independence-reference)
+the dependence chapter built by shuffling — the distribution that *defines*
+"no dependence."  All the joint structure is destroyed before the first
+scenario is drawn.
 
 ```{python}
 #| label: fig-independent-fail
-#| fig-cap: "Real co-crashing pair, independent resampling (co-crash destroyed), and RBIG samples (co-crash restored). Shaded = joint lower-tail."
-a, b = datasets.tail_dependent_pair(n=2000, seed=0)
-X = np.column_stack([a, b])
-rng = np.random.default_rng(1)
-indep = np.column_stack([rng.permutation(a), rng.permutation(b)])
-gen = AnnealedRBIG(n_layers=30, random_state=0).fit(X).sample(2000)
-
-panels = [(X, COOL, "real"), (indep, CRASH, "independent resample"),
-          (gen, plotting.PALETTE["green"], "RBIG backward")]
-fig, axes = plt.subplots(1, 3, figsize=(13, 4.4))
-for ax, (data, col, name) in zip(axes, panels):
-    cc = cocrash_fraction(data[:, 0], data[:, 1])
-    ax.scatter(data[:, 0], data[:, 1], s=7, c=col, alpha=0.35, edgecolors="none")
-    ax.axvspan(-6, np.quantile(data[:, 0], 0.1), color=CRASH, alpha=0.06)
-    ax.axhspan(-6, np.quantile(data[:, 1], 0.1), color=CRASH, alpha=0.06)
-    ax.set_title(f"{name}\nco-crash = {cc:.0%}", fontsize=11)
+#| fig-cap: "Real pair vs independent resampling. The marginals are identical (each axis histograms the same history); the joint is unrecognizable. The diagonal smear into the lower-left corner — the days that hurt — is simply gone, and the co-crash rate collapses to the chance-level 5% that independence predicts."
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(10, 3.8), sharex=True, sharey=True)
+for ax, D, col, name in [
+    (axL, X, COOL,
+     f"real · co-crash {cocrash_fraction(a, b, 0.05):.0%}"),
+    (axR, indep_draws[:2000], CRASH,
+     f"independent · co-crash {cocrash_fraction(indep_draws[:, 0], indep_draws[:, 1], 0.05):.1%}"),
+]:
+    ax.scatter(D[:, 0], D[:, 1], s=6, c=col, alpha=0.35, edgecolors="none")
     ax.set_xlim(-5, 4); ax.set_ylim(-5, 4)
+    ax.set_title(name, fontsize=12)
     ax.set_xticks([]); ax.set_yticks([]); despine(ax)
 fig.tight_layout()
 plt.show()
 ```
 
-The marginals are identical in all three panels.  Independence throws away the
-one thing the portfolio fears.
+Independent resampling can never produce the co-crash — and the co-crash *is*
+the risk.  Strike one, and a lesson: a generator is graded on its joint, not
+its marginals.
 
 ## Rung 2 · Gaussian Monte-Carlo — Right Correlation, Wrong Extremes
 
-Fit a covariance, sample a multivariate normal.  Cheap, and it captures linear
-co-movement — but Gaussian tails are **thin**, so it understates the worst joint
-losses.
+Keep the co-movement: fit a mean and covariance, sample a multivariate
+normal.
+
+$$
+x = \mu + L z, \qquad z \sim \mathcal N(0, I), \qquad L L^\top = \Sigma .
+$$
+
+```{python}
+#| label: gauss-draws
+def sample_gaussian(
+    D: Float[Array, "n_days 2"], n: int, rng_: np.random.Generator
+) -> Float[Array, "n 2"]:
+    """Gaussian Monte-Carlo: x = μ + L·z with z ~ 𝒩(0, I) and L·Lᵀ = Σ.
+
+    The Cholesky factor L 'colors' independent noise with the fitted
+    covariance — linear co-movement in, nothing else.
+    """
+    μ = D.mean(axis=0)                       # (2,) sample mean   [return units]
+    Σ = np.cov(D.T)                          # (2, 2) sample covariance
+    L = np.linalg.cholesky(Σ)                # (2, 2) with L·Lᵀ = Σ
+    z = rng_.normal(size=(n, 2))             # (n, 2) white noise ~ 𝒩(0, I)
+    return μ + einx.dot("n d, k d -> n k", z, L)   # apply L to every draw
+
+
+gauss_draws = sample_gaussian(X, n_draw, rng)
+```
+
+This captures **linear** co-movement — the cloud tilts correctly, the
+correlation matrix is matched exactly.  But two things go quietly wrong in
+the corner:
 
 ::: {.callout-note icon=false}
 ## Why Gaussian Tails Are Thin, Precisely
 A Gaussian density decays like $e^{-x^2/2}$; a Student-$t$ decays only
-polynomially, $\sim |x|^{-(\nu+1)}$.  Worse, a Gaussian copula has *asymptotic
-tail independence* — the probability both assets breach an extreme quantile
-together $\to 0$ as the quantile deepens, however high the correlation.  Matching
-the covariance is not matching the tail.
+polynomially, $\sim |x|^{-(\nu+1)}$.  Worse, the Gaussian *copula* has
+**asymptotic tail independence**: the probability that both assets breach an
+extreme quantile together $\to 0$ as the quantile deepens — *however high
+the correlation*.  Matching the covariance is not matching the tail.  This
+is the [Gaussian shadow](../dependence/03-mutual-information.qmd) of the
+dependence chapter, met from the other direction.
 :::
 
 ```{python}
 #| label: fig-gauss-mc
-#| fig-cap: "Real (tail-dependent) returns vs a Gaussian Monte-Carlo with the same covariance. Same bulk; the portfolio-loss tail and 1% VaR are understated by the Gaussian."
-rng = np.random.default_rng(2)
-n = 4000
-z = rng.normal(0, 1, n)
-a2 = 0.5 * z + 0.5 * rng.normal(0, 1, n)
-b2 = 0.5 * z + 0.5 * rng.normal(0, 1, n)
-crash = rng.random(n) < 0.05
-shock = np.abs(rng.standard_t(2.5, n) * 3.0)
-a2 = np.where(crash, a2 - shock, a2)
-b2 = np.where(crash, b2 - shock, b2)
-D = np.column_stack([a2, b2]); D = (D - D.mean(0)) / D.std(0)
-gmc = rng.multivariate_normal(D.mean(0), np.cov(D.T), size=n)
+#| fig-cap: "Left: the Gaussian Monte-Carlo cloud over the real pair — the bulk and the tilt are right, but the lower-left corner is empty. Right: push both scenario sets through the 50/50 portfolio and the Gaussian's loss histogram stops short; its 1% VaR is visibly too optimistic, exactly where it matters."
+port_real = einx.mean("n d -> n", X)         # 50/50 portfolio, real days
+port_gauss = einx.mean("n d -> n", gauss_draws)
 
-port_real, port_gmc = D[:, 0] + D[:, 1], gmc[:, 0] + gmc[:, 1]
-var_real, var_gmc = np.quantile(port_real, 0.01), np.quantile(port_gmc, 0.01)
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 3.8))
+axL.scatter(X[:, 0], X[:, 1], s=6, c=COOL, alpha=0.3, edgecolors="none",
+            label="real")
+axL.scatter(gauss_draws[:2000, 0], gauss_draws[:2000, 1], s=6, c=WARM,
+            alpha=0.25, edgecolors="none", label="Gaussian MC")
+axL.set_xlim(-5, 4); axL.set_ylim(-5, 4)
+axL.set_xticks([]); axL.set_yticks([])
+axL.legend(fontsize=10, frameon=False, markerscale=2); despine(axL)
 
-fig, (axL, axR) = plt.subplots(1, 2, figsize=(11.5, 4.4))
-axL.scatter(D[:, 0], D[:, 1], s=7, c=COOL, alpha=0.25, edgecolors="none", label="real")
-axL.scatter(gmc[:, 0], gmc[:, 1], s=7, c=CRASH, alpha=0.2, edgecolors="none",
-            label="Gaussian MC")
-axL.set_xlim(-8, 4); axL.set_ylim(-8, 4)
-axL.set_title("real vs Gaussian MC", fontsize=12)
-axL.legend(fontsize=9, frameon=False, markerscale=2)
-axL.set_xticks([]); axL.set_yticks([]); despine(axL)
-
-bins = np.linspace(min(port_real.min(), port_gmc.min()), 3, 60)
+bins = np.linspace(min(port_real.min(), port_gauss.min()), 3, 60)
 axR.hist(port_real, bins=bins, density=True, color=COOL, alpha=0.55, label="real")
-axR.hist(port_gmc, bins=bins, density=True, color=CRASH, alpha=0.45, label="Gaussian MC")
-axR.axvline(var_real, color=COOL, lw=2, ls="--")
-axR.axvline(var_gmc, color=CRASH, lw=2, ls="--")
-axR.set_title("portfolio loss & 1% VaR", fontsize=12)
-annotate_box(axR, 0.5, -0.12,
-             f"1% VaR:  real {var_real:.1f}   vs   Gaussian {var_gmc:.1f}")
-axR.legend(fontsize=9, frameon=False); despine(axR)
+axR.hist(port_gauss, bins=bins, density=True, color=WARM, alpha=0.5,
+         label="Gaussian MC")
+axR.axvline(np.quantile(port_real, 0.01), color=COOL, lw=2, ls="--")
+axR.axvline(np.quantile(port_gauss, 0.01), color=WARM, lw=2, ls="--")
+axR.set_title(f"1% VaR · real {np.quantile(port_real, 0.01):.2f} "
+              f"vs Gaussian {np.quantile(port_gauss, 0.01):.2f}", fontsize=12)
+axR.set_yticks([]); axR.legend(fontsize=10, frameon=False); despine(axR)
 fig.tight_layout()
 plt.show()
 ```
 
-The Gaussian draws the same cloud in the middle but **misses the co-extremes** —
-its VaR is too optimistic by a wide margin.
+Same cloud in the middle, **too-optimistic VaR** at the quantile the desk
+actually reports.  Strike two — but a more instructive one: the failure is
+not in the dependence *strength* (the correlation is perfect) but in the
+dependence *shape*.
 
-## Rung 3 · RBIG Backward — The Hero
+## Rung 3 · Student-t Monte-Carlo — Patch the Tails by Hand
 
-Learn $T$ with RBIG, sample in the Gaussian space, invert.  The generated
-scenarios keep the **real** joint tail: the same tool that *measured* dependence
-in Chapter 1, now a *generator*.
+If thin tails are the problem, the classic fix is to keep $\mu$ and $\Sigma$
+and swap the bell for a fatter one:
+
+$$
+x = \mu + \frac{L z}{\sqrt{g/\nu}}, \qquad z \sim \mathcal N(0, I),
+\quad g \sim \chi^2_\nu .
+$$
+
+Read the recipe: draw a Gaussian scenario, then divide by a *random scale*
+$\sqrt{g/\nu}$.  Most days $g/\nu \approx 1$ and nothing changes; on the rare
+day $g$ comes out small, **both** assets are amplified by the same shock —
+which is exactly how real crises behave, and exactly what gives the Student-t
+genuine *tail dependence* where the Gaussian has none.  One new knob, the
+degrees of freedom $\nu$: smaller $\nu$, fatter tails, with
+$\nu \to \infty$ recovering the Gaussian.
+
+```{python}
+#| label: t-draws
+def fit_t_dof(D: Float[Array, "n_days 2"]) -> float:
+    """Pick ν by maximum likelihood over a small grid.
+
+    The multivariate-t with shape matrix S has covariance S·ν/(ν−2), so we
+    scale S = Σ·(ν−2)/ν to keep the fitted covariance equal to the sample's.
+    """
+    μ, Σ = D.mean(axis=0), np.cov(D.T)
+    ν_grid = (2.5, 3, 4, 5, 6, 8, 12)
+    log_liks = [multivariate_t(μ, Σ * (ν - 2) / ν, df=ν).logpdf(D).sum()
+                for ν in ν_grid]
+    return ν_grid[int(np.argmax(log_liks))]
+
+
+def sample_t(
+    D: Float[Array, "n_days 2"], ν: float, n: int, rng_: np.random.Generator
+) -> Float[Array, "n 2"]:
+    """Student-t Monte-Carlo: x = μ + L·z / √(g/ν), one shared shock per day.
+
+    g ~ χ²_ν is drawn ONCE per scenario and divides both assets — the shared
+    shock is what creates tail dependence (a Gaussian has a shock per asset).
+    """
+    μ, Σ = D.mean(axis=0), np.cov(D.T)
+    L = np.linalg.cholesky(Σ * (ν - 2) / ν)  # shape matrix → covariance Σ
+    z = rng_.normal(size=(n, 2))             # (n, 2) white noise
+    g = rng_.chisquare(ν, size=n)            # (n,) one scale shock per scenario
+    colored = einx.dot("n d, k d -> n k", z, L)
+    return μ + einx.divide("n d, n -> n d", colored, np.sqrt(g / ν))
+
+
+ν_fit = fit_t_dof(X)
+t_draws = sample_t(X, ν_fit, n_draw, rng)
+print(f"fitted degrees of freedom: ν = {ν_fit:g}")
+```
+
+```{python}
+#| label: fig-t-mc
+#| fig-cap: "Student-t Monte-Carlo with the maximum-likelihood ν. Left: the scenario cloud now reaches into the joint lower-left corner. Right: the portfolio-loss tail and the 1% VaR land nearly on top of the real ones."
+port_t = einx.mean("n d -> n", t_draws)
+
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 3.8))
+axL.scatter(X[:, 0], X[:, 1], s=6, c=COOL, alpha=0.3, edgecolors="none",
+            label="real")
+axL.scatter(t_draws[:2000, 0], t_draws[:2000, 1], s=6, c=PURPLE, alpha=0.25,
+            edgecolors="none", label=f"Student-t (ν = {ν_fit:g})")
+axL.set_xlim(-5, 4); axL.set_ylim(-5, 4)
+axL.set_xticks([]); axL.set_yticks([])
+axL.legend(fontsize=10, frameon=False, markerscale=2); despine(axL)
+
+bins = np.linspace(min(port_real.min(), port_t.min()), 3, 60)
+axR.hist(port_real, bins=bins, density=True, color=COOL, alpha=0.55, label="real")
+axR.hist(port_t, bins=bins, density=True, color=PURPLE, alpha=0.4,
+         label="Student-t")
+axR.axvline(np.quantile(port_real, 0.01), color=COOL, lw=2, ls="--")
+axR.axvline(np.quantile(port_t, 0.01), color=PURPLE, lw=2, ls="--")
+axR.set_title(f"1% VaR · real {np.quantile(port_real, 0.01):.2f} "
+              f"vs Student-t {np.quantile(port_t, 0.01):.2f}", fontsize=12)
+axR.set_yticks([]); axR.legend(fontsize=10, frameon=False); despine(axR)
+fig.tight_layout()
+plt.show()
+```
+
+The fitted $\nu$ brings the tail back to life — but read the fine print
+before celebrating.  The shape is still **assumed**: symmetric (real crashes
+are skewed — the down-tail is heavier than the up-tail), elliptical, one
+global $\nu$ for every direction.  And this particular pair was
+*manufactured* from a Student-t recipe, so the guessed family happens to be
+exactly right.  **Hold that thought for the real-data exam below.**  This is
+the [dependence chapter's fork](../dependence/05-gaussianization.qmd)
+again: *assume* the shape — or *learn* it.
+
+## Rung 4 · RBIG Backward — Learn the Joint, Then Invert
+
+The top rung guesses nothing.  Recall the spine of the course:
+
+$$
+\underbrace{z = T(x)}_{\text{forward: measure / remove}}
+\qquad\qquad
+\underbrace{x = T^{-1}(z)}_{\text{backward: propagate}}
+$$
+
+[Gaussianization](../dependence/05-gaussianization.qmd) learned an invertible
+map $T$ that turns the real, dependent, fat-tailed data into an independent
+Gaussian ball — and *measured* dependence by what the map had to remove.
+Run it **backward** and the same map is a scenario generator: draw
+$z \sim \mathcal N(0, I)$ (trivial), invert ($x = T^{-1}(z)$), and out comes
+a scenario from the *learned* joint — skew, fat tails, co-crash and all.
+The change-of-variables formula is the warranty:
+$p_X(x) = p_Z(T(x))\,\lvert\det J\rvert$, exactly.
 
 ```{python}
 #| label: fig-rbig-scenarios
-#| fig-cap: "Real returns and RBIG-generated scenarios: the lower-tail co-crash matches."
-gen2 = AnnealedRBIG(n_layers=30, random_state=0).fit(D).sample(n)
-fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.4), sharex=True, sharey=True)
-for ax, data, col, name in [
-    (axL, D, COOL, f"real · co-crash {cocrash_fraction(D[:,0], D[:,1], 0.05):.0%}"),
-    (axR, gen2, plotting.PALETTE["green"],
-     f"RBIG scenarios · co-crash {cocrash_fraction(gen2[:,0], gen2[:,1], 0.05):.0%}"),
+#| fig-cap: "RBIG run backward: fit the invertible map on the real pair, sample the Gaussian ball, invert. The generated scenarios reproduce the co-crash corner the Gaussian missed — without ever being told a parametric family."
+rbig_draws = AnnealedRBIG(n_layers=30, random_state=0).fit(X).sample(n_draw)
+
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(10, 3.8), sharex=True, sharey=True)
+for ax, D, col, name in [
+    (axL, X, COOL,
+     f"real · co-crash {cocrash_fraction(a, b, 0.05):.0%}"),
+    (axR, rbig_draws[:2000], GREEN,
+     f"RBIG · co-crash {cocrash_fraction(rbig_draws[:, 0], rbig_draws[:, 1], 0.05):.0%}"),
 ]:
-    ax.scatter(data[:, 0], data[:, 1], s=7, c=col, alpha=0.3, edgecolors="none")
-    ax.set_xlim(-8, 4); ax.set_ylim(-8, 4)
-    ax.set_title(name, fontsize=11)
+    ax.scatter(D[:, 0], D[:, 1], s=6, c=col, alpha=0.3, edgecolors="none")
+    ax.set_xlim(-5, 4); ax.set_ylim(-5, 4)
+    ax.set_title(name, fontsize=12)
     ax.set_xticks([]); ax.set_yticks([]); despine(ax)
 fig.tight_layout()
 plt.show()
 ```
 
+Learned joint, learned tails: the diagonal of joint crashes survives the
+round-trip through Gaussian space.  The same tool that *measured* dependence
+in the dependence chapter is, run in reverse, the only generator on the
+ladder that never had to guess a shape.
+
+## Every Generator, Same Exam
+
+All four side by side, against the two exam questions:
+
+```{python}
+#| label: fig-generator-scorecard
+#| fig-cap: "The ladder graded. Left: co-crash rate (the chance the second asset is in its worst 5% given the first is) — independent collapses to the 5% chance level, Gaussian undershoots, Student-t and RBIG match. Right: 1% VaR of the 50/50 portfolio — the Gaussian shaves the tail; the top two rungs price it. The dashed line is the real data's answer."
+names = ["real\n(the data)", "#1\nindependent", "#2\nGaussian MC",
+         "#3\nStudent-t", "#4\nRBIG"]
+scenario_sets = [X, indep_draws, gauss_draws, t_draws, rbig_draws]
+colors = [INK, CRASH, WARM, PURPLE, GREEN]
+
+cocrash_rates = [cocrash_fraction(S[:, 0], S[:, 1], 0.05) for S in scenario_sets]
+var_1pcts = [np.quantile(einx.mean("n d -> n", S), 0.01) for S in scenario_sets]
+
+xs = np.arange(5)
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 3.6))
+axL.bar(xs, cocrash_rates, 0.6, color=colors)
+axL.axhline(cocrash_rates[0], color=INK, lw=1.4, ls="--")
+axL.set_title("co-crash rate (both in worst 5%)", fontsize=12)
+axR.bar(xs, var_1pcts, 0.6, color=colors)
+axR.axhline(var_1pcts[0], color=INK, lw=1.4, ls="--")
+axR.set_title("1% VaR of the 50/50 portfolio", fontsize=12)
+for ax in (axL, axR):
+    ax.set_xticks(xs); ax.set_xticklabels(names, fontsize=9)
+    despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+Independent fails both questions; Gaussian passes the first and shaves the
+second.  Student-t nearly aces the exam — but remember, these banks were
+*built* from a t, so its guess is exactly right.  RBIG gets to the same place
+**with no guess at all**.  Whether that distinction matters is an empirical
+question, so real data gets the final word.
+
+## The Real-Data Exam — JPM & BAC
+
+Same four generators, but the character is now real: JPMorgan and Bank of
+America daily returns, 2007–2025.  What does the 1-in-100 morning cost a
+50:50 holder?
+
+```{python}
+#| label: fig-real-exam
+#| fig-cap: "The exam on real data. The Gaussian shaves a full point off the 1-in-100 morning. The Student-t — hero of the synthetic exam — does no better here: real crash days are skewed, and no symmetric bell can say so. RBIG, guessing nothing, wins back most of the gap."
+X_real = R[["JPM", "BAC"]].to_numpy()        # (n_days, 2) real daily returns
+rng_real = np.random.default_rng(0)
+
+gauss_real = sample_gaussian(X_real, n_draw, rng_real)
+ν_real = fit_t_dof(X_real)
+t_real = sample_t(X_real, ν_real, n_draw, rng_real)
+rbig_real = AnnealedRBIG(n_layers=30, random_state=0).fit(X_real).sample(n_draw)
+
+names_real = ["real data", "Gaussian MC", f"Student-t (ν = {ν_real:g})", "RBIG"]
+var_real = [np.quantile(einx.mean("n d -> n", S), 0.01)
+            for S in (X_real, gauss_real, t_real, rbig_real)]
+colors_real = [INK, WARM, PURPLE, GREEN]
+
+fig, ax = plt.subplots(figsize=(9.5, 3.4))
+ax.bar(np.arange(4), var_real, 0.55, color=colors_real)
+ax.axhline(var_real[0], color=INK, lw=1.4, ls="--")
+for k, v in enumerate(var_real):
+    ax.text(k, v / 2, f"{v:.1%}", ha="center", va="center", fontsize=13,
+            fontweight="bold", color="white")
+ax.set_xticks(np.arange(4)); ax.set_xticklabels(names_real, fontsize=11)
+ax.set_ylabel("1% VaR · JPM/BAC 50:50")
+ax.set_yticks([]); despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+Three lessons in one bar chart:
+
+1. **The Gaussian understates the worst mornings** — on real banks, by
+   roughly a full percentage point of daily return.  At desk scale that is
+   not a rounding error; it is the difference between surviving the week and
+   explaining it to a regulator.
+2. **A fatter assumed family is not the same as the right family.**  The
+   Student-t aced the synthetic exam because the synthetic data *was* a t.
+   On real returns its symmetric, elliptical shape buys almost nothing —
+   real crashes are skewed, and no global $\nu$ can express "the down-tail
+   is heavier than the up-tail."
+3. **Learning the shape transfers; assuming it does not.**  RBIG never knew
+   a family existed and recovers most of the gap on both datasets — the
+   *assume vs learn* fork, settled by experiment.
+
 ::: {.eli5}
-**One-liner recap.**  Independent sampling kills the joint; Gaussian Monte-Carlo
-keeps the correlation but thins the tail; RBIG (or a flow) run backward keeps the
-*real* joint extremes — the only honest scenario generator of the three.
+**One-liner recap.**  Independent sampling kills the joint; Gaussian
+Monte-Carlo keeps the correlation but thins the tail; Student-t fattens the
+tail but assumes its shape; RBIG (or a flow) run backward *learns* the joint
+and keeps the real extremes — the only generator that never guessed.
 :::
 
-Next: uncertainty around a *prediction* — [predictive bands: noise &
-ensembles](04-predictive-bands.qmd).
+Act 1 sampled the *world*.  Act 2 turns to a single model and asks how wrong
+its prediction is.  First, open the black box every prediction comes out of —
+[the regression recipe](04-regression-recipe.qmd) — then put a band around it
+in [predictive bands: noise & ensembles](05-predictive-bands.qmd).

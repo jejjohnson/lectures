@@ -1,0 +1,510 @@
+---
+title: "Mutual Information, Entropy, and the Linfoot Bridge"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, GRID, PANEL, despine, annotate_box
+from lectures.measures import mutual_information_bits, mutual_information_xy, linfoot_r, nats_to_bits
+from scipy.stats import multivariate_normal
+plotting.set_style("notes")
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.patches import Circle, Ellipse, FancyBboxPatch, Rectangle
+from matplotlib.gridspec import GridSpec
+from scipy.stats import pearsonr, spearmanr
+import einx                      # linear algebra with the axes spelled out
+from jaxtyping import Float      # shape annotations: Float[Array, "n_days"]
+
+Array = np.ndarray
+
+
+def _venn_circle(ax, xy, r, color, alpha=0.32):
+    """A filled circle with a crisp matching outline (information-Venn style)."""
+    ax.add_patch(Circle(xy, r, facecolor=color, edgecolor=color, lw=2.2,
+                        alpha=alpha, zorder=2))
+    ax.add_patch(Circle(xy, r, facecolor="none", edgecolor=color, lw=2.2, zorder=3))
+```
+
+Road 1 is complete: the [correlation](01-correlation.qmd) and
+[kernel](02-kernels-hsic.qmd) pages compared data directly — no density
+needed.  That road hands you a *score*, but it leaves a question it cannot
+answer: how much is the dependence worth, in units you can reason about?
+This page takes the **second road**: we read the dependence out of $p(x,y)$
+as *information*, one concept at a time — surprise, then entropy, then the
+measure itself.
+
+---
+
+## Rung 5 · Information — One Event at a Time
+
+Information is *surprise*.  A rare event carries more information than a
+common one.  Shannon formalised this with one constraint: the surprise of two
+*independent* events must add.  The only continuous function that turns
+multiplication (of probabilities) into addition (of surprises) is the
+logarithm:
+
+$$
+I(x) = \log\frac{1}{p(x)} = -\log p(x)
+\qquad [\text{bits if } \log_2,\ \text{nats if } \ln]
+$$
+
+::: {.callout-note icon=false}
+## Background — Where the Logarithm Comes from
+
+We want a measure $I(x)$ that (1) decreases as $p(x)$ grows, and (2) adds
+for independent events: $I(x,y)=I(x)+I(y)$ when $p(x,y)=p(x)p(y)$.  The only
+continuous solution is $I(x) = -\log p(x)$.  The base sets the unit: base 2
+gives **bits**, base $e$ gives **nats** (1 bit = $\ln 2$ nats).
+:::
+
+```{python}
+#| label: fig-surprise
+#| fig-cap: "One event, one number. An ordinary 50/50 day carries a single bit of information; a 1-in-100 crash day carries 6.6 — rare events are where the information lives."
+p = np.linspace(0.004, 1, 500)
+info_bits = np.log2(1 / p)            # I(x) = log₂(1/p)   [bits]
+
+fig, ax = plt.subplots(figsize=(9.5, 3.6))
+ax.plot(p, info_bits, color=COOL, lw=2.4)
+for p_event, label, offset in [(0.5, "ordinary day\n1 bit", (30, 10)),
+                               (0.01, "crash day\n6.6 bits", (40, -8))]:
+    ax.scatter([p_event], [np.log2(1 / p_event)], s=70, c=CRASH, zorder=5)
+    ax.annotate(label, (p_event, np.log2(1 / p_event)),
+                textcoords="offset points", xytext=offset,
+                ha="center", fontsize=10, color=INK)
+ax.set_xlabel("probability of the event  p(x)")
+ax.set_ylabel("information  log₂(1/p)  (bits)")
+despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+That is the whole concept: **one event, one number**.  Everything that
+follows is bookkeeping over many events.
+
+---
+
+## Rung 5 · Entropy — The Average Surprise
+
+A variable is not one event but a distribution of them.  **Entropy** is the
+*expected* surprise — how unpredictable the variable is on an average day:
+
+$$
+H(X) = \mathbb{E}\!\left[\log\frac{1}{p(X)}\right]
+     = -\sum_x p(x)\log p(x)
+\qquad [\text{bits}]
+$$
+
+::: {.callout-note icon=false}
+## Background — Continuous Variables
+
+For a continuous variable the sum becomes the differential entropy
+$h(X) = -\int p(x)\log p(x)\,dx$.  A Gaussian with standard deviation
+$\sigma$ has $h = \tfrac{1}{2}\log(2\pi e\,\sigma^2)$ — so more volatile
+returns are *genuinely* harder to predict, in a way the next figure
+quantifies.
+:::
+
+```{python}
+#| label: fig-entropy-volatility
+#| fig-cap: "The Gaussian closed form h = ½·log₂(2πe·σ²): doubling the volatility adds exactly one bit of unpredictability."
+σ_grid = np.linspace(0.3, 3, 400)
+h_bits = 0.5 * np.log2(2 * np.pi * np.e * σ_grid**2)   # differential entropy [bits]
+
+fig, ax = plt.subplots(figsize=(9.5, 3.4))
+ax.plot(σ_grid, h_bits, color=INK, lw=2.4)
+ax.set_xlabel("volatility  σ  (std dev of daily return)")
+ax.set_ylabel("entropy  h  (bits)")
+ax.set_title("More volatile → more uncertain → higher entropy", fontsize=12)
+despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+**A sanity check with coins:**
+
+```{python}
+#| label: coin-entropy
+def shannon_entropy_bits(probs: Float[Array, "n_outcomes"]) -> float:
+    """H(X) = −Σᵢ pᵢ · log₂(pᵢ)     [bits]"""
+    p = np.asarray(probs, float)
+    p = p[p > 0]                  # 0·log(0) = 0 by convention — drop empty outcomes
+    return float(-(p * np.log2(p)).sum())
+
+print(f"Fair coin       H = {shannon_entropy_bits([0.5, 0.5]):.3f} bit")
+print(f"Biased (90/10)  H = {shannon_entropy_bits([0.9, 0.1]):.3f} bit")
+print(f"Certain         H = {shannon_entropy_bits([1.0]):.3f} bit")
+```
+
+### Entropy, In Pictures
+
+The coin numbers become visceral on return *distributions*.  Ask the same
+question every morning — *what will today's return be?* — of three assets.
+Discretise each history into the same bins and stamp each panel with its
+entropy:
+
+```{python}
+#| label: fig-entropy-pictures
+#| fig-cap: "Entropy made tangible: three return distributions on identical bins, each stamped with its average surprise. A pegged currency never surprises (0 bits); a calm asset takes ~2.4 bits to describe; a volatile one ~4.3. Width of the distribution *is* unpredictability."
+rng = np.random.default_rng(2)
+nE = 6000
+bins = np.linspace(-8, 8, 33)
+
+
+def hist_entropy_bits(returns: Float[Array, "n_days"]) -> float:
+    """Entropy of a return series, via a histogram on the shared bins.
+
+    H(X) = −Σᵢ pᵢ · log₂(pᵢ)     [bits]   where pᵢ = (days in bin i) / n_days
+    """
+    counts, _ = np.histogram(returns, bins=bins)     # days per return bin
+    prob = counts / counts.sum()                     # pᵢ — empirical probabilities
+    prob = prob[prob > 0]                            # 0·log(0) = 0 by convention
+    return -(prob * np.log2(prob)).sum() + 0.0       # +0.0 avoids displaying "-0.0"
+
+
+panels = [("Pegged currency", 0.25 + 0.02 * rng.normal(size=nE), COOL),
+          ("Calm asset", 0.6 * rng.normal(size=nE), COOL),
+          ("Volatile asset", 2.5 * rng.normal(size=nE), WARM)]
+fig, axes = plt.subplots(1, 3, figsize=(12, 3.8), sharey=True)
+for ax, (name, s, col) in zip(axes, panels):
+    ax.hist(s, bins=bins, density=True, color=col, alpha=0.75)
+    ax.set_title(name, fontsize=12)
+    ax.text(0.5, 0.78, f"H = {hist_entropy_bits(s):.1f} bits", transform=ax.transAxes,
+            ha="center", fontsize=13, fontweight="bold", color=INK,
+            bbox=dict(boxstyle="round,pad=0.4", fc=PANEL, ec=GRID))
+    ax.set_xlabel("daily return")
+    ax.set_xticks([]); ax.set_yticks([])
+    despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+This is the discrete cousin of the differential-entropy curve above: the wider
+the distribution, the more bits it takes to describe a day.  Entropy is the
+budget that mutual information will spend from — two variables can only
+*share* as much surprise as each one carries.
+
+---
+
+## Rung 6 · Mutual Information — The Honest Measure
+
+Combine the pieces.  **Mutual information** is the reduction in surprise about
+$Y$ from knowing $X$ — equivalently, the KL divergence between the true joint
+and the independent reference:
+
+$$
+I(X;Y) = D_{\mathrm{KL}}\!\left(p(x,y) \,\|\, p(x)p(y)\right)
+        = H(X) + H(Y) - H(X,Y) \geq 0.
+$$
+
+::: {.callout-note icon=false}
+## Background — Three Faces of Mutual Information
+
+Plugging $q = p(x,y)$ and $r = p(x)p(y)$ into the KL divergence gives
+
+$$
+I(X;Y) = \iint p(x,y)\log\frac{p(x,y)}{p(x)\,p(y)}\,dx\,dy.
+$$
+
+Expanding the log and taking expectations term by term turns this into the
+**entropy form** $H(X)+H(Y)-H(X,Y)$, and regrouping as $H(Y)-H(Y\mid X)$
+gives the **uncertainty-reduction form**: bits of uncertainty about $Y$ that
+knowing $X$ removes.  Same number, three readings.
+:::
+
+The three faces have one picture.  Draw each variable's entropy as a circle; the
+**overlap is the mutual information** — the shared area that knowing one variable
+tells you about the other.  The crescents outside the overlap are the conditional
+entropies $H(X\mid Y)$ and $H(Y\mid X)$ — what stays uncertain.
+
+```{python}
+#| label: fig-venn-bivariate
+#| fig-cap: "The information Venn for two variables: H(X) and H(Y) as circles, their overlap the mutual information I(X;Y) = H(X) + H(Y) - H(X,Y). The crescents are the leftover conditional entropies."
+fig, ax = plt.subplots(figsize=(8.0, 5.4))
+ax.set_xlim(0, 10); ax.set_ylim(0, 8); ax.axis("off"); ax.set_aspect("equal")
+
+r, cx1, cx2, cy = 2.1, 4.0, 6.0, 4.2
+_venn_circle(ax, (cx1, cy), r, COOL)
+_venn_circle(ax, (cx2, cy), r, WARM)
+
+ax.text(cx1 - 1.05, cy + 1.05, "H(X)", family="monospace", fontsize=15,
+        color=COOL, fontweight="bold", ha="center")
+ax.text(cx2 + 1.05, cy + 1.05, "H(Y)", family="monospace", fontsize=15,
+        color=WARM, fontweight="bold", ha="center")
+ax.text(5.0, cy, "I(X;Y)", family="monospace", fontsize=13, color=INK,
+        fontweight="bold", ha="center", zorder=5)
+ax.text(cx1 - 0.95, cy - 0.05, "H(X|Y)", family="monospace", fontsize=9,
+        color="#33506e", ha="center", zorder=5)
+ax.text(cx2 + 0.95, cy - 0.05, "H(Y|X)", family="monospace", fontsize=9,
+        color="#9a5440", ha="center", zorder=5)
+ax.text(5.0, 1.0, "I(X;Y) = H(X) + H(Y) - H(X,Y)", family="monospace",
+        fontsize=13, color=INK, ha="center",
+        bbox=dict(boxstyle="round,pad=0.4", fc=PANEL, ec=GRID))
+fig.tight_layout(); plt.show()
+```
+
+**Cookie-cutter check — two coins.**  Glue $Y$ to $X$ and they share exactly
+1 bit; make them independent and they share 0.
+
+```{python}
+#| label: fig-coins-mi
+#| fig-cap: "Mutual information by hand: from 1 bit (glued) to 0 (independent)."
+joints = {
+    "Glued (Y = X)":   np.array([[0.5, 0.0], [0.0, 0.5]]),
+    "Partly coupled":  np.array([[0.40, 0.10], [0.10, 0.40]]),
+    "Independent":     np.array([[0.25, 0.25], [0.25, 0.25]]),
+}
+
+fig, axes = plt.subplots(1, 3, figsize=(12, 4.0))
+for ax, (name, P) in zip(axes, joints.items()):
+    mi = mutual_information_bits(P)
+    ax.imshow(P, cmap="BuPu", vmin=0, vmax=0.5)
+    for i in range(2):
+        for j in range(2):
+            ax.text(j, i, f"{P[i, j]:.2f}", ha="center", va="center",
+                    color="white" if P[i, j] > 0.3 else INK,
+                    fontsize=13, fontweight="bold")
+    ax.set_xticks([0, 1]); ax.set_yticks([0, 1])
+    ax.set_xticklabels(["Y=H", "Y=T"])
+    ax.set_yticklabels(["X=H", "X=T"])
+    ax.set_title(f"{name}\nMI = {mi:.2f} bits", fontsize=11)
+
+fig.suptitle("Two-coin MI: from 1 bit (glued) to 0 (independent)",
+             fontsize=12, fontweight="bold", y=1.04)
+fig.tight_layout()
+plt.show()
+```
+
+### Our Convex Character Finally Scores
+
+Pearson called the V-shape near zero; mutual information sees it because MI
+responds to *any* relationship, not just straight lines.  The Venn above and
+the data below are the same picture: dependent data **earns** overlap, in bits;
+independent data earns none.
+
+```{python}
+#| label: fig-mi-pictures
+#| fig-cap: "From data to Venn. Top: a curved (dependent) pair and an independent pair. Bottom: the Venn each one maps to, with the mutual information it earns — the curved pair shares about a bit; the independent pair shares nothing."
+rng = np.random.default_rng(3)
+n_mi = 2500
+xd = rng.uniform(-2.5, 2.5, n_mi); yd = xd**2 + 0.5 * rng.normal(size=n_mi)
+xi = rng.normal(size=n_mi); yi = rng.normal(size=n_mi)
+
+
+def mi_bits_hist(x: Float[Array, "n_days"], y: Float[Array, "n_days"]) -> float:
+    """I(X;Y) from a 10×10 joint histogram     [bits]"""
+    joint_counts = np.histogram2d(x, y, bins=10)[0]   # (10, 10) table of day counts
+    return mutual_information_bits(joint_counts)
+
+
+fig = plt.figure(figsize=(10, 6.4))
+gs = GridSpec(2, 2, height_ratios=[1.25, 1], hspace=0.3, wspace=0.18)
+axDs = fig.add_subplot(gs[0, 0])
+axDs.scatter(xd, yd, s=8, c=WARM, alpha=0.4, edgecolors="none")
+axDs.set_title("Dependent data (curved)", fontsize=12)
+axIs = fig.add_subplot(gs[0, 1])
+axIs.scatter(xi, yi, s=8, c=COOL, alpha=0.4, edgecolors="none")
+axIs.set_title("Independent data", fontsize=12)
+for ax in (axDs, axIs):
+    ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+
+
+def mini_venn(ax, overlap, mi, lab):
+    ax.set_xlim(0, 10); ax.set_ylim(0, 6); ax.axis("off"); ax.set_aspect("equal")
+    dx = 1.5 if overlap else 2.7
+    _venn_circle(ax, (5 - dx, 3), 2.0, COOL)
+    _venn_circle(ax, (5 + dx, 3), 2.0, WARM)
+    if overlap:
+        ax.text(5, 3, "MI", family="monospace", ha="center", va="center",
+                fontsize=12, fontweight="bold", color=INK, zorder=6)
+    ax.set_title(f"{lab}  →  MI = {mi:.2f} bit", fontsize=12, fontweight="bold")
+
+
+mini_venn(fig.add_subplot(gs[1, 0]), True, mi_bits_hist(xd, yd), "overlap")
+mini_venn(fig.add_subplot(gs[1, 1]), False, mi_bits_hist(xi, yi), "no overlap")
+plt.show()
+```
+
+### A Known Answer to Validate Against
+
+For a bivariate Gaussian the MI has a closed form:
+
+$$
+I = -\tfrac{1}{2}\ln(1-\rho^2) \quad \text{(nats)}.
+$$
+
+This is the bridge that lets the walkthrough *check* an estimator against a
+number computable by hand — and it shows that, for Gaussian data, MI carries
+the same content as correlation.
+
+```{python}
+#| label: fig-mi-gaussian
+#| fig-cap: "MI grows with correlation, but the relationship is nonlinear — a little correlation already implies substantial shared information."
+rho = np.linspace(0, 0.98, 400)
+mi_nats = -0.5 * np.log(1 - rho**2)
+
+fig, ax = plt.subplots(figsize=(8, 4.2))
+ax.plot(rho, mi_nats, color=COOL, lw=2.6)
+for r in (0.5, 0.8):
+    m = -0.5 * np.log(1 - r**2)
+    ax.scatter([r], [m], color=CRASH, zorder=5, s=60)
+    ax.annotate(f"ρ={r} → {m:.2f} nats",
+                xy=(r, m), xytext=(r - 0.35, m + 0.22),
+                fontsize=9.5, color=INK,
+                arrowprops=dict(arrowstyle="->", color=INK, lw=1.1))
+ax.set_xlabel("Pearson correlation  ρ")
+ax.set_ylabel("mutual information  (nats)")
+ax.set_title("Known answer: MI = −½ ln(1 − ρ²)  for Gaussian pairs",
+             fontsize=12, fontweight="bold")
+despine(ax)
+plt.tight_layout()
+plt.show()
+```
+
+**Pros** — zero only under true independence; sees nonlinear and non-monotone
+dependence alike; reports real units (bits or nats).
+
+**Cons** — needs a density estimate, is data-hungry, and the value depends on the
+estimator.
+
+---
+
+## Rung 7 · Linfoot R — Back to a Familiar Scale
+
+Bits are unfamiliar to practitioners raised on correlations in $[-1, 1]$.
+Linfoot rescales MI onto that axis:
+
+$$
+R = \sqrt{1 - e^{-2\,I}} \in [0, 1].
+$$
+
+For a bivariate Gaussian this returns exactly $|\rho|$ — so **correlation is
+the shadow that mutual information casts when the world is Gaussian.**  Any
+excess of $R$ over Pearson on real data is non-Gaussian, tail-driven dependence
+that correlation cannot represent.
+
+::: {.callout-note icon=false}
+## Background — Why Linfoot Reduces to |ρ| for a Gaussian
+
+Start from $I = -\tfrac{1}{2}\log(1-\rho^2)$.  Linfoot's $R = \sqrt{1-e^{-2I}}$.
+Substituting: $e^{-2I} = e^{\log(1-\rho^2)} = 1-\rho^2$, so
+$R = \sqrt{1-(1-\rho^2)} = |\rho|$.  The construction is engineered so that on
+Gaussian data both measures agree — which licenses reading any *gap* between
+$R$ and Pearson's $r$ on real data as the extra dependence correlation
+structurally cannot see.
+:::
+
+```{python}
+#| label: fig-linfoot
+#| fig-cap: "Linfoot's bridge: mutual information (nats) read as a correlation-like number."
+I_vals = np.linspace(0, 1.6, 400)
+R_vals = np.sqrt(1 - np.exp(-2 * I_vals))
+
+fig, ax = plt.subplots(figsize=(8, 4.2))
+ax.plot(I_vals, R_vals, color=COOL, lw=2.6,
+        label="R = √(1 − e^{−2I})")
+ax.set_xlabel("mutual information  (nats)")
+ax.set_ylabel("dependence on the correlation scale  R")
+ax.set_ylim(0, 1.05)
+ax.set_title("Linfoot's bridge: MI read as a correlation",
+             fontsize=12, fontweight="bold")
+despine(ax)
+ax.legend(loc="lower right", frameon=False)
+plt.tight_layout()
+plt.show()
+```
+
+### The Gaussian Shadow, Seen
+
+"Correlation is the shadow that mutual information casts when the world is
+Gaussian" is a slogan until you photograph it.  Fit a Gaussian (mean and
+covariance — all that Pearson ever uses) to each running character and draw its
+contours over the data.  Then put the shadow $r$ next to the information
+$R$ on each panel:
+
+```{python}
+#| label: fig-gaussian-shadow
+#| fig-cap: "The shadow test. Contours show the Gaussian fitted to each pair — the distribution Pearson implicitly assumes. Left: the banks are Gaussian-ish, so the shadow is faithful (r ≈ R). Right: the convex pair is not Gaussian at all — the shadow loses nearly everything (r ≈ 0) while the information survives (R ≈ 0.9)."
+a_s, b_s, _ = datasets.two_banks(n=800)
+u_s, v_s = datasets.convex_payoff(n=800)
+fig, axes = plt.subplots(1, 2, figsize=(11, 4.2))
+for ax, x_, y_, col, name in [(axes[0], a_s, b_s, COOL, "Banks — a Gaussian-ish world"),
+                              (axes[1], u_s, v_s, WARM, "Convex — not Gaussian at all")]:
+    XY = np.column_stack([x_, y_])
+    gpts = np.linspace(XY.min() - 0.5, XY.max() + 0.5, 160)
+    XX, YY = np.meshgrid(gpts, gpts)
+    Z = multivariate_normal(XY.mean(0), np.cov(XY.T)).pdf(np.dstack([XX, YY]))
+    r_ = pearsonr(x_, y_)[0]
+    R_ = linfoot_r(mutual_information_xy(x_, y_))
+    ax.scatter(x_, y_, s=10, c=col, alpha=0.45, edgecolors="none")
+    ax.contour(XX, YY, Z, levels=6, colors=INK, linewidths=1.0, alpha=0.65)
+    ax.set_title(name, fontsize=12)
+    annotate_box(ax, 0.5, -0.10,
+                 f"shadow r = {r_:+.2f}   ·   information R = {R_:.2f}")
+    ax.set_xticks([]); ax.set_yticks([])
+    despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+When the fitted Gaussian hugs the data, the shadow is the whole story — and
+Pearson is exactly the right tool (recall the
+[known-answer formula](#a-known-answer-to-validate-against): on Gaussian data
+MI carries the *same* content as $\rho$).  When it does not, the gap
+$R - |r|$ is precisely the dependence that lives outside the Gaussian family —
+curved, skewed, or tail-driven.  Measuring it properly requires *learning* the
+density, which is where [Gaussianization](05-gaussianization.qmd)
+comes in.
+
+### Scorecard — Both Characters, All Measures
+
+```{python}
+#| label: tbl-scorecard-mi
+#| tbl-cap: "Running-character scorecard including the information-theoretic measures."
+from lectures.measures import distance_correlation
+
+rng = np.random.default_rng(0)
+n = 800
+
+a, b, _ = datasets.two_banks(n=n)
+u, v = datasets.convex_payoff(n=n)
+
+def score(x: Float[Array, "n_days"], y: Float[Array, "n_days"]) -> dict[str, float]:
+    """Every measure of the chapter, for one pair of return series."""
+    pearson_r = pearsonr(x, y)[0]          # r  = cov(X,Y) / (σₓ·σᵧ)      ∈ [−1, 1]
+    spearman_ρ = spearmanr(x, y)[0]        # ρₛ = corr(rank(x), rank(y))  ∈ [−1, 1]
+    dcor = distance_correlation(x, y)      # dCor ∈ [0, 1], 0 ⇔ independent
+    # Discrete MI approximation via a 20×20 joint histogram
+    joint_counts, _, _ = np.histogram2d(x, y, bins=20, density=True)
+    mi_bits = mutual_information_bits(joint_counts)        # I(X;Y)   [bits]
+    mi_nats = mi_bits * np.log(2)                          # bits → nats (1 bit = ln 2 nats)
+    R = linfoot_r(mi_nats)                 # R = √(1 − e^(−2I))           ∈ [0, 1]
+    return dict(pearson=pearson_r, spearman=spearman_ρ, distance=dcor,
+                mi_bits=mi_bits, linfoot_R=R)
+
+banks = score(a, b)
+convex = score(u, v)
+
+print(f"{'Measure':<16s}  {'Banks':>8s}  {'Convex':>8s}")
+print("-" * 38)
+for key, fmt in [("pearson", "+.3f"), ("spearman", "+.3f"),
+                 ("distance", ".3f"), ("mi_bits", ".2f"), ("linfoot_R", ".3f")]:
+    print(f"  {key:<16s}  {banks[key]:{fmt}}  {convex[key]:{fmt}}")
+```
+
+Opposite blind spots, made concrete.  The **banks** score high on every
+measure; the **convex pair** is invisible to Pearson yet obvious once we pass
+through the distribution.  No single number is the whole truth.
+
+---
+
+## What's Next
+
+Everything on this page treated a variable as a *scalar* — one value per day.
+The [next page](04-windows-and-blocks.qmd) widens the lens: windows, vectors,
+and blocks, where the same information measures scale from a pair of stocks to
+a whole portfolio.  And the density this page estimated with a crude histogram
+gets a proper estimator in [Gaussianization](05-gaussianization.qmd).

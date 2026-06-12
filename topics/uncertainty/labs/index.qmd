@@ -12,7 +12,7 @@ sample the joint, push it through, and report honest uncertainty.
 |-----|-------|
 | [Tool 1 — Independent fails](lab-tool1-independent-fail.qmd) | why per-marginal sampling destroys the joint |
 | [Tool 2 — Gaussian Monte-Carlo](lab-tool2-gaussian-mc.qmd) | right correlation, thin tails; the VaR gap |
-| [Tool 3 — Predictive bands](lab-tool3-bands.qmd) | aleatoric vs epistemic by sampling |
+| [Tool 3 — Predictive bands](lab-tool3-bands.qmd) | neural-net uncertainty: an NLL net's σ(x) + a deep ensemble |
 
 ## Do-the-Job Track
 
@@ -31,6 +31,11 @@ from lectures import plotting, datasets
 from rbig import AnnealedRBIG
 from lectures.measures import cocrash_fraction
 plotting.set_style("notes")
+
+# the prediction-band labs train small Keras nets (CPU JAX backend)
+import os
+os.environ["KERAS_BACKEND"] = "jax"   # set BEFORE importing keras
+import keras
 ```
 
 The do-the-job labs load real returns with `datasets.load_returns()`.

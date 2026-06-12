@@ -6,31 +6,47 @@ title: "Uncertainty Is Probability"
 #| echo: false
 import sys, pathlib
 sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
-from lectures import plotting
+from lectures import plotting, datasets
 from lectures.plotting import INK, COOL, WARM, CRASH, BAND, despine, annotate_box
 plotting.set_style("notes")
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.stats import norm, t as student_t
+from jaxtyping import Float      # shape annotations: Float[Array, "n_days"]
+
+Array = np.ndarray
+GREEN = plotting.PALETTE["green"]
 ```
 
-A forecast is not a number — it is a **distribution**.  A point estimate throws
-away exactly the thing risk cares about: how wrong you might be, and in which
-direction.
+Start with a story every risk desk knows.
+
+> *The desk model promised: 19 days in 20 inside the band.  That month, the
+> band broke **three times** — all in the same week.*
+
+Was the model *wrong* — or just *unlucky*?  Three misses in a month is what a
+fair coin sometimes does; three misses in the *same week* smells like a model
+that never understood when the world gets loud.  You cannot even pose that
+question — let alone answer it — until uncertainty is an object you can
+**measure, propagate, and check**.  That object is a probability
+distribution, and this chapter is about treating it as a first-class citizen:
+inputs, parameters, and predictions are *distributions*, not points.
 
 ## A Point Estimate Hides the Tail
 
-A model that reports "expected return = $\mu$" — or even a tidy 95% band that
-assumes thin Gaussian tails — can look fine right up until the loss that lands far
-out in a tail it never represented.
+A forecast is not a number — it is a **distribution**.  A point estimate
+throws away exactly the thing risk cares about: how wrong you might be, and
+in which direction.  And a tidy ±2σ band built on thin Gaussian tails is only
+a slightly more sophisticated way to make the same mistake — it represents
+the *typical* miss while assigning essentially no probability to the loss
+that actually arrives.
 
 ```{python}
 #| label: fig-honest-forecast
-#| fig-cap: "A confident point forecast (and a thin Gaussian band) versus the honest, fat-tailed predictive distribution. The realized loss lands where the confident view assigned almost no probability."
+#| fig-cap: "A confident point forecast (and a thin Gaussian band) versus the honest, fat-tailed predictive distribution. The realized loss lands where the confident view assigned almost no probability — and where the honest view kept a visible reserve of doubt."
 grid = np.linspace(-8, 8, 600)
-confident = norm.pdf(grid, 0, 1.0)
-honest = student_t.pdf(grid, df=2.5)
-realized = -4.6
+confident = norm.pdf(grid, 0, 1.0)           # 𝒩(0, 1): tails decay like e^(−x²/2)
+honest = student_t.pdf(grid, df=2.5)         # Student-t ν=2.5: tails decay like |x|⁻³·⁵
+realized = -4.6                              # the loss that actually landed [σ units]
 
 fig, ax = plt.subplots(figsize=(8, 4.2))
 ax.fill_between(grid, confident, color=WARM, alpha=0.35, label="confident (Gaussian)")
@@ -45,26 +61,43 @@ fig.tight_layout()
 plt.show()
 ```
 
+At $-4.6$ the Gaussian density is about $10^{-5}$ — a once-in-decades event.
+The fat-tailed forecast puts real mass there: rare, but *on the menu*.  Same
+data, same center, same width in the bulk; the entire difference between
+"sound risk management" and "a broken promise" lives in the tails.
+
 ## Uncertainty Has a Number: Entropy
 
-Surprise is $\log\frac{1}{p(x)}$; **entropy** is its average,
-$H(X) = \mathbb E[\log\frac{1}{p(X)}]$ — the [same quantity](../dependence/02-mutual-information.qmd)
-from the dependence chapter, here measuring *how unsure* a forecast is.
+If a forecast is a distribution, *how uncertain* it is must be a property of
+that distribution.  It is, and you have already met it: surprise is
+$\log\frac{1}{p(x)}$, and **entropy** is its average,
+
+$$
+H(X) = \mathbb E\!\left[\log\tfrac{1}{p(X)}\right],
+$$
+
+the [same quantity](../dependence/03-mutual-information.qmd#rung-5-entropy--the-average-surprise)
+that anchored Road 2 of the dependence chapter.  There it measured how
+unpredictable an asset *is*; here it measures how unsure a forecast *admits
+to being*.
 
 ```{python}
 #| label: fig-entropy-ladder
-#| fig-cap: "Three forecasts over the same outcomes, from near-certain to maximally uncertain. Entropy puts a number on it."
-def entropy_bits(p):
-    p = np.asarray(p, float)
-    return float(-(p[p > 0] * np.log2(p[p > 0])).sum())
+#| fig-cap: "Three forecasts over the same four outcomes, from near-certain to maximally uncertain. Entropy puts a number on the doubt: 0 bits would be a delta spike, 2 bits is the uniform — total ignorance over four options."
+def entropy_bits(p: Float[Array, "n_outcomes"]) -> float:
+    """H(X) = −Σᵢ pᵢ·log₂ pᵢ   [bits] — the average surprise of the forecast."""
+    p = np.asarray(p, dtype=float)
+    p_nonzero = p[p > 0]                     # 0·log 0 = 0 by convention
+    return float(-(p_nonzero * np.log2(p_nonzero)).sum())
 
-dists = {
+
+forecasts = {
     "near-certain": np.array([0.85, 0.08, 0.05, 0.02]),
     "moderate": np.array([0.5, 0.3, 0.15, 0.05]),
     "max uncertainty": np.array([0.25, 0.25, 0.25, 0.25]),
 }
 fig, axes = plt.subplots(1, 3, figsize=(12, 3.6))
-for ax, (name, p) in zip(axes, dists.items()):
+for ax, (name, p) in zip(axes, forecasts.items()):
     ax.bar(range(4), p, color=COOL, alpha=0.85)
     ax.set_title(f"{name}\nH = {entropy_bits(p):.2f} bits", fontsize=11)
     ax.set_ylim(0, 1); ax.set_xticks(range(4))
@@ -78,16 +111,79 @@ plt.show()
 
 The honest forecast is the **most uncertain** (maximum-entropy) distribution
 consistent with what you actually know.  A corollary that surprises people:
-**learning does not only shrink uncertainty.**  Evidence that conflicts with your
-model can *widen* the predictive distribution (and shift it) — being well
-calibrated sometimes means becoming *less* sure.  The Gaussian is the
+**learning does not only shrink uncertainty.**  Evidence that conflicts with
+your model can *widen* the predictive distribution (and shift it) — being
+well calibrated sometimes means becoming *less* sure.  The Gaussian is the
 least-committal joint for a given mean and covariance, which is exactly why
-[Gaussianization](../gaussianization/index.qmd) is the natural reference.
+[Gaussianization](../gaussianization/index.qmd) is the natural reference
+point throughout this course.
 :::
+
+## Two Questions, Two Acts
+
+Every uncertainty in this chapter is an instance of one of **two questions**,
+and the chapter is organised as two acts around them:
+
+- **Act 1 — What could the world do?**  Scenarios for a whole portfolio:
+  sample the **joint** distribution of returns, push the samples through the
+  portfolio, price the tail.  The ladder of generators — independent →
+  Gaussian → Student-t → RBIG — lives on the
+  [noise-and-propagation page](03-noise-and-propagation.qmd).
+- **Act 2 — How wrong is my prediction?**  A band around a single model's
+  $\hat y = f(x)$: noise you must **predict**, ignorance you must **admit**.
+  The tools — $\sigma(x)$, volatility forecasts, ensembles — live on the
+  [predictive-bands page](05-predictive-bands.qmd), with the underlying
+  fitting machinery opened up in the
+  [regression recipe](04-regression-recipe.qmd).
+
+Each act has a running character that carries its question through every
+figure:
+
+```{python}
+#| label: fig-running-characters
+#| fig-cap: "The chapter's two running characters. Left — Act 1: a fat-tailed pair of bank returns whose worst days arrive together (the diagonal smear into the lower-left corner). Right — Act 2: a noisy curve with a hole in the middle of its data; the dotted line is the truth the model never sees, and the '?' marks the region where it must confess ignorance."
+# Act 1 character: the fat-tailed bank pair (the dependence chapter's banks)
+a, b = datasets.tail_dependent_pair(n=2000, seed=0)
+
+# Act 2 character: y = sin(1.3·x) + σ(x)·ε, observed only OUTSIDE |x| < 1.4,
+# with noise σ(x) that grows left-to-right from 0.05 to 0.50
+rng = np.random.default_rng(5)
+half = 30
+x_obs = np.sort(np.concatenate([rng.uniform(-3.2, -1.4, half),
+                                rng.uniform(1.4, 3.2, half)]))
+σ_true = 0.05 + 0.45 * (x_obs + 3.2) / 6.4   # noise level, rising with x
+y_obs = np.sin(1.3 * x_obs) + σ_true * rng.standard_normal(x_obs.size)
+
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 3.6))
+axL.scatter(a, b, s=7, c=COOL, alpha=0.35, edgecolors="none")
+axL.set_title("Act 1 · the banks — fat tails, co-crashes", fontsize=12)
+for x_true in (np.linspace(-3.4, -1.4, 100), np.linspace(1.4, 3.4, 100)):
+    axR.plot(x_true, np.sin(1.3 * x_true), c=INK, lw=1.4, ls=":", alpha=0.55)
+axR.scatter(x_obs, y_obs, s=18, c=INK, alpha=0.8)
+axR.axvspan(-1.4, 1.4, color=GREEN, alpha=0.08)
+axR.text(0, 0, "?", fontsize=24, color=GREEN, fontweight="bold",
+         ha="center", va="center")
+axR.set_ylim(-2.4, 2.4)
+axR.set_title("Act 2 · the curve — noisy on the right, a hole in the middle",
+              fontsize=12)
+for ax in (axL, axR):
+    ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+The banks ask Act 1's question — *if I hold both, what does the 1-in-100
+morning cost?* — and answering it means generating joint scenarios whose
+corner is as ugly as the real one.  The gappy curve asks Act 2's — *how wide
+should my band be, here?* — and the honest answer is different on the noisy
+right edge (wide because the *world* is loud) than over the hole (wide
+because the *model* is blind).  Keep the two reasons separate; the whole of
+Act 2 turns on that distinction.
 
 ## Discrete and Continuous, One Idea
 
-For discrete outcomes, probability is a table that sums to one; for continuous
-ones, a density that integrates to one.  Both carry the same uncertainty content,
-and both transform by the **same rule** when pushed through a model — the subject
-of the [next page](02-probability-under-transformation.qmd).
+For discrete outcomes, probability is a table that sums to one; for
+continuous ones, a density that integrates to one.  Both carry the same
+uncertainty content, and both transform by the **same rule** when pushed
+through a model — the subject of the
+[next page](02-probability-under-transformation.qmd).

@@ -38,8 +38,14 @@ import sys, pathlib
 sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
 from lectures import plotting, datasets
 from lectures.measures import cka_rbf, cka_linear
-from lectures.neutralize import fair_fit
+from lectures.neutralize import fair_fit       # closed-form teaching stand-in
 plotting.set_style("notes")
+
+# the end-to-end version (Tool 2 §3 and Job B) — the course's real library
+import os
+os.environ["KERAS_BACKEND"] = "jax"            # set BEFORE importing keras
+import keras
+from fairkl import FairModelWrapper            # loss = fit + μ·CKA(ŷ, S)
 ```
 
 The do-the-job labs additionally load real data with

@@ -12,10 +12,17 @@ plotting.set_style("notes")
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.stats import norm
+from jaxtyping import Float      # shape annotations: Float[Array, "n_draws"]
+
+Array = np.ndarray
 ```
 
-Push a distribution through a function and it is **reshaped** — by the function's
-derivative.  This is the same [change-of-variables](../gaussianization/01-change-of-variables.qmd)
+The [previous page](01-uncertainty-is-probability.qmd) made uncertainty an
+object: a distribution.  But a distribution rarely stays where you found it —
+returns become P&L, rates become bond prices, inputs become predictions.
+Push a distribution through a function and it is **reshaped** — and the
+reshaping is governed entirely by the function's *derivative*.  This is the
+same [change-of-variables](../gaussianization/01-change-of-variables.qmd)
 rule that powers Gaussianization, now read as *uncertainty propagation*.
 
 ## The Rule
@@ -26,79 +33,164 @@ $$
 p_Y(y) = p_X(x)\,\left|\frac{dx}{dy}\right| = \frac{p_X(x)}{\lvert f'(x)\rvert}.
 $$
 
-Where $f$ is **steep**, it spreads probability out (the output is more
-uncertain); where it is **flat**, it concentrates it.  The Jacobian
-$\lvert f'\rvert$ is the exact bookkeeping.
+Read it as conservation of probability: the mass that lived in a small
+interval $dx$ must reappear in the image interval $dy = |f'(x)|\,dx$.  Where
+$f$ is **steep**, the same mass is smeared over a wider interval — the
+density drops, the output is more uncertain.  Where $f$ is **flat**, mass
+piles up.  The Jacobian $\lvert f'\rvert$ is the exact bookkeeping; nothing
+is created, nothing destroyed.
 
 ```{python}
 #| label: fig-pushforward
-#| fig-cap: "A Gaussian input pushed through a convex function. The output is skewed and stretched in the steep region — uncertainty is reshaped, not merely shifted."
+#| fig-cap: "A Gaussian input pushed through a convex, option-like function. The symmetric input becomes a skewed, heavy-right output: the steep upper region stretches probability out, the flat lower region compresses it. Uncertainty is reshaped, not merely shifted."
+def f_convex(x: Float[Array, "n"]) -> Float[Array, "n"]:
+    """y = e^(0.55·x) — convex, option-like: flat for losses, steep for gains."""
+    return np.exp(0.55 * x)
+
+
 rng = np.random.default_rng(0)
-f = lambda x: np.exp(0.55 * x)           # convex, option-like
-x = rng.normal(0.0, 1.0, 40000)
-y = f(x)
+x_draws = rng.normal(0.0, 1.0, 40_000)       # input: x ~ 𝒩(0, 1)
+y_draws = f_convex(x_draws)                  # output: the push-forward of 𝒩(0,1)
 
 fig, ax = plt.subplots(figsize=(7.5, 5.2))
-# function curve
-xs = np.linspace(-3, 3, 300)
-ax.plot(xs, f(xs), c=INK, lw=2.2)
+x_curve = np.linspace(-3, 3, 300)
+ax.plot(x_curve, f_convex(x_curve), c=INK, lw=2.2)
 ax.set_xlabel("input x"); ax.set_ylabel("output y = f(x)")
-# input density along the bottom
-xb = np.linspace(-3, 3, 200)
-ax.fill_between(xb, -0.3 + 2.0 * norm.pdf(xb), -0.3, color=COOL, alpha=0.5)
+# input density, drawn along the bottom edge
+x_band = np.linspace(-3, 3, 200)
+ax.fill_between(x_band, -0.3 + 2.0 * norm.pdf(x_band), -0.3, color=COOL, alpha=0.5)
 ax.text(-2.6, 0.5, "input p(x)", color=COOL, fontsize=10)
-# output density along the left (rotated)
-yb = np.linspace(y.min(), np.quantile(y, 0.999), 200)
-hist, edges = np.histogram(y, bins=80, density=True)
-cen = 0.5 * (edges[:-1] + edges[1:])
-ax.fill_betweenx(cen, -3 + 2.5 * hist, -3, color=WARM, alpha=0.5)
-ax.text(-2.9, np.quantile(y, 0.85), "output p(y)\n(skewed, heavy)",
+# output density, drawn (rotated) along the left edge
+hist, edges = np.histogram(y_draws, bins=80, density=True)
+bin_centers = 0.5 * (edges[:-1] + edges[1:])
+ax.fill_betweenx(bin_centers, -3 + 2.5 * hist, -3, color=WARM, alpha=0.5)
+ax.text(-2.9, np.quantile(y_draws, 0.85), "output p(y)\n(skewed, heavy)",
         color=WARM, fontsize=10)
-ax.set_xlim(-3, 3); ax.set_ylim(-0.4, np.quantile(y, 0.999))
+ax.set_xlim(-3, 3); ax.set_ylim(-0.4, np.quantile(y_draws, 0.999))
 ax.set_title("A distribution reshaped by its transform", fontsize=12)
 despine(ax)
 fig.tight_layout()
 plt.show()
 ```
 
+Notice what happened to the *shape*: a perfectly symmetric Gaussian went in,
+and a skewed, heavy-tailed distribution came out — without any heavy-tailed
+ingredient anywhere.  Nonlinearity alone manufactures asymmetry.  This is
+why option books have skewed P&L even when the underlying looks tame, and
+why "the inputs are Gaussian" never implies "the outputs are."
+
 ## Small-Noise Propagation
 
-Linearize and the rule becomes the familiar engineering formula: a small input
-noise $\sigma_x$ produces output noise
+Zoom in close enough and every smooth function is a line.  Linearize
+$f$ around an operating point and the rule collapses to the engineering
+formula every lab course teaches:
 
 $$
 \sigma_y \approx \lvert f'(x)\rvert\,\sigma_x.
 $$
 
-Error scales with the **slope of the system** — the steeper the response, the more
-your input uncertainty is amplified.
+Error scales with the **slope of the system** — the steeper the response,
+the more your input uncertainty is amplified.  Same instrument, same input
+noise, wildly different output noise depending on *where you operate*.
+
+The figure below makes the formula geometric.  Both panels carry the
+**identical** blue input band, $x_0 \pm 2\sigma_x$.  Follow the dashed lines:
+each edge of the band climbs up to the curve and turns left, and the orange
+strip they bracket is the *image* of the input band — the output noise.
+Where the curve is steep, the same band is stretched into a wide strip;
+where it is flat, it is crushed into a sliver.
 
 ```{python}
 #| label: fig-error-propagation
-#| fig-cap: "Same input noise, two operating points. Where f is steep the output band is wide; where f is flat it is narrow."
-f = lambda x: np.tanh(1.5 * x)
-fp = lambda x: 1.5 * (1 - np.tanh(1.5 * x) ** 2)
-xs = np.linspace(-2.5, 2.5, 300)
-sig_x = 0.3
-fig, ax = plt.subplots(figsize=(7.5, 4.4))
-ax.plot(xs, f(xs), c=INK, lw=2.2)
-for x0, name in [(-0.1, "steep"), (1.6, "flat")]:
-    sy = abs(fp(x0)) * sig_x
-    ax.errorbar(x0, f(x0), yerr=sy, xerr=sig_x, fmt="o", color=CRASH,
-                capsize=4, lw=2)
-    ax.annotate(f"{name}: σ_y≈{sy:.2f}", (x0, f(x0)),
-                textcoords="offset points", xytext=(10, -18), fontsize=10)
-ax.set_xlabel("input x"); ax.set_ylabel("output f(x)")
-ax.set_title("σ_y ≈ |f'(x)| · σ_x", fontsize=12)
-despine(ax)
+#| fig-cap: "The same input noise, pushed through the same system at two operating points. The blue band (x₀ ± 2σₓ, identical in both panels) projects through the curve onto the orange output band. Steep operating point: the band is stretched ~30×, relative to the flat one, where the saturating response simply swallows the noise. The bells on the edges sketch the input and output distributions."
+def f_sat(x: Float[Array, "n"]) -> Float[Array, "n"]:
+    """y = tanh(1.5·x) — a saturating response: steep at 0, flat at the rails."""
+    return np.tanh(1.5 * x)
+
+
+def f_sat_slope(x: float) -> float:
+    """f'(x) = 1.5·(1 − tanh²(1.5·x)) — the local gain of the system."""
+    return 1.5 * (1 - np.tanh(1.5 * x) ** 2)
+
+
+σ_x = 0.3                                    # input noise, same at both points
+operating_points = [(-0.1, "steep"), (1.6, "flat")]
+x_curve = np.linspace(-2.5, 2.5, 300)
+y_floor, x_wall = -1.55, -2.7                # where the marginal bells sit
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 4.6), sharey=True)
+for ax, (x0, name) in zip(axes, operating_points):
+    slope = abs(f_sat_slope(x0))
+    σ_y = slope * σ_x                        # σ_y ≈ |f'(x₀)|·σₓ
+    y_lo, y_hi = f_sat(x0 - 2 * σ_x), f_sat(x0 + 2 * σ_x)
+
+    ax.plot(x_curve, f_sat(x_curve), c=INK, lw=2.2)
+    ax.axvspan(x0 - 2 * σ_x, x0 + 2 * σ_x, color=COOL, alpha=0.15)   # input band
+    ax.axhspan(y_lo, y_hi, color=WARM, alpha=0.22)                   # its image
+    # projection lines: band edge → curve → y-axis
+    for x_edge in (x0 - 2 * σ_x, x0 + 2 * σ_x):
+        y_edge = f_sat(x_edge)
+        ax.plot([x_edge, x_edge], [y_floor, y_edge], c=COOL, lw=1.1, ls="--")
+        ax.plot([x_wall, x_edge], [y_edge, y_edge], c=WARM, lw=1.1, ls="--")
+    # the input bell on the bottom edge — identical in both panels
+    xs_in = np.linspace(x0 - 3.2 * σ_x, x0 + 3.2 * σ_x, 120)
+    bump_in = 0.30 * np.exp(-0.5 * ((xs_in - x0) / σ_x) ** 2)
+    ax.fill_between(xs_in, y_floor + bump_in, y_floor, color=COOL, alpha=0.75)
+    # the output bell on the left edge — shaped by the image band
+    y_mid, σ_img = 0.5 * (y_lo + y_hi), max((y_hi - y_lo) / 4, 1e-3)
+    ys_out = np.linspace(y_mid - 3.2 * σ_img, y_mid + 3.2 * σ_img, 120)
+    bump_out = 0.42 * np.exp(-0.5 * ((ys_out - y_mid) / σ_img) ** 2)
+    ax.fill_betweenx(ys_out, x_wall + bump_out, x_wall, color=WARM, alpha=0.75)
+    ax.plot(x0, f_sat(x0), "o", c=CRASH, ms=7, zorder=5)
+    ax.set_title(f"{name}:  |f′(x₀)| = {slope:.2f}  →  σ_y ≈ {σ_y:.2f}",
+                 fontsize=12)
+    ax.set_xlim(x_wall, 2.6); ax.set_ylim(y_floor, 1.55)
+    ax.set_xlabel("input x")
+    despine(ax)
+axes[0].set_ylabel("output f(x)")
+fig.suptitle("same input noise σ_x = 0.3 — the slope decides what comes out",
+             fontsize=12, y=1.0)
 fig.tight_layout()
 plt.show()
 ```
 
+How good is the linearized formula?  Check it the honest way — push actual
+samples through and compare:
+
+```{python}
+#| label: check-linearization
+rng_check = np.random.default_rng(0)
+for x0, name in operating_points:
+    x_draws = rng_check.normal(x0, σ_x, 50_000)     # x ~ 𝒩(x₀, σₓ²)
+    σ_y_mc = f_sat(x_draws).std()                   # the true output noise
+    σ_y_lin = abs(f_sat_slope(x0)) * σ_x            # the formula's claim
+    print(f"{name:>5}:  Monte-Carlo σ_y = {σ_y_mc:.3f}   vs   |f′|·σₓ = {σ_y_lin:.3f}")
+```
+
+Close, but not equal — and the gap is the lesson.  The formula is the right
+*first instinct*: exact for a line, good for small noise.  But a $\pm
+2\sigma_x$ band is already wide enough to feel the curvature (the steep
+point's true noise is *less* than the formula says, because the curve
+saturates inside the band), and the output bells are not really Gaussian —
+the steep panel's is visibly skewed by the bend.  When the input
+distribution is wide, or fat-tailed, or the function bends, there is only
+one honest method left: **sample** the input distribution, push every draw
+through $f$, and read the output distribution off the samples.  That is
+Monte-Carlo, and it is where the next page begins.
+
 ::: {.callout-note icon=false}
 ## Why This Matters for Risk
-Portfolio P&L is a *function* of returns.  Propagating return uncertainty to P&L
-is exactly this push-forward — and because the function is multivariate, the
-**joint** dependence of the inputs controls the joint tail of the output.  Keeping
-that dependence is what the [next page](03-noise-and-propagation.qmd) is about.
+
+Portfolio P&L is a *function* of returns.  Propagating return uncertainty to
+P&L uncertainty is exactly this push-forward — with one crucial upgrade:
+the function is **multivariate**, so what enters is not one distribution but
+a *joint* one.  The derivative bookkeeping generalises (the Jacobian
+determinant $\lvert\det J\rvert$ replaces $\lvert f'\rvert$ — the
+[same object](../gaussianization/01-change-of-variables.qmd) Gaussianization
+tracks layer by layer), but a new failure mode appears that has no univariate
+analogue: getting every marginal right while destroying the **dependence**
+between the inputs.  The [dependence chapter](../dependence/index.qmd) spent
+a whole ladder measuring that structure; the
+[next page](03-noise-and-propagation.qmd) shows what happens to a portfolio
+when a scenario generator drops it.
 :::

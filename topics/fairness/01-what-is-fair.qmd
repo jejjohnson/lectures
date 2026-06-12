@@ -13,26 +13,106 @@ plotting.set_style("notes")
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.stats import pearsonr
+
+GREEN = plotting.PALETTE["green"]
 ```
 
-## The Itch — Neutral on Paper, Not in Fact
+Start with a sign-off that every model-risk team has seen.
 
-A model gets signed off as *neutral* because it passes the usual check:
-near-zero correlation with the sensitive variable $S$.  But correlation only
-sees straight lines.  An honest audit — a measure that catches *any* shape —
-shows the score bending with $S$ all along.
+> *"The model is fair.  It doesn't even use the protected attribute."*
 
-This is the fairness mirror of the dependence chapter's [bad
-morning](../dependence/01-correlation.qmd): **the number said safe, the
-dependence was there.**
+Then an audit shows its scores still track that attribute — cleanly enough
+to reconstruct it.  Nobody lied: the attribute really was deleted from the
+inputs, and the standard correlation check really did come back near zero.
+**The number said neutral.  The dependence was there.**  This chapter is
+about closing the distance between those two sentences — and the tools are
+exactly the dependence measures of
+[the dependence chapter](../dependence/index.qmd), now pointed at a model's
+own output.
+
+## What Counts as Unfair?
+
+A model is **unfair** when its decision would change if we flipped only a
+**protected attribute** $S$ — sex, race, age — and held everything else
+fixed.  Credit, hiring, bail, insurance: the score should track *risk*, not
+*who you are*.  Stated as a property of the prediction $\hat y$, the goal is
+
+$$
+\hat y \;\perp\; S
+\qquad\Longleftrightarrow\qquad
+\operatorname{Dep}(\hat y, S) = 0 ,
+$$
+
+independence between the score and the attribute — the criterion known as
+**statistical parity**.  The left side is a moral requirement; the right
+side is a *measurable quantity*.  That equivalence is the whole chapter:
+once "fair" is a dependence, it can be audited with a number and trained
+against with a penalty.
+
+*(Other fairness criteria — equalized odds, sufficiency — condition on the
+true outcome $y$ before demanding independence.  They are different and
+sometimes mutually incompatible choices, but every one of them is a
+dependence statement; we work with independence because it maps directly
+onto the tools we have.)*
+
+## The Three Layers
+
+Where does the unfairness physically live?  Three layers, two arrows:
+
+```{python}
+#| label: fig-three-layers
+#| fig-cap: "The anatomy of an unfair model. The sensitive attribute S leaks into the features X (zip code, occupation, sector); the model faithfully passes whatever is in X through to the prediction ŷ. The audit — and the training penalty — both attack the dashed link: is ŷ independent of S?"
+from matplotlib.patches import FancyBboxPatch, FancyArrowPatch
+
+fig, ax = plt.subplots(figsize=(10.5, 3.4))
+ax.set_xlim(0, 10); ax.set_ylim(0, 4.8); ax.axis("off")
+boxes = [(1.7, "S", "sensitive\n(sex, race, age)", CRASH),
+         (5.0, "X", "features / data\n(carry proxies for S)", COOL),
+         (8.3, "ŷ", "prediction\n(the decision)", GREEN)]
+for x0, sym, sub, col in boxes:
+    ax.add_patch(FancyBboxPatch((x0 - 0.9, 1.5), 1.8, 1.0,
+                                boxstyle="round,pad=0.08",
+                                fc="white", ec=col, lw=2.6))
+    ax.text(x0, 2.0, sym, ha="center", va="center", fontsize=21, color=col,
+            fontweight="bold")
+    ax.text(x0, 0.85, sub, ha="center", va="center", fontsize=10, color=INK)
+for (x0, x1, lbl) in [(2.7, 4.0, "leaks"), (6.0, 7.3, "model")]:
+    ax.add_patch(FancyArrowPatch((x0, 2.0), (x1, 2.0), arrowstyle="-|>",
+                                 mutation_scale=18, lw=2, color=INK))
+    ax.text((x0 + x1) / 2, 2.28, lbl, ha="center", fontsize=10, color=INK)
+ax.add_patch(FancyArrowPatch((8.3, 2.55), (1.7, 2.55),
+                             connectionstyle="arc3,rad=0.30",
+                             arrowstyle="-|>", mutation_scale=18, lw=2,
+                             ls="--", color=WARM))
+ax.text(5.0, 4.55, "fairness audit:  is  ŷ  independent of  S ?",
+        ha="center", fontsize=13, color=WARM, fontweight="bold")
+plt.show()
+```
+
+The bias hides in the *arrows*, not the boxes.  $S$ **leaks** into the
+features — through zip code, occupation, hours worked, sector membership —
+and the model, doing exactly its job, passes whatever predictive signal is
+in $X$ through to $\hat y$.  Deleting the $S$ column removes a box, not the
+arrows.  The audit (and later the training penalty) targets the dashed
+link directly: measure $\operatorname{Dep}(\hat y, S)$, and drive it down.
+
+## The Itch — The Standard Check Is Blind
+
+So we need a number for the dashed link.  The standard sign-off uses the
+cheapest one — Pearson correlation between score and attribute — and that
+choice is exactly where the opening story goes wrong.  Correlation sees
+straight lines; a score can bend with $S$ and still correlate at zero.
+This is the fairness mirror of the dependence chapter's
+[bad morning](../dependence/01-correlation.qmd): the number said safe, the
+dependence was there.
 
 ```{python}
 #| label: fig-fair-hook
-#| fig-cap: "Left: predictions look neutral — Pearson ≈ 0 against S. Right: binned, the score bends with S all along, and CKA reports strong dependence."
+#| fig-cap: "Left: the standard check — Pearson ≈ 0 against S, sign-off granted. Right: bin S and plot the mean score per bin — the score bends with S all along, and CKA (the kernel measure from the dependence chapter) reports the dependence the correlation missed."
 rng = np.random.default_rng(7)
 n = 700
 S = rng.normal(0, 1, n)
-score = (S**2 - 1) + 0.4 * rng.normal(0, 1, n)  # nonlinear, ~zero correlation
+score = (S**2 - 1) + 0.4 * rng.normal(0, 1, n)  # depends on S — but curvily
 
 pear = pearsonr(score, S)[0]
 ck = cka_rbf(score, S)
@@ -61,17 +141,33 @@ fig.tight_layout()
 plt.show()
 ```
 
+The fix is not a better lawyer — it is a better measure.  Every audit in
+this chapter will use one that sees curves
+([CKA](../dependence/02-kernels-hsic.qmd), the normalized HSIC), and every
+training method will be graded against it.
+
 ## The Objective — The Whole Chapter in One Line
 
-```
-loss = fit(y_hat, y) + mu * Dep(y_hat, S)
-```
+Perfect neutrality usually costs accuracy, so we do not demand it — we
+**price** it:
 
-`fit` is your usual prediction error.  $\operatorname{Dep}$ is any dependence
-measure from [Chapter 1](../dependence/index.qmd), now applied between the
-*predictions* and $S$.  The weight $\mu$ trades accuracy against neutrality.
-The [ladder](03-fair-kernel-learning.qmd) is just a sequence of choices for
-$\operatorname{Dep}$, from cheap-and-blind to flexible-and-expensive.
+$$
+\text{loss} \;=\;
+\underbrace{\text{fit}(\hat y, y)}_{\text{predict well}}
+\;+\; \mu \cdot
+\underbrace{\operatorname{Dep}(\hat y, S)}_{\text{stay blind to } S} .
+$$
+
+`fit` is your usual prediction error.  $\operatorname{Dep}$ is any
+dependence measure from [the dependence chapter](../dependence/index.qmd),
+applied between the *predictions* and $S$.  The weight $\mu$ trades accuracy
+against neutrality.  The [ladder of removal](03-fair-kernel-learning.qmd)
+is just a sequence of choices for $\operatorname{Dep}$, from cheap-and-blind
+to flexible-and-expensive — and this objective is, structurally, the same
+move as the uncertainty chapter's
+[regression recipe](../uncertainty/04-regression-recipe.qmd): change what
+you want from the model by changing the *loss*, then let the optimizer do
+the negotiating.
 
 ::: {.callout-note icon=false}
 ## Background — The Penalty Is a Lagrangian
@@ -84,18 +180,19 @@ $$
 \quad\text{s.t.}\quad \operatorname{Dep}(\hat y_\theta, S) = 0.
 $$
 
-Forming the Lagrangian turns the constraint into the additive penalty we train
-with,
+Forming the Lagrangian turns the constraint into the additive penalty we
+train with,
 
 $$
 \mathcal{L}(\theta) = \mathbb{E}\,[\,\ell(\hat y_\theta, y)\,]
 + \mu\,\operatorname{Dep}(\hat y_\theta, S),
 $$
 
-where $\mu$ is the Lagrange multiplier.  Sweeping $\mu$ from $0$ to $\infty$
-traces the **Pareto frontier** between accuracy and neutrality — exactly the
-[trade-off curve](03-fair-kernel-learning.qmd) this chapter builds to.  There is
-no single "fair model"; there is a curve, and $\mu$ chooses your operating point.
+where $\mu$ is the Lagrange multiplier.  Sweeping $\mu$ from $0$ to
+$\infty$ traces the **Pareto frontier** between accuracy and neutrality —
+exactly the [trade-off curve](03-fair-kernel-learning.qmd) this chapter
+builds to.  There is no single "fair model"; there is a curve, and $\mu$
+chooses your operating point.
 :::
 
 ## Two Framings, One Operation
@@ -104,20 +201,23 @@ The same objective wears two names in finance:
 
 - **Fairness.** $S$ is a protected attribute (sex, race, age).  Regulation —
   the EU's [GDPR](https://gdpr.eu/) Art. 22 on automated decisions, and the
-  **EU AI Act**, which classes credit scoring and CV screening as *high-risk* —
-  requires that decisions not depend on such attributes.  A credit model must
-  approve on ability to repay, not on group membership.
-- **Factor-neutrality.** $S$ is a market or sector factor (beta).  A strategy
-  that must be *market-neutral* should produce returns that don't load on the
-  factor it is hedging.
+  **EU AI Act**, which classes credit scoring and CV screening as
+  *high-risk* — requires that decisions not depend on such attributes.  A
+  credit model must approve on ability to repay, not on group membership.
+- **Factor-neutrality.** $S$ is a market or sector factor (beta).  A
+  strategy that must be *market-neutral* should produce returns that don't
+  load on the factor it is hedging.
 
-"Don't discriminate" and "don't load on the factor I'm hedging" are the same
-maths: drive $\operatorname{Dep}(\hat y, S)$ to zero.
+"Don't discriminate" and "don't load on the factor I'm hedging" are the
+same maths: drive $\operatorname{Dep}(\hat y, S)$ to zero.  The
+[credit lab](labs/lab-jobB-neutralize-credit.qmd) and the
+[beta-neutral lab](labs/lab-jobC-beta-neutral.qmd) run the *identical code*
+on both problems.
 
 ::: {.eli5}
 **One-liner.**  Fair learning doesn't *hide* the sensitive variable — it adds
 "depend on $S$" to the bill, so the optimizer chooses to stop using it.
 :::
 
-Next: why the obvious fix — just delete $S$ — [doesn't
-work](02-bias-and-proxies.qmd).
+Next: why the obvious fix — just delete $S$ —
+[doesn't work](02-bias-and-proxies.qmd).

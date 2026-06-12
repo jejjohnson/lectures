@@ -7,11 +7,16 @@ title: "Correlation: Pearson, Spearman, and the Blind Spots"
 import sys, pathlib
 sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
 from lectures import plotting, datasets
-from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
+from lectures.plotting import INK, COOL, WARM, CRASH, GRID, despine, annotate_box
+from lectures.measures import distance_correlation, mutual_information_xy
 plotting.set_style("notes")
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.stats import pearsonr, spearmanr
+from scipy.stats import gaussian_kde, pearsonr, rankdata, spearmanr
+import einx                      # linear algebra with the axes spelled out
+from jaxtyping import Float      # shape annotations: Float[Array, "n_days"]
+
+Array = np.ndarray
 ```
 
 ## The Motivating Failure
@@ -164,6 +169,43 @@ fig.tight_layout()
 plt.show()
 ```
 
+### Seeing the Transform
+
+Spearman is usually *described* ("correlate the ranks") but rarely *shown*.
+Here is the transform made visible.  Take a compounding payoff — the kind of
+multiplicative growth that bends every scatter plot in finance — and plot the
+data twice: raw, and after replacing each value by its rank.
+
+```{python}
+#| label: fig-rank-transform
+#| fig-cap: "The rank transform, seen. Left: a compounding payoff bends the relationship, so Pearson under-reports. Right: ranking each variable straightens the curve — Spearman is literally Pearson computed on this panel."
+rng = np.random.default_rng(11)
+n = 400
+x = rng.normal(0, 1, n)
+# A compounding payoff: y = exp(0.9·x) · (1 + 0.18·ε) — multiplicative growth
+# bends the relationship, but never changes its direction (monotone).
+y = np.exp(0.9 * x) * (1 + 0.18 * rng.normal(size=n))
+
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.2))
+axL.scatter(x, y, s=12, c=WARM, alpha=0.5, edgecolors="none")
+axL.set_title("Raw data — compounding payoff", fontsize=12)
+annotate_box(axL, 0.5, -0.10, f"Pearson r = {pearsonr(x, y)[0]:.2f}")
+axR.scatter(rankdata(x), rankdata(y), s=12, c=COOL, alpha=0.5, edgecolors="none")
+axR.set_title("After the transform — rank(x) vs rank(y)", fontsize=12)
+annotate_box(axR, 0.5, -0.10,
+             f"Pearson on ranks = Spearman = {spearmanr(x, y)[0]:.2f}")
+for ax in (axL, axR):
+    ax.set_xticks([]); ax.set_yticks([])
+    despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+The bend costs Pearson about a quarter of its value; ranks recover it because
+the relationship, however curved, never changes direction.  This is the cleanest
+possible illustration that Spearman is *not a new measure* — it is the same
+measure after a different transform.
+
 ### The Seed of the Abstraction
 
 Notice what just happened.  Pearson and Spearman differ in **one slot only**:
@@ -177,20 +219,187 @@ general   = compare( transform(x)  ,  transform(y)  )
 Both compare the data directly — **neither needs the distribution**.  This is
 the first of our two roads.
 
+### The Two Roads, On One Dataset
+
+The fork the whole chapter rests on can be photographed.  Take the banks and
+ask the question both ways: **Road 1** transforms the *points* and compares
+them (here: ranks); **Road 2** fits the *density* and measures how far it sits
+from the independent reference $p(a)\,p(b)$ — in bits (the subject of the
+[mutual information page](03-mutual-information.qmd)).
+
+```{python}
+#| label: fig-two-roads-data
+#| fig-cap: "The same data, both roads. Left: the banks. Centre: Road 1 — compare the rank-transformed points directly, no density anywhere. Right: Road 2 — the fitted joint density (orange) against the independence reference p(a)·p(b) (blue contours); the gap between the two surfaces, measured in bits, is the mutual information."
+a2, b2, _ = datasets.two_banks(n=2000)
+
+# Road 1 — transform the points, then compare them directly (no density).
+rank_a = rankdata(a2)      # transform: each day → its rank, 1 … n_days
+rank_b = rankdata(b2)
+spearman_ρ = pearsonr(rank_a, rank_b)[0]    # ρₛ = corr(rank(a), rank(b))
+
+# Road 2 — fit the density, then measure the gap from independence.
+grid_pts = np.linspace(-4.2, 2.8, 120)
+XX, YY = np.meshgrid(grid_pts, grid_pts)
+# p̂(a, b): kernel density estimate of the JOINT, evaluated on the grid
+joint_kde = gaussian_kde(np.vstack([a2, b2]))
+p_joint = joint_kde(np.vstack([XX.ravel(), YY.ravel()])).reshape(XX.shape)
+# p̂(a)·p̂(b): the INDEPENDENT reference — the product of the two marginals
+p_a = gaussian_kde(a2)(grid_pts)     # marginal density of a, on the grid
+p_b = gaussian_kde(b2)(grid_pts)
+p_independent = einx.multiply("i, j -> j i", p_a, p_b)   # outer product, (n_grid, n_grid)
+# MI = ∫∫ p(a,b) · log₂[ p(a,b) / (p(a)·p(b)) ] da db     [bits]
+mi_bits = mutual_information_xy(a2, b2) / np.log(2)      # helper returns nats → ÷ ln 2
+
+fig, (ax0, ax1, ax2) = plt.subplots(1, 3, figsize=(12.5, 4.0))
+ax0.scatter(a2, b2, s=8, c=INK, alpha=0.35, edgecolors="none")
+ax0.set_title("The data", fontsize=12, fontweight="bold")
+ax1.scatter(rank_a, rank_b, s=8, c=COOL, alpha=0.35, edgecolors="none")
+ax1.set_title(f"Road 1 · compare transforms\ncorr(rank a, rank b) = "
+              f"{spearman_ρ:.2f}", fontsize=11)
+ax2.contourf(XX, YY, p_joint, levels=10, cmap="Oranges")
+ax2.contour(XX, YY, p_independent, levels=6, colors=COOL, linewidths=1.2)
+ax2.set_title(f"Road 2 · through the density\nMI = {mi_bits:.2f} bits", fontsize=11)
+for ax in (ax0, ax1, ax2):
+    ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+Road 1 never touches a density; Road 2 is *all* density.  Both confirm the
+banks are strongly dependent — they will disagree only when the dependence
+hides where transforms cannot reach but the density can (and vice versa).
+
 ---
 
 ## Rung 3 · Distance Correlation — Zero Only If Truly Independent
 
 Spearman still misses the U-shape because it checks *order*, not *dependence*.
-Distance correlation changes the distance metric rather than just the transform:
+Distance correlation keeps the template but swaps in a far richer transform:
+**one day becomes its distances to every other day**.  Form the pairwise
+distance matrices and double-center them,
 
 $$
-dCor(X, Y) \in [0, 1], \quad dCor = 0 \iff X \perp Y.
+A_{ij} = |x_i - x_j| \;(\text{centered}), \qquad
+B_{ij} = |y_i - y_j| \;(\text{centered}),
 $$
 
-That last property — zero *exactly* under independence — is what separates
-distance correlation from Pearson and Spearman.  The U-shape above scores
-$dCor \approx 0.62$ while both classic measures read near zero.
+then correlate *those*:
+
+$$
+\operatorname{dCor}(X, Y)
+  = \frac{\operatorname{dCov}(X, Y)}{\sqrt{\operatorname{dVar}(X)\,\operatorname{dVar}(Y)}}
+  \in [0, 1],
+\qquad
+\operatorname{dCov}^2 = \overline{A_{ij} B_{ij}},
+$$
+
+with $\operatorname{dCor} = 0 \iff X \perp Y$.  That last property — zero
+*exactly* under independence — is what separates distance correlation from
+Pearson and Spearman.  The U-shape above scores $dCor \approx 0.62$ while both
+classic measures read near zero.
+
+### The Transform, Seen
+
+Why do distances see what values cannot?  Sort the convex pair by $x$ and draw
+all pairwise distances as matrices.  The $x$-distances form a smooth gradient
+(neighbours in $x$ are close); the $y$-distances show the V-shape as a
+**cross** — days on opposite arms of the V have similar $|u|$ and hence
+similar $v$.  The structure survives the transform, with no density in sight.
+
+```{python}
+#| label: fig-dcor-transform
+#| fig-cap: "The distance transform. Left: one anchor day (red) measured against every other day. Centre and right: all pairwise distances in X and in Y, days sorted by x. The smooth gradient in X and the cross in Y are the V-shape, re-encoded as distances. The red line marks the anchor day's row."
+def convex_clean(
+    n: int = 120, noise: float = 0.08, seed: int = 42
+) -> tuple[Float[Array, "n_days"], Float[Array, "n_days"]]:
+    # the convex pair v = |u| + noise·ε, with the noise turned down
+    # so the matrix structure below stays visible
+    rng = np.random.default_rng(seed)
+    u = rng.normal(0, 1, n)
+    return u, np.abs(u) + noise * rng.normal(0, 1, n)
+
+
+u_c, v_c = convex_clean()
+order = np.argsort(u_c)            # sort days by u so the matrices are readable
+us, vs = u_c[order], v_c[order]
+
+# The transform: every PAIR of days (i, j) becomes a distance.
+# Aᵢⱼ = |xᵢ − xⱼ|   and   Bᵢⱼ = |yᵢ − yⱼ|        shape: (n_days, n_days)
+A_mat = np.abs(einx.subtract("i, j -> i j", us, us))
+B_mat = np.abs(einx.subtract("i, j -> i j", vs, vs))
+anchor = 12   # one example day, highlighted in red
+
+fig, (ax0, ax1, ax2) = plt.subplots(1, 3, figsize=(12.5, 4.0))
+ax0.scatter(us, vs, s=14, c=WARM, alpha=0.45, edgecolors="none")
+ax0.scatter([us[anchor]], [vs[anchor]], s=70, c=CRASH, zorder=5)
+for j in range(0, len(us), 14):
+    ax0.plot([us[anchor], us[j]], [vs[anchor], vs[j]], color=GRID, lw=0.8, zorder=1)
+ax0.set_title("One day vs every other day", fontsize=11)
+despine(ax0)
+for ax, M, ttl, cmap in [(ax1, A_mat, "all pairwise distances in X", "Blues"),
+                         (ax2, B_mat, "all pairwise distances in Y", "Oranges")]:
+    ax.imshow(M, cmap=cmap, origin="lower")
+    ax.set_title(ttl, fontsize=11)
+    ax.axhline(anchor, color=CRASH, lw=1.2)
+for ax in (ax0, ax1, ax2):
+    ax.set_xticks([]); ax.set_yticks([])
+fig.tight_layout()
+plt.show()
+```
+
+### Then It Is Pearson Again
+
+Here is the part textbooks bury: after the transform, distance correlation is
+*literally the same move as Pearson* — a plain correlation, computed on the
+centered distance entries.  Scatter $A_{ij}$ against $B_{ij}$ and the V-shape,
+invisible to Pearson on the raw values, becomes an ordinary linear trend:
+
+```{python}
+#| label: fig-dcor-compare
+#| fig-cap: "Pearson, after the transform. Each dot is a pair of days (i, j), plotted by its centered distance in X against its centered distance in Y. For the convex pair (left) the correlation of these entries is exactly dCor² — dependence of any shape becomes a linear trend in distance space. For an independent pair (right) the cloud is structureless."
+rng = np.random.default_rng(3)
+n_pairs = 300
+u_p, v_p = datasets.convex_payoff(n=n_pairs)
+xi, yi = rng.normal(size=n_pairs), rng.normal(size=n_pairs)
+
+
+def centered_distances(z: Float[Array, "n_days"]) -> Float[Array, "n_days n_days"]:
+    """The dCor transform: double-centered pairwise distances.
+
+    Dᵢⱼ = |zᵢ − zⱼ|                      [same units as z]
+    Aᵢⱼ = Dᵢⱼ − D̄ᵢ. − D̄.ⱼ + D̄..         (row, column, grand means removed)
+    """
+    D = np.abs(einx.subtract("i, j -> i j", z, z))   # (n_days, n_days)
+    row_mean = einx.mean("i j -> i", D)              # D̄ᵢ. — day i's mean distance
+    col_mean = einx.mean("i j -> j", D)              # D̄.ⱼ — day j's mean distance
+    A = einx.subtract("i j, i -> i j", D, row_mean)
+    A = einx.subtract("i j, j -> i j", A, col_mean)
+    return A + D.mean()                              # add back the grand mean D̄..
+
+
+# scatter a random subsample of the n² matrix entries (4 000 of 90 000)
+sub = rng.choice(n_pairs * n_pairs, 4000, replace=False)
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.2))
+for ax, (x_, y_), name, col in [(axL, (u_p, v_p), "Convex pair", WARM),
+                                (axR, (xi, yi), "Independent pair", COOL)]:
+    Ac, Bc = centered_distances(x_).ravel()[sub], centered_distances(y_).ravel()[sub]
+    ax.scatter(Ac, Bc, s=6, c=col, alpha=0.3, edgecolors="none")
+    ax.set_title(name, fontsize=12)
+    annotate_box(ax, 0.5, -0.10,
+                 f"corr of centered distances = {pearsonr(Ac, Bc)[0]:.2f}"
+                 f"   ·   dCor = {distance_correlation(x_, y_):.2f}")
+    ax.set_xlabel("centered |xi − xj|"); ax.set_ylabel("centered |yi − yj|")
+    ax.set_xticks([]); ax.set_yticks([])
+    despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+Check the numbers: the correlation of the centered distances ($0.28$) is
+$0.52^2$ — exactly $\operatorname{dCor}^2$, as the definition above promises.
+One template, three rungs so far; the transform does all the work.  The
+[next page](02-kernels-hsic.qmd) takes the final step on this road: swap
+*distance* for *kernel similarity* and the same construction becomes HSIC.
 
 ```{python}
 #| label: fig-dcor-check
@@ -263,11 +472,11 @@ $$
 
 **Dependence is the failure of that equation** — the gap between the real joint
 and the product of marginals.  Measuring that gap precisely, in bits, is the
-job of mutual information on the [next page](02-mutual-information.qmd).
+job of [mutual information](03-mutual-information.qmd), later in the chapter.
 
 ```{python}
 #| label: fig-independence-gap
-#| fig-cap: "Dependence is the gap between the true joint (left) and the independent reference (centre). Right: the signed difference, red where the joint exceeds the product."
+#| fig-cap: "Dependence is the gap between the joint and the independence reference — with the marginals attached, seaborn-jointplot style. Left: the true joint p(x, y) with its two marginals. Centre: the independent reference p(x)·p(y) — built from the SAME two marginals (look at the side panels: identical), yet a completely different joint. Right: the signed gap, red where the joint holds more mass than independence allows. Marginals lie; the joint is where dependence lives."
 from scipy.ndimage import gaussian_filter
 
 rng = np.random.default_rng(11)
@@ -276,37 +485,56 @@ x = rng.normal(0, 1, M)
 y = 0.55 * x - 0.55 * (x**2 - 1) + rng.normal(0, 0.55, M)
 box = [[-3.2, 3.2], [-4.2, 2.6]]
 
-Hj, xe, ye = np.histogram2d(x, y, bins=60, range=box, density=True)
-px = Hj.sum(1); px /= px.sum()
-py = Hj.sum(0); py /= py.sum()
-Pj = Hj / Hj.sum()
-Pi = np.outer(px, py)
-Sj = gaussian_filter(Pj, 1.2)
-Si = gaussian_filter(Pi, 1.2)
-diff = Sj - Si
-ext = [xe[0], xe[-1], ye[0], ye[-1]]
+# histogram → joint probabilities; marginals are the row / column sums
+H_joint, x_edges, y_edges = np.histogram2d(x, y, bins=60, range=box, density=True)
+P_joint = H_joint / H_joint.sum()                  # p(x, y), (60, 60)
+p_x = einx.sum("i j -> i", P_joint)                # marginal p(x), (60,)
+p_y = einx.sum("i j -> j", P_joint)                # marginal p(y), (60,)
+P_indep = einx.multiply("i, j -> i j", p_x, p_y)   # independence: p(x)·p(y)
 
-fig, axes = plt.subplots(1, 3, figsize=(13, 3.8))
-for ax, (M_data, title, cmap) in zip(axes, [
-    (Sj, "True joint  p(x, y)", "magma"),
-    (Si, "Independent reference  p(x)·p(y)", "magma"),
-    (diff, "Gap = dependence", "RdBu_r"),
-]):
-    if cmap == "RdBu_r":
-        v = np.abs(M_data).max()
-        ax.imshow(M_data.T, origin="lower", extent=ext, aspect="auto",
-                  cmap=cmap, vmin=-v, vmax=v)
-    else:
-        ax.imshow(M_data.T, origin="lower", extent=ext, aspect="auto",
-                  cmap=cmap)
-    ax.set_title(title, fontsize=11)
-    ax.set_xticks([]); ax.set_yticks([])
+S_joint = gaussian_filter(P_joint, 1.2)            # light smoothing for display
+S_indep = gaussian_filter(P_indep, 1.2)
+gap = S_joint - S_indep
+extent = [x_edges[0], x_edges[-1], y_edges[0], y_edges[-1]]
+x_centers = 0.5 * (x_edges[:-1] + x_edges[1:])
+y_centers = 0.5 * (y_edges[:-1] + y_edges[1:])
+
+fig = plt.figure(figsize=(14, 4.8))
+outer = fig.add_gridspec(1, 3, wspace=0.22, width_ratios=[1.12, 1.12, 1])
+
+
+def joint_with_marginals(spec, P, title):
+    """A seaborn-jointplot-style block: main heatmap + marginal bars."""
+    inner = spec.subgridspec(2, 2, width_ratios=[4, 1], height_ratios=[1, 4],
+                             hspace=0.06, wspace=0.06)
+    ax_top = fig.add_subplot(inner[0, 0])
+    ax_main = fig.add_subplot(inner[1, 0])
+    ax_right = fig.add_subplot(inner[1, 1])
+    ax_main.imshow(P.T, origin="lower", extent=extent, aspect="auto", cmap="magma")
+    ax_top.fill_between(x_centers, p_x, color=COOL, alpha=0.85, lw=0)
+    ax_right.fill_betweenx(y_centers, p_y, color=WARM, alpha=0.85, lw=0)
+    ax_top.set_title(title, fontsize=11)
+    for ax in (ax_top, ax_main, ax_right):
+        ax.set_xticks([]); ax.set_yticks([])
+    for ax in (ax_top, ax_right):
+        for sp in ax.spines.values():
+            sp.set_visible(False)
+
+
+joint_with_marginals(outer[0], S_joint, "true joint  p(x, y)")
+joint_with_marginals(outer[1], S_indep, "independent reference  p(x)·p(y)")
+
+ax_gap = fig.add_subplot(outer[2])
+v = np.abs(gap).max()
+ax_gap.imshow(gap.T, origin="lower", extent=extent, aspect="auto",
+              cmap="RdBu_r", vmin=-v, vmax=v)
+ax_gap.set_title("gap = dependence", fontsize=11)
+ax_gap.set_xticks([]); ax_gap.set_yticks([])
 
 fig.suptitle(
-    "Dependence is the gap between how things move and how they'd move if unrelated",
+    "Same marginals, different joints — the gap is the dependence",
     fontsize=12, fontweight="bold", y=1.03,
 )
-fig.tight_layout()
 plt.show()
 ```
 
@@ -417,7 +645,7 @@ convex pair nearly independent (false).  Distance correlation sees both
 correctly — but for *why* the banks are more dangerous than their Pearson
 suggests, and to properly score the convex case, we need to measure the gap
 from independence in information units: see
-[Mutual Information](02-mutual-information.qmd).
+[Mutual Information](03-mutual-information.qmd).
 
 ::: {.eli5}
 **One-liner recap.**  Pearson asks "do they rise together in a straight line?";

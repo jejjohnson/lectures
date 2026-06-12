@@ -47,6 +47,17 @@ nbclient = "*"
 # the topic figures with the author's real package, not a stand-in.
 [feature.docs.pypi-dependencies]
 rbig = { git = "https://github.com/jejjohnson/rbig.git" }
+# Teaching-code style: einx spells out the axes of every linear-algebra op,
+# jaxtyping documents array shapes in function signatures (numpy-compatible).
+einx = ">=0.3"
+jaxtyping = ">=0.2"
+# Keras (JAX CPU backend) renders the neural-network uncertainty figures —
+# same stack as keras-fairkl in Module 4, kept CPU-only so docs CI stays light.
+keras = ">=3.5"
+jax = ">=0.4.30"
+# The author's fair kernel learning package — renders the Module 4 figures with
+# the real penalty implementation, not a stand-in.
+fairkl = { git = "https://github.com/jejjohnson/keras-fairkl.git" }
 
 # --- Opt-in env for the live code demos (heavy: jax/torch/tf land here) ---
 # Kept out of the default + docs envs so `pixi install` and the docs CI stay light.

@@ -1,0 +1,462 @@
+---
+title: "Predictive Bands: Noise & Ensembles"
+subtitle: "Act 2 · Doubt Around a Prediction"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, BAND, despine, annotate_box, mark_event
+from rbig import AnnealedRBIG
+plotting.set_style("notes")
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import einx                      # linear algebra with the axes spelled out
+from jaxtyping import Float      # shape annotations: Float[Array, "n_days"]
+
+Array = np.ndarray
+GREEN = plotting.PALETTE["green"]
+```
+
+[Act 1](03-noise-and-propagation.qmd) sampled the *world*: scenarios for a
+whole portfolio.  Act 2 asks about a single model: how wrong is
+$\hat y = f(x)$ — **here, at this $x$**?  Every $f$ on this page is a small
+neural network, fitted by the
+[regression recipe](04-regression-recipe.qmd) — data, model, loss,
+optimizer — and the method for doubting it is the same as Act 1's: ask what
+you don't know, then estimate it by *sampling* — no posteriors, no
+variational inference.  But two genuinely different doubts hide in the
+question, and they demand different tools:
+
+$$
+\text{predictive variance} =
+\underbrace{\sigma_{\text{aleatoric}}^2}_{\text{the world's noise}} +
+\underbrace{\sigma_{\text{epistemic}}^2}_{\text{the model's doubt}}
+$$
+
+- **Aleatoric** — *how noisy is the world here?*  Irreducible: more data
+  will not shrink it.  The response is to **predict it** — and a network
+  can be trained to predict its own noise.
+- **Epistemic** — *has the model even seen data here?*  Curable: it shrinks
+  as data grows.  The response is to **admit it** — and a committee of
+  networks will confess what a single one cannot.
+
+The litmus test that separates them: **would more data shrink it?**
+Yes → epistemic.  No → aleatoric.
+
+Act 2's running character from the
+[chapter opener](01-uncertainty-is-probability.qmd#two-questions-two-acts)
+was built to need both: the noise *grows* to the right (aleatoric), and the
+data has a *hole* in the middle (epistemic).
+
+```{python}
+#| label: make-character
+# y = sin(1.3·x) + σ(x)·ε, observed only OUTSIDE |x| < 1.4,
+# with noise σ(x) rising from 0.05 (left) to 0.50 (right)
+rng = np.random.default_rng(5)
+half = 30
+x_obs = np.sort(np.concatenate([rng.uniform(-3.2, -1.4, half),
+                                rng.uniform(1.4, 3.2, half)]))
+σ_true = 0.05 + 0.45 * (x_obs + 3.2) / 6.4
+y_obs = np.sin(1.3 * x_obs) + σ_true * rng.standard_normal(x_obs.size)
+x_grid = np.linspace(-4.0, 4.0, 400)
+```
+
+## Tool A · Predict the Noise
+
+Treat the world's noise as a *target of its own*.  Instead of a network
+that outputs one number — the mean — give it **two outputs per input**: the
+prediction $\mu(x)$ *and* its own noise level $\sigma(x)$:
+
+$$
+y = \mu(x) + \sigma(x)\,\varepsilon, \qquad \varepsilon \sim \mathcal N(0, 1).
+$$
+
+What loss trains such a thing?  Exactly the one the
+[recipe page](04-regression-recipe.qmd#ingredient-3--loss) derived when it
+let the noise depend on $x$ — the **Gaussian negative log-likelihood**:
+
+$$
+L(\theta) = \frac{1}{n}\sum_i \left[
+\frac{\big(y_i - \mu(x_i)\big)^2}{2\,\sigma(x_i)^2} + \log \sigma(x_i)
+\right].
+$$
+
+Read its two terms as incentives: a large error is *forgiven* where the
+network declares $\sigma(x)$ big — but declaring big $\sigma$ everywhere is
+*taxed* by the $\log\sigma$ term.  The only way to make both terms happy is
+to put the doubt where the noise actually lives.  The loss **is** the noise
+model, trained.
+
+```{python}
+#| label: keras-toolkit
+import os
+os.environ["KERAS_BACKEND"] = "jax"          # Keras 3 on the CPU JAX backend
+import keras
+from keras import layers
+
+
+def make_mlp(n_out: int = 1, seed: int = 0) -> keras.Model:
+    """x → Dense(64, tanh) → Dense(64, tanh) → Dense(n_out) — the recipe's net."""
+    keras.utils.set_random_seed(seed)        # reproducible weight init
+    return keras.Sequential([
+        layers.Dense(64, activation="tanh"),
+        layers.Dense(64, activation="tanh"),
+        layers.Dense(n_out),
+    ])
+
+
+def gaussian_nll(y_true, y_pred):
+    """−log 𝒩(y | μ(x), σ(x)²) up to a constant:  (y−μ)²/(2σ²) + log σ.
+
+    The network's two outputs are [μ, log σ] — predicting log σ keeps
+    σ = e^(log σ) positive without any constraint on the layer.
+    """
+    μ, log_σ = y_pred[..., :1], y_pred[..., 1:]
+    return keras.ops.mean(
+        0.5 * keras.ops.exp(-2 * log_σ) * (y_true - μ) ** 2 + log_σ
+    )
+```
+
+Train it next to the alternative it replaces — an ordinary MSE network
+wearing one global error bar — on data whose noise visibly varies:
+
+```{python}
+#| label: fig-predict-noise
+#| fig-cap: "Two networks on the same data. Left: an MSE net with one global ±2-residual-σ bar — too wide on the quiet left, barely enough on the loud right. Right: the NLL net predicts μ(x) and σ(x) together, and the band breathes — tight where the world is calm, wide where it is noisy. Similar headline coverage; only one puts the doubt in the right place."
+x2, y2 = datasets.heteroscedastic_noise(n=250, seed=0)
+order = np.argsort(x2)
+x2, y2 = x2[order], y2[order]
+
+# the alternative: an ordinary mean net + one constant bar from the residuals
+mean_net = make_mlp(n_out=1, seed=1)
+mean_net.compile(optimizer=keras.optimizers.Adam(0.01), loss="mse")
+mean_net.fit(x2[:, None], y2[:, None], epochs=500, batch_size=64, verbose=0)
+μ_mse = mean_net.predict(x2[:, None], verbose=0)[:, 0]
+σ_const = (y2 - μ_mse).std()                 # one number for every x
+
+# the tool: one net, two outputs, NLL loss
+noise_net = make_mlp(n_out=2, seed=2)
+noise_net.compile(optimizer=keras.optimizers.Adam(0.01), loss=gaussian_nll)
+noise_net.fit(x2[:, None], y2[:, None], epochs=800, batch_size=64, verbose=0)
+pred2 = noise_net.predict(x2[:, None], verbose=0)
+μ_nll, σ_nll = pred2[:, 0], np.exp(pred2[:, 1])
+
+print(f"constant bar : 2σ coverage {np.mean(np.abs(y2 - μ_mse) <= 2 * σ_const):.2f}")
+print(f"σ(x) net     : 2σ coverage {np.mean(np.abs(y2 - μ_nll) <= 2 * σ_nll):.2f}")
+
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 3.8), sharey=True)
+axL.fill_between(x2, μ_mse - 2 * σ_const, μ_mse + 2 * σ_const, color=CRASH, alpha=0.18)
+axL.scatter(x2, y2, s=12, c=INK, alpha=0.6); axL.plot(x2, μ_mse, c=INK, lw=2)
+axL.set_title("MSE net + one global bar", fontsize=12); despine(axL)
+axR.fill_between(x2, μ_nll - 2 * σ_nll, μ_nll + 2 * σ_nll, color=COOL, alpha=0.30)
+axR.scatter(x2, y2, s=12, c=INK, alpha=0.6); axR.plot(x2, μ_nll, c=INK, lw=2)
+axR.set_title("NLL net — predicts its own σ(x)", fontsize=12); despine(axR)
+for ax in (axL, axR):
+    ax.set_xlabel("x"); ax.set_xticks([]); ax.set_yticks([])
+axL.set_ylabel("y")
+fig.tight_layout()
+plt.show()
+```
+
+The constant bar cries wolf in the calm zone and whispers in the loud one.
+Coverage *on average* is a weak promise; the band must be right *locally*.
+Hold that thought: it returns as **calibration** below.
+
+## Aleatoric Is Volatility
+
+The NLL net is the general-purpose learner of noise.  In markets the noise
+has a name — **volatility** — and a famous one-line domain forecaster,
+because volatility **clusters**: turbulent days follow turbulent days (the
+same fact the [windows page](../dependence/04-windows-and-blocks.qmd) found
+as 0.75 bits of memory in $|r_t|$).  EWMA — the RiskMetrics estimator — is
+"predict the noise" distilled to a single recursion:
+
+$$
+\sigma_t^2 = \lambda\,\sigma_{t-1}^2 + (1-\lambda)\,r_{t-1}^2,
+\qquad \lambda = 0.94 .
+$$
+
+```{python}
+#| label: fig-vol-band
+#| fig-cap: "JPM daily returns with a ±2σ band from a causal EWMA volatility forecast. The band balloons through the 2008–09 financial crisis and the 2020 COVID crash, and tightens in the calm mid-2010s — exactly the heteroscedastic noise a constant bar cannot represent."
+def ewma_volatility(
+    r: Float[Array, "n_days"], λ: float = 0.94
+) -> Float[Array, "n_days"]:
+    """RiskMetrics EWMA: σ²_t = λ·σ²_{t−1} + (1−λ)·r²_{t−1}   [daily variance].
+
+    Strictly causal — the forecast for day t uses only days < t.
+    """
+    σ2 = np.empty_like(r)
+    σ2[0] = np.var(r[:20])                   # warm start from the first month
+    for t in range(1, len(r)):
+        σ2[t] = λ * σ2[t - 1] + (1 - λ) * r[t - 1] ** 2
+    return np.sqrt(σ2)
+
+
+R = datasets.load_returns()
+r_jpm = R["JPM"].to_numpy()                  # (n_days,) daily returns
+dates = R.index
+σ_ewma = ewma_volatility(r_jpm)
+print(f"|r_t| ≤ 2σ_t coverage: {np.mean(np.abs(r_jpm) <= 2 * σ_ewma):.2f}  (target 0.95)")
+print(f"forecast vol, calm vs crash: {np.median(σ_ewma):.3f} vs {σ_ewma.max():.3f}")
+
+fig, ax = plt.subplots(figsize=(11, 3.4))
+ax.fill_between(dates, -2 * σ_ewma, 2 * σ_ewma, color=COOL, alpha=0.35,
+                label="±2σ̂  (volatility forecast)")
+ax.plot(dates, r_jpm, c=INK, lw=0.5, alpha=0.8)
+mark_event(ax, pd.Timestamp("2008-09-15"), "Lehman")
+mark_event(ax, pd.Timestamp("2020-03-16"), "COVID")
+ax.set_ylim(-0.18, 0.18); ax.set_ylabel("JPM daily return")
+ax.legend(loc="lower left", fontsize=10, frameon=False); despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+The band widens exactly when it must.  But did it keep its promise?  That
+question has a name —
+
+## Calibration — Keeping the 95% Promise
+
+A 95% band is a **promise**: one day in twenty outside, *no matter when*.
+Headline coverage cannot check that promise, because it averages over calm
+decades.  Plot *when* the misses happen instead:
+
+```{python}
+#| label: fig-calibration-strips
+#| fig-cap: "Every day JPM's return escaped the 95% band, as a tick mark. Top: a constant band covers 95% overall — and concentrates its misses into 2008 and 2020, breaking three-in-a-week exactly like the chapter's opening story. Bottom: the volatility band's misses are spread thin across the whole sample; no week-long failure clusters."
+σ_const_jpm = r_jpm.std()                    # the constant-band alternative
+miss_const = np.abs(r_jpm) > 2 * σ_const_jpm
+miss_ewma = np.abs(r_jpm) > 2 * σ_ewma
+
+fig, axes = plt.subplots(2, 1, figsize=(11, 3.2), sharex=True)
+for ax, miss, name, col in [
+    (axes[0], miss_const,
+     f"constant band — covers {1 - miss_const.mean():.0%} overall, misses cluster in crises", CRASH),
+    (axes[1], miss_ewma,
+     f"volatility band — covers {1 - miss_ewma.mean():.0%}, misses spread out", COOL),
+]:
+    ax.vlines(dates[miss], 0, 1, color=col, lw=0.7, alpha=0.8)
+    ax.set_yticks([]); ax.set_title(name, fontsize=11, loc="left")
+    despine(ax); ax.spines["left"].set_visible(False)
+axes[1].set_xlabel("days outside the 95% band — JPM, real data")
+fig.tight_layout()
+plt.show()
+```
+
+This figure answers the chapter's opening question.  *"Was the model wrong,
+or just unlucky?"*  The constant band passes the headline test and fails the
+calibration test: its misses arrive in clusters, so three breaks in one week
+is not bad luck — it is the model's noise assumption failing exactly when it
+matters.  The volatility band keeps the promise *uniformly in time*.
+
+It still runs about a point hot (~94% instead of 95%): returns are
+**fat-tailed**, and a Gaussian 2σ rule under-counts extremes even with the
+right $\sigma_t$.  Gaussianize the standardized residuals first — the
+[Gaussianization chapter's](../gaussianization/index.qmd) move — and the
+coverage snaps back.  The noise model handles *when*; Gaussianization
+handles *how heavy*.
+
+## Tool B · Ensembles
+
+Aleatoric noise was sitting in the residuals, learnable by a loss.  Model
+doubt is different — it is invisible to the model that has it, because
+**a network cannot grade its own homework**.  So ask a committee:
+
+1. Retrain the **same network** on resampled data, from a fresh random
+   initialization each time → a **deep ensemble**.
+2. Where members **agree**, the data pinned the model down.
+3. Where they **fan out**, the model is guessing — it has seen nothing there.
+
+Each member is one full run of the recipe — one descent of the loss
+landscape — and the spread between members is the spread of *plausible
+stories consistent with the data*:
+
+```{python}
+#| label: fig-ensemble
+#| fig-cap: "Fifteen retrainings of the same network on bootstrap resamples of the running character (twelve drawn). The members agree tightly where data is dense and fan out into a balloon of honest doubt over the central hole — the committee correctly reports where it has seen nothing. Unlike aleatoric noise, this band shrinks as you add data."
+def train_member(seed: int) -> Float[Array, "n_grid"]:
+    """One committee member: bootstrap the days, re-initialize, retrain."""
+    rng_k = np.random.default_rng(seed)
+    idx = rng_k.integers(0, x_obs.size, x_obs.size)     # resample with replacement
+    net = make_mlp(n_out=1, seed=seed)                  # fresh random init
+    net.compile(optimizer=keras.optimizers.Adam(0.01), loss="mse")
+    net.fit(x_obs[idx][:, None], y_obs[idx][:, None],
+            epochs=600, batch_size=x_obs.size, verbose=0)
+    return net.predict(x_grid[:, None], verbose=0)[:, 0]
+
+
+ensemble = np.stack([train_member(seed) for seed in range(15)])  # (n_members, n_grid)
+μ_epi = einx.mean("m g -> g", ensemble)
+σ_epi = einx.std("m g -> g", ensemble)                  # disagreement = doubt
+
+in_data = (np.abs(x_grid) > 1.4) & (np.abs(x_grid) < 3.2)
+in_gap = np.abs(x_grid) < 1.4
+print(f"epistemic σ where data exists: {σ_epi[in_data].mean():.2f}")
+print(f"epistemic σ over the hole    : {σ_epi[in_gap].mean():.2f}   ← wider where data is sparse")
+
+fig, ax = plt.subplots(figsize=(10.5, 3.4))
+ax.fill_between(x_grid, μ_epi - 2 * σ_epi, μ_epi + 2 * σ_epi, color=GREEN, alpha=0.25)
+for member in ensemble[:12]:
+    ax.plot(x_grid, member, c=GREEN, lw=0.7, alpha=0.5)
+ax.plot(x_grid, μ_epi, c=INK, lw=2)
+ax.scatter(x_obs, y_obs, s=16, c=INK, zorder=5)
+ax.axvspan(-1.4, 1.4, color=CRASH, alpha=0.07)          # the data hole
+ax.set_ylim(-3.0, 3.0)
+ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+::: {.callout-note}
+## The Committee's Cheaper Cousins — and Its Principled Limit
+A deep ensemble is the bluntest way to sample "models the data would
+allow," and in practice one of the best-calibrated.  Cheaper: **MC dropout**
+— train one network with dropout layers and *leave dropout on at prediction
+time*; each stochastic forward pass is a slightly different sub-network, a
+committee hiding inside one model.  More principled: a fully **Bayesian
+neural network** maintains a distribution over the weights themselves
+(see [pyrox](https://github.com/jejjohnson/pyrox) for the primitives).  All
+three approximate the same object — the spread of plausible functions — and
+the ensemble is the one you can build with nothing but a `for` loop.
+:::
+
+## Total Doubt = Noise + Ignorance
+
+Now put both tools on the character at once: the NLL net supplies
+$\mu(x)$ and $\sigma_{\text{aleatoric}}(x)$, the committee supplies
+$\sigma_{\text{epistemic}}(x)$.
+
+```{python}
+#| label: fig-two-flavors
+#| fig-cap: "Both doubts on one curve. The blue band is the NLL net's predicted noise σ(x) — tight on the calm left, breathing open on the loud right. The green strands are the committee — agreeing wherever data exists, fanning out over the hole. And note the trap: over the hole the single NLL net confidently invents a hill, and its σ(x) never warns you. Only the committee exposes the guess."
+char_net = make_mlp(n_out=2, seed=0)
+char_net.compile(optimizer=keras.optimizers.Adam(0.01), loss=gaussian_nll)
+char_net.fit(x_obs[:, None], y_obs[:, None],
+             epochs=800, batch_size=x_obs.size, verbose=0)
+pred_char = char_net.predict(x_grid[:, None], verbose=0)
+μ_fit, σ_alea = pred_char[:, 0], np.exp(pred_char[:, 1])
+
+fig, ax = plt.subplots(figsize=(11, 3.8))
+for member in ensemble[:12]:
+    ax.plot(x_grid, member, c=GREEN, lw=0.7, alpha=0.5)
+ax.fill_between(x_grid, μ_fit - 2 * σ_alea, μ_fit + 2 * σ_alea,
+                color=COOL, alpha=0.30)
+ax.plot(x_grid, μ_fit, c=INK, lw=2)
+ax.scatter(x_obs, y_obs, s=16, c=INK, zorder=5)
+ax.set_ylim(-3.0, 3.0)
+ax.annotate("EPISTEMIC\nmodel doubt — no data here\n(more data would fix it)",
+            (0, 2.0), ha="center", fontsize=11, color=GREEN, fontweight="bold")
+ax.annotate("ALEATORIC\nworld noise\n(more data won't help)",
+            (2.4, -2.5), ha="center", fontsize=11, color=COOL, fontweight="bold")
+ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+The two flavors are independent sources of variance, so they **add in
+quadrature** — and each dominates where it should:
+
+$$
+\sigma_{\text{total}}^2(x) = \sigma_{\text{aleatoric}}^2(x) + \sigma_{\text{epistemic}}^2(x).
+$$
+
+```{python}
+#| label: fig-total-band
+#| fig-cap: "The honest predictive band. Where there is data, total ≈ aleatoric (the blue band fills the green one); over the hole, the epistemic balloon takes over and overrules the NLL net's invented hill. One band, two honest ingredients — the noise that will never go away plus the doubt that more data would cure."
+σ_total = np.sqrt(σ_alea**2 + σ_epi**2)      # add in quadrature [y units]
+
+fig, ax = plt.subplots(figsize=(11, 3.6))
+ax.fill_between(x_grid, μ_fit - 2 * σ_total, μ_fit + 2 * σ_total,
+                color=GREEN, alpha=0.25,
+                label="total = √(aleatoric² + epistemic²)")
+ax.fill_between(x_grid, μ_fit - 2 * σ_alea, μ_fit + 2 * σ_alea,
+                color=COOL, alpha=0.40, label="aleatoric  σ(x)")
+ax.plot(x_grid, μ_fit, c=INK, lw=2)
+ax.scatter(x_obs, y_obs, s=16, c=INK, zorder=5)
+ax.set_ylim(-3.2, 3.2)
+ax.legend(fontsize=11, frameon=False, loc="upper left")
+ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+## One Grid — Where Does the Doubt Live?
+
+|  | **ALEATORIC** · the world's noise | **EPISTEMIC** · the model's doubt |
+|---|---|---|
+| **diagnose** | residuals cluster; tails stay fat | committee members disagree |
+| **respond** | *predict it*: an NLL net's $\sigma(x)$, EWMA, learned joint | *admit it*: widen claims, gather data |
+| **at portfolio scale** | sample the learned joint ([RBIG backward](03-noise-and-propagation.qmd)) | every generator takes the same exam |
+
+More data shrinks only the **right-hand column** — and confusing the two
+columns is exactly how 95% promises get broken.
+
+## The Capstone — One Machine, Three Uses
+
+The course in one figure.  A single invertible map $T$: **forward** it
+Gaussianizes, and the gap it closes is the dependence we *measure*
+([dependence](../dependence/index.qmd)) and *remove*
+([fairness](../fairness/index.qmd)); **backward** it generates, sampling the
+simple law and inverting to the real, dependent world to *propagate* (this
+chapter).
+
+```{python}
+#| label: fig-capstone
+#| fig-cap: "Measure · remove · propagate are three directions of one change of variables. Forward: data → Gaussian (the distortion is the dependence). Backward: Gaussian → data (sampling the real joint)."
+rng_cap = np.random.default_rng(0)
+n_cap = 1400
+factor = rng_cap.standard_t(5, n_cap)        # one fat-tailed common factor
+a_cap = 0.85 * factor + 0.35 * rng_cap.standard_t(5, n_cap)
+b_cap = 0.85 * factor + 0.35 * rng_cap.standard_t(5, n_cap)
+X_cap = np.column_stack([a_cap, b_cap])
+X_cap = (X_cap - X_cap.mean(0)) / X_cap.std(0)
+Z_cap = AnnealedRBIG(n_layers=30, random_state=0).fit_transform(X_cap)
+
+fig = plt.figure(figsize=(13, 5.2))
+axL = fig.add_axes([0.04, 0.18, 0.30, 0.66])
+axC = fig.add_axes([0.37, 0.0, 0.26, 1.0]); axC.axis("off")
+axR = fig.add_axes([0.66, 0.18, 0.30, 0.66])
+
+axL.scatter(X_cap[:, 0], X_cap[:, 1], s=7, c=COOL, alpha=0.35, edgecolors="none")
+axL.set_title("DATA space", fontsize=12)
+annotate_box(axL, 0.5, -0.13, "correlated · fat-tailed")
+axL.set_xticks([]); axL.set_yticks([]); despine(axL)
+
+axR.scatter(Z_cap[:, 0], Z_cap[:, 1], s=7, c=GREEN, alpha=0.35, edgecolors="none")
+axR.set_title("GAUSSIAN space", fontsize=12)
+annotate_box(axR, 0.5, -0.13, "independent · spherical")
+axR.set_xticks([]); axR.set_yticks([]); despine(axR)
+
+axC.annotate("", xy=(0.95, 0.62), xytext=(0.05, 0.62),
+             arrowprops=dict(arrowstyle="-|>", lw=2.4, color=INK))
+axC.text(0.5, 0.70, "forward:  z = T(x)", ha="center", fontsize=12,
+         family="monospace", fontweight="bold")
+axC.text(0.5, 0.58, "MEASURE (Ch.1) · REMOVE (Ch.4)", ha="center", fontsize=9,
+         color=COOL, fontweight="bold")
+axC.annotate("", xy=(0.05, 0.36), xytext=(0.95, 0.36),
+             arrowprops=dict(arrowstyle="-|>", lw=2.4, color=WARM))
+axC.text(0.5, 0.28, "backward:  x = T⁻¹(z)", ha="center", fontsize=12,
+         family="monospace", fontweight="bold")
+axC.text(0.5, 0.16, "PROPAGATE (Ch.3)", ha="center", fontsize=9, color=WARM,
+         fontweight="bold")
+axC.text(0.5, 0.92, "One machine, three uses", ha="center", fontsize=13,
+         fontweight="bold")
+plt.show()
+```
+
+::: {.callout-note icon=false}
+## The Whole Course, One Line
+**Claim only what your evidence justifies.**  The Gaussian is the
+least-committal joint distribution; what $T$ removes or generates is
+*exactly* the dependence in the data — nothing assumed, nothing discarded.
+Signal (measure), neutrality (remove), and risk (propagate) are one
+operation, read three ways.
+:::
+
+The hands-on [labs](labs/index.qmd) propagate a real portfolio to its tail
+risk and build a calibrated, regime-aware band — NLL net and committee
+included — from real returns.

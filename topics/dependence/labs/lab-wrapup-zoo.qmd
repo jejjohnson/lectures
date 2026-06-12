@@ -1,0 +1,223 @@
+---
+title: "Wrap-up — The Measure Zoo"
+subtitle: "Every Measure × Every Relationship Shape"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, GRID, PANEL, despine
+from lectures.measures import (distance_correlation, cka_rbf,
+                               mutual_information_bits, linfoot_r)
+plotting.set_style("notes")
+import numpy as np, matplotlib.pyplot as plt
+from scipy.stats import pearsonr, spearmanr
+from jaxtyping import Float      # shape annotations: Float[Array, "n_days"]
+
+Array = np.ndarray
+```
+
+*Learn-the-tool track · wrap-up.*
+
+You have climbed the whole ladder: Pearson, Spearman, distance correlation,
+HSIC/CKA on [Road 1](../02-kernels-hsic.qmd); mutual information and Linfoot R
+on [Road 2](../03-mutual-information.qmd).  This lab closes the chapter the
+way every benchmark should — **all the measures, side by side, on a zoo of
+relationships where you know the right answer.**  It is the chapter's version
+of the famous correlation-examples figure, with the full ladder attached.
+
+**What you will produce:** one grid of datasets × measures that you can keep
+as a cheat sheet — *which number catches which shape, and what it reads when
+it does*.
+
+---
+
+## 1 · Build the Zoo
+
+Eight relationships, each chosen to break (or flatter) a specific rung:
+
+```{python}
+#| label: build-zoo
+rng = np.random.default_rng(42)
+n = 600
+
+
+def make_zoo() -> dict[str, tuple[Float[Array, "n"], Float[Array, "n"]]]:
+    """Eight (x, y) pairs: from straight lines to pure independence."""
+    t = rng.normal(size=n)                   # a shared "driver" variable
+    θ = rng.uniform(0, 2 * np.pi, n)         # angle, for the ring
+    x_u = rng.uniform(-2.5, 2.5, n)          # uniform driver, for the U
+    x_s = rng.uniform(0, 1, n)               # uniform driver, for the sine
+
+    return {
+        # the cheap tool's home turf: y = 0.8·x + ε
+        "linear": (t, 0.8 * t + 0.6 * rng.normal(size=n)),
+        # monotone but curved: y = x³ + ε — bends Pearson, not Spearman
+        "monotone curve": (t, t**3 + 1.5 * rng.normal(size=n)),
+        # the V: y = x² + ε — non-monotone, kills Pearson AND Spearman
+        "U-shape": (x_u, x_u**2 + 0.4 * rng.normal(size=n)),
+        # a ring: strong dependence, zero correlation of every linear kind
+        "ring": (np.cos(θ) + 0.15 * rng.normal(size=n),
+                 np.sin(θ) + 0.15 * rng.normal(size=n)),
+        # two full cosine periods: y = cos(4π·x) + ε — symmetric about x = ½,
+        # so the linear trend cancels EXACTLY (a sine would not: each period
+        # tilts the cloud by −1/4π)
+        "wave": (x_s, np.cos(4 * np.pi * x_s) + 0.25 * rng.normal(size=n)),
+        # an X: two crossing diagonals — symmetric, so linear measures cancel
+        "cross": (t, t * rng.choice([-1, 1], size=n) + 0.3 * rng.normal(size=n)),
+        # no trend, rising risk: y = x·ε — dependence lives in the SPREAD
+        "fan (heteroskedastic)": (t, t * rng.normal(size=n)),
+        # the control: genuinely nothing to find
+        "independent": (rng.normal(size=n), rng.normal(size=n)),
+    }
+
+
+zoo = make_zoo()
+print("datasets:", list(zoo.keys()))
+```
+
+---
+
+## 2 · One Scoring Function, Six Measures
+
+One subtlety before scoring: the histogram MI estimator is **biased upward**.
+Even pure noise lands some counts unevenly across a 20×20 grid, so independent
+data scores ~0.3 "bits" that are pure estimation artefact — and Linfoot R
+inflates that to a scary-looking 0.6.  The honest fix is the chapter's oldest
+trick: build the [independence reference](../01-correlation.qmd#the-independence-reference)
+by **shuffling**, measure the MI of the shuffled pair, and subtract.  What
+survives is information *above chance*.
+
+```{python}
+#| label: score-fn
+def mi_bits_debiased(
+    x: Float[Array, "n"], y: Float[Array, "n"], n_shuffles: int = 3
+) -> float:
+    """Histogram MI, calibrated against the shuffled (independent) baseline.
+
+    I(X;Y) = Σᵢⱼ pᵢⱼ · log₂[ pᵢⱼ / (pᵢ.·p.ⱼ) ]     [bits]
+    debiased: subtract the average MI of (x, shuffle(y)) — same marginals,
+    link destroyed — so independent data reads ≈ 0 instead of the bin artefact.
+    """
+    def mi_hist(xx, yy):
+        joint_counts = np.histogram2d(xx, yy, bins=20)[0]   # (20, 20) day counts
+        return mutual_information_bits(joint_counts)
+
+    mi_raw = mi_hist(x, y)
+    baseline = np.mean([mi_hist(x, rng.permutation(y)) for _ in range(n_shuffles)])
+    return max(0.0, mi_raw - baseline)
+
+
+def score_all(x: Float[Array, "n"], y: Float[Array, "n"]) -> dict[str, float]:
+    """The whole ladder for one pair.
+
+    Pearson r      = cov(X,Y) / (σₓ·σᵧ)               ∈ [−1, 1]   linear only
+    Spearman ρₛ    = corr(rank(x), rank(y))            ∈ [−1, 1]   monotone
+    dCor           = dCov / √(dVar·dVar)               ∈ [0, 1]    any shape
+    CKA (RBF)      = HSIC / √(HSIC·HSIC)               ∈ [0, 1]    any shape
+    MI             = histogram MI − shuffle baseline    [bits]      any shape
+    Linfoot R      = √(1 − e^(−2·I_nats))              ∈ [0, 1]    MI, rescaled
+    """
+    mi_bits = mi_bits_debiased(x, y)
+    mi_nats = mi_bits * np.log(2)                      # bits → nats (1 bit = ln 2 nats)
+    return {
+        "Pearson": pearsonr(x, y)[0],
+        "Spearman": spearmanr(x, y)[0],
+        "dCor": distance_correlation(x, y),
+        "CKA": cka_rbf(x, y),
+        "MI (bits)": mi_bits,
+        "Linfoot R": linfoot_r(mi_nats),
+    }
+
+
+scores = {name: score_all(x, y) for name, (x, y) in zoo.items()}
+measures = list(next(iter(scores.values())).keys())
+```
+
+---
+
+## 3 · The Famous Plot, With the Full Ladder
+
+```{python}
+#| label: fig-zoo-grid
+#| fig-cap: "The measure zoo. Each panel is one relationship; beneath it, every measure's verdict. Walk the rows of any column: Pearson dies at the U-shape; Spearman survives one panel longer; dCor, CKA, MI and Linfoot R light up for every real dependence and stay silent on the control."
+fig, axes = plt.subplots(2, 4, figsize=(14.5, 7.6))
+for ax, (name, (x, y)) in zip(axes.flat, zoo.items()):
+    ax.scatter(x, y, s=8, c=COOL if name != "independent" else WARM,
+               alpha=0.45, edgecolors="none")
+    sc = scores[name]
+    lines = [f"P {sc['Pearson']:+.2f}   S {sc['Spearman']:+.2f}   dCor {sc['dCor']:.2f}",
+             f"CKA {sc['CKA']:.2f}   MI {sc['MI (bits)']:.2f}b   R {sc['Linfoot R']:.2f}"]
+    ax.set_title(name, fontsize=11, fontweight="bold")
+    ax.text(0.5, -0.16, "\n".join(lines), transform=ax.transAxes, ha="center",
+            va="top", fontsize=9, family="monospace", color=INK,
+            bbox=dict(boxstyle="round,pad=0.35", fc=PANEL, ec=GRID))
+    ax.set_xticks([]); ax.set_yticks([])
+    despine(ax)
+fig.tight_layout(h_pad=4.5)
+plt.show()
+```
+
+The same verdicts as a single heat-grid — the chapter on one screen:
+
+```{python}
+#| label: fig-zoo-heatmap
+#| fig-cap: "Datasets × measures. Cell color = strength on each measure's own scale (|value| for the correlation-like columns, value/max for MI). The signed measures (Pearson, Spearman) go dark only for monotone shapes; the four general measures form a bright block everywhere except the independent control row."
+M = np.zeros((len(zoo), len(measures)))
+for i, name in enumerate(zoo):
+    for j, m in enumerate(measures):
+        M[i, j] = scores[name][m]
+
+# normalize per column for color: |value| for [−1,1] scales, value/max for bits
+strength = np.abs(M.copy())
+mi_col = measures.index("MI (bits)")
+strength[:, mi_col] = strength[:, mi_col] / strength[:, mi_col].max()
+
+fig, ax = plt.subplots(figsize=(9.5, 5.6))
+ax.imshow(strength, cmap="BuPu", vmin=0, vmax=1, aspect="auto")
+for i in range(M.shape[0]):
+    for j in range(M.shape[1]):
+        ax.text(j, i, f"{M[i, j]:+.2f}" if j < 2 else f"{M[i, j]:.2f}",
+                ha="center", va="center", fontsize=10,
+                color="white" if strength[i, j] > 0.55 else INK)
+ax.set_xticks(range(len(measures))); ax.set_xticklabels(measures, fontsize=10)
+ax.set_yticks(range(len(zoo))); ax.set_yticklabels(list(zoo.keys()), fontsize=10)
+ax.set_title("The chapter in one grid: which measure catches which shape",
+             fontsize=12, fontweight="bold")
+plt.tight_layout()
+plt.show()
+```
+
+::: {.callout-tip}
+## How to Read the Grid
+
+- **Pearson** column: large only when the cloud *tilts* — linear and monotone
+  rows.  The fan, ring, cross, and U all read ≈ 0: same blindness, four shapes.
+- **Spearman**: identical story, one row more (the monotone curve is rescued).
+- **dCor / CKA / MI / Linfoot R**: nonzero on *every* dependent row and
+  essentially zero on the control.  They agree on detection but have
+  favourites — CKA dims on the ring, MI loves the U — and they differ in
+  **units**: dCor and CKA are scores, MI is bits, Linfoot R reads like a
+  correlation.
+- The **fan** row is the quiet star: no trend at all, yet every general
+  measure fires.  Risk that lives in the spread is still dependence.
+:::
+
+---
+
+## 4 · Your Turn
+
+1. **Add a dataset** to the zoo that you predict will fool *Spearman but not
+   Pearson*.  (Hint: is that even possible?  Why not — and what does that say
+   about the ladder's ordering?)
+2. **Stress the estimators**: shrink `n` from 600 to 100 and re-run.  Which
+   columns degrade first, and why?  (Watch the MI histogram especially.)
+3. **Bandwidth games**: recompute the CKA column with `sigma=0.05` and
+   `sigma=50` instead of the median heuristic.  Match what you see to the
+   [bandwidth sweep](../02-kernels-hsic.qmd#the-zoo--choosing-the-distance-and-the-kernel)
+   figure.
+4. **Real-data row**: append `("JPM/BAC real", ...)` from
+   `datasets.load_returns()` and place the real pair inside the zoo.  Which
+   synthetic row does it most resemble — and which measure tells you that?
