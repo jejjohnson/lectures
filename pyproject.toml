@@ -41,13 +41,25 @@ docs = [
     "numpy>=1.26",
     "pandas>=2.2",
     "scipy>=1.13",
+    # Teaching-code style: einx spells out the axes of every linear-algebra op,
+    # jaxtyping documents array shapes in function signatures (numpy-compatible).
+    "einx>=0.3",
+    "jaxtyping>=0.2",
     # The author's RBIG (Gaussianization) package — NumPy/scikit-learn based, so
     # it renders the topic figures without the heavy JAX/Keras demo libraries.
     "rbig",
+    # Keras (JAX CPU backend) renders the neural-network uncertainty figures —
+    # same stack as keras-fairkl in Module 4, kept CPU-only so docs CI stays light.
+    "keras>=3.5",
+    "jax>=0.4.30",
+    # The author's fair kernel learning package — renders the Module 4 figures
+    # with the real penalty implementation, not a stand-in.
+    "fairkl",
 ]
 
 [tool.uv.sources]
 rbig = { git = "https://github.com/jejjohnson/rbig.git" }
+fairkl = { git = "https://github.com/jejjohnson/keras-fairkl.git" }
 
 [tool.ruff]
 target-version = "py312"
