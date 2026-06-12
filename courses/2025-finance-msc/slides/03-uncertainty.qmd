@@ -5,7 +5,7 @@ format:
   revealjs:
     theme: [default, ../../../styles/slides.scss]
     slide-number: true
-    incremental: true
+    incremental: false # bullets show immediately; use explicit ". . ." pauses for staging
     transition: fade
     fig-align: center
     auto-stretch: false # keep figures at their natural aspect (no fill-to-height distortion)
@@ -16,63 +16,50 @@ format:
 import sys, pathlib
 sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
 from lectures import plotting, datasets
-from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box, mark_event
+from lectures.plotting import INK, COOL, WARM, CRASH, GRID, PANEL, despine, annotate_box, mark_event
 from rbig import AnnealedRBIG
 from lectures.measures import cocrash_fraction
 plotting.set_style("slides")
+import os
+os.environ["KERAS_BACKEND"] = "jax"  # Keras 3 on the CPU JAX backend
+import keras
+from keras import layers
 import numpy as np, matplotlib.pyplot as plt
 import pandas as pd
 from scipy.stats import norm, t as student_t
+GREEN = plotting.PALETTE["green"]
+
+
+def make_mlp(n_out=1, seed=0):
+    """x → Dense(64, tanh) → Dense(64, tanh) → Dense(n_out)."""
+    keras.utils.set_random_seed(seed)
+    return keras.Sequential([
+        layers.Dense(64, activation="tanh"),
+        layers.Dense(64, activation="tanh"),
+        layers.Dense(n_out),
+    ])
+
+
+def gaussian_nll(y_true, y_pred):
+    """−log 𝒩(y | μ(x), σ(x)²) up to a constant: (y−μ)²/(2σ²) + log σ."""
+    mu, log_sig = y_pred[..., :1], y_pred[..., 1:]
+    return keras.ops.mean(0.5 * keras.ops.exp(-2 * log_sig) * (y_true - mu) ** 2 + log_sig)
 ```
 
-## The Naive Fix Destroys the Risk {.center}
+## A Broken Promise {.center}
 
-To carry uncertainty forward, you must **sample**.
+> "The desk model promised: 19 days in 20 inside the band."
+>
+> That month, the band broke **three times** — all in the same week.
 
 . . .
 
-The obvious move — sample each asset on its own — gets every marginal right and
-the **joint catastrophically wrong**.
+Was the model *wrong* — or just *unlucky*?
 
-. . .
+You cannot even pose that question until uncertainty is an object you can
+**measure, propagate, and check**.
 
-It can never produce the co-crash. And the co-crash is the risk.
-
-## Independent Sampling Kills the Joint {auto-animate=true}
-
-```{python}
-#| echo: false
-#| fig-width: 11
-#| fig-height: 3.8
-a, b = datasets.tail_dependent_pair(n=2000, seed=0)
-X = np.column_stack([a, b])
-rng = np.random.default_rng(1)
-indep = np.column_stack([rng.permutation(a), rng.permutation(b)])
-gen = AnnealedRBIG(n_layers=30, random_state=0).fit(X).sample(2000)
-fig, axes = plt.subplots(1, 3, figsize=(11, 3.8))
-for ax, data, col, name in [
-    (axes[0], X, COOL, f"real · co-crash {cocrash_fraction(a,b):.0%}"),
-    (axes[1], indep, CRASH, f"independent · {cocrash_fraction(indep[:,0],indep[:,1]):.0%}"),
-    (axes[2], gen, plotting.PALETTE["green"], f"RBIG · {cocrash_fraction(gen[:,0],gen[:,1]):.0%}")]:
-    ax.scatter(data[:, 0], data[:, 1], s=6, c=col, alpha=0.35, edgecolors="none")
-    ax.set_title(name, fontsize=12); ax.set_xlim(-5, 4); ax.set_ylim(-5, 4)
-    ax.set_xticks([]); ax.set_yticks([]); despine(ax)
-fig.tight_layout(); plt.show()
-```
-
-Identical marginals. Only joint generation keeps the co-crash.
-
-## The Spine — The Same Machine, Backward
-
-$$\underbrace{z = T(x)}_{\text{forward: measure / remove}}
-\qquad
-\underbrace{x = T^{-1}(z)}_{\text{backward: propagate}}$$
-
-- A map that *simplifies* one way **generates** the other
-- Draw $z \sim \mathcal N(0, I)$, invert → a real, dependent scenario
-- The change-of-variables formula is the recipe: $p_X(x) = p_Z(T(x))\,|\det J|$
-
-## Uncertainty Is a Distribution, Not a Number {auto-animate=true}
+## Uncertainty Is a Distribution, Not a Number
 
 ```{python}
 #| echo: false
@@ -90,126 +77,444 @@ fig.tight_layout(); plt.show()
 A point forecast — or a thin Gaussian band — hides the loss that lands in the
 tail it never represented.
 
----
+## Two Questions, Two Acts
 
-## #2 Gaussian Monte-Carlo — Thin Tails {auto-animate=true}
+Every uncertainty in this module is one of **two questions**:
 
-Fit a covariance, sample a normal. Captures linear co-movement, but Gaussian
-tails are **thin** and tail-*independent*.
+. . .
+
+**Act 1 — What could the world do?**
+
+- scenarios for a whole portfolio: sample the **joint**, price the tail
+- *the ladder:* independent → Gaussian → Student-t → RBIG
+
+. . .
+
+**Act 2 — How wrong is my prediction?**
+
+- a band around a neural net's $\hat y = f(x)$: noise you **predict**, ignorance you **admit**
+- *the tools:* a net that predicts its own $\sigma(x)$ · volatility · deep ensembles
+
+## The Running Characters
 
 ```{python}
 #| echo: false
 #| fig-width: 11
-#| fig-height: 3.4
-rng = np.random.default_rng(2); n = 4000
-z = rng.normal(0, 1, n)
-a2 = 0.5*z + 0.5*rng.normal(0,1,n); b2 = 0.5*z + 0.5*rng.normal(0,1,n)
-crash = rng.random(n) < 0.05; shock = np.abs(rng.standard_t(2.5, n)*3.0)
-a2 = np.where(crash, a2-shock, a2); b2 = np.where(crash, b2-shock, b2)
-D = np.column_stack([a2, b2]); D = (D-D.mean(0))/D.std(0)
-gmc = rng.multivariate_normal(D.mean(0), np.cov(D.T), size=n)
-pr, pg = D[:,0]+D[:,1], gmc[:,0]+gmc[:,1]
-fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 3.4))
-axL.scatter(D[:,0], D[:,1], s=6, c=COOL, alpha=0.25, edgecolors="none", label="real")
-axL.scatter(gmc[:,0], gmc[:,1], s=6, c=CRASH, alpha=0.2, edgecolors="none", label="Gaussian")
-axL.set_xlim(-8,4); axL.set_ylim(-8,4); axL.set_xticks([]); axL.set_yticks([])
-axL.legend(fontsize=10, frameon=False, markerscale=2); despine(axL)
-bins = np.linspace(min(pr.min(), pg.min()), 3, 50)
-axR.hist(pr, bins=bins, density=True, color=COOL, alpha=0.55, label="real")
-axR.hist(pg, bins=bins, density=True, color=CRASH, alpha=0.45, label="Gaussian")
-axR.axvline(np.quantile(pr,0.01), color=COOL, lw=2, ls="--")
-axR.axvline(np.quantile(pg,0.01), color=CRASH, lw=2, ls="--")
-axR.set_title(f"1% VaR: real {np.quantile(pr,0.01):.1f} vs Gauss {np.quantile(pg,0.01):.1f}", fontsize=12)
-axR.legend(fontsize=10, frameon=False); despine(axR)
+#| fig-height: 3.6
+# Act 1 character: the fat-tailed bank pair (Module 1's banks, tails and all)
+a, b = datasets.tail_dependent_pair(n=2000, seed=0)
+X = np.column_stack([a, b])
+
+# Act 2 character: a curve with a data gap and noise that grows to the right
+rng = np.random.default_rng(5)
+half = 30
+xg = np.sort(np.concatenate([rng.uniform(-3.2, -1.4, half), rng.uniform(1.4, 3.2, half)]))
+sig_true = 0.05 + 0.45 * (xg + 3.2) / 6.4
+yg = np.sin(1.3 * xg) + sig_true * rng.standard_normal(xg.size)
+
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 3.6))
+axL.scatter(a, b, s=7, c=COOL, alpha=0.35, edgecolors="none")
+axL.set_title("Act 1 · the banks — fat tails, co-crashes", fontsize=13)
+for xt in (np.linspace(-3.4, -1.4, 100), np.linspace(1.4, 3.4, 100)):
+    axR.plot(xt, np.sin(1.3 * xt), c=INK, lw=1.4, ls=":", alpha=0.55)
+axR.scatter(xg, yg, s=18, c=INK, alpha=0.8)
+axR.axvspan(-1.4, 1.4, color=GREEN, alpha=0.08)
+axR.text(0, 0, "?", fontsize=24, color=GREEN, fontweight="bold", ha="center", va="center")
+axR.set_ylim(-2.4, 2.4)
+axR.set_title("Act 2 · the curve — noisy on the right, a hole in the middle", fontsize=13)
+for ax in (axL, axR):
+    ax.set_xticks([]); ax.set_yticks([]); despine(ax)
 fig.tight_layout(); plt.show()
 ```
 
-Same cloud in the middle, **too-optimistic VaR** at the edge.
+The banks carry Act 1's question; the gappy curve carries Act 2's.
 
-## #3 RBIG Backward — Keeps the Real Tail
+---
 
-Learn $T$, sample in Gaussian space, invert. The same tool that measured
-dependence (Module 1), now a **generator**.
+## Act 1 · Scenarios for a Portfolio {.center}
+
+A portfolio's risk lives in its **joint** distribution — and the only way to
+carry a joint forward is to **sample scenarios** from it.
+
+. . .
+
+Four generators, in rising order of honesty:
+**#1 independent → #2 Gaussian MC → #3 Student-t MC → #4 RBIG backward**.
+
+. . .
+
+Each one takes the same exam: *reproduce the co-crash, price the tail*.
+
+## The Target — VaR, the 1-in-100 Morning
+
+**Value at Risk** is a quantile of the portfolio's daily P&L — the loss that a
+1-in-100 morning meets or beats:
+
+```{python}
+#| echo: false
+#| fig-width: 10
+#| fig-height: 3.2
+R = datasets.load_returns()
+port = R.mean(axis=1).to_numpy()  # equal-weight basket
+var1 = np.quantile(port, 0.01)
+fig, ax = plt.subplots(figsize=(10, 3.2))
+bins = np.linspace(port.min(), port.max(), 120)
+ax.hist(port[port > var1], bins=bins, color=COOL, alpha=0.7)
+ax.hist(port[port <= var1], bins=bins, color=CRASH, alpha=0.9)
+ax.axvline(var1, color=CRASH, lw=2.5, ls="--")
+ax.annotate(f"1% VaR = {var1:.1%}\nthe 1-in-100 morning", (var1, ax.get_ylim()[1] * 0.55),
+            xytext=(-10, 0), textcoords="offset points", ha="right",
+            fontsize=13, color=CRASH, fontweight="bold")
+ax.set_xlabel("daily return — equal-weight S&P basket (real data)")
+ax.set_yticks([]); despine(ax)
+fig.tight_layout(); plt.show()
+```
+
+A generator is only as good as the **tail** of the scenarios it produces.
+
+---
+
+## #1 Independent Resampling — The Idea
+
+The obvious move: resample each asset's history **on its own**.
+
+```
+scenario = ( resample(a) , resample(b) )     # each column separately
+```
+
+- Every **marginal** is exactly right — by construction
+- But this samples from $p(a)\,p(b)$ — *Module 1's shuffled reference!*
+- All dependence is destroyed before the first scenario is drawn
+
+. . .
+
+It can never produce the co-crash.  **And the co-crash is the risk.**
+
+## #1 Independent Resampling — In Pictures
 
 ```{python}
 #| echo: false
 #| fig-width: 10
 #| fig-height: 3.6
-gen2 = AnnealedRBIG(n_layers=30, random_state=0).fit(D).sample(n)
+rng = np.random.default_rng(1)
+n_draw = 20000
+idx = rng.integers(0, len(a), (n_draw, 2))
+indep_draws = np.column_stack([a[idx[:, 0]], b[idx[:, 1]]])
+indep_show = indep_draws[:2000]
 fig, (axL, axR) = plt.subplots(1, 2, figsize=(10, 3.6), sharex=True, sharey=True)
-for ax, data, col, name in [
-    (axL, D, COOL, f"real · co-crash {cocrash_fraction(D[:,0],D[:,1],0.05):.0%}"),
-    (axR, gen2, plotting.PALETTE["green"], f"RBIG · co-crash {cocrash_fraction(gen2[:,0],gen2[:,1],0.05):.0%}")]:
-    ax.scatter(data[:,0], data[:,1], s=6, c=col, alpha=0.3, edgecolors="none")
-    ax.set_xlim(-8,4); ax.set_ylim(-8,4); ax.set_title(name, fontsize=12)
+for ax, D, col, name in [
+    (axL, X, COOL, f"real · co-crash {cocrash_fraction(a, b, 0.05):.0%}"),
+    (axR, indep_show, CRASH,
+     f"independent · co-crash {cocrash_fraction(indep_draws[:, 0], indep_draws[:, 1], 0.05):.0%}")]:
+    ax.scatter(D[:, 0], D[:, 1], s=6, c=col, alpha=0.35, edgecolors="none")
+    ax.set_xlim(-5, 4); ax.set_ylim(-5, 4)
+    ax.set_title(name, fontsize=13)
     ax.set_xticks([]); ax.set_yticks([]); despine(ax)
 fig.tight_layout(); plt.show()
 ```
 
-## #4 The Other Uncertainty — Around a Prediction {.center}
+Identical marginals, unrecognizable joint: the diagonal — the days that hurt —
+is simply gone.
 
-So far we sampled the *joint* to price a portfolio. Now: the uncertainty around a
-single **prediction** $\hat y = f(x)$.
+---
 
-. . .
+## #2 Gaussian Monte-Carlo — The Idea
 
-Two different questions — two tools, no priors needed:
+Keep the co-movement: fit a covariance, sample a normal.
 
-- **aleatoric** — *how noisy is the world here?* (data noise)
-- **epistemic** — *have I even seen data here?* (model doubt)
+$$x = \mu + L z, \qquad z \sim \mathcal N(0, I), \qquad L L^\top = \Sigma$$
 
-## Tool A · Predict the Noise {auto-animate=true}
+- Captures **linear** co-movement — the cloud tilts correctly
+- But Gaussian tails are **thin**, and Gaussian extremes are **tail-independent**
+- *Module 1's lesson again: correlation is only the Gaussian shadow*
 
-Fit the mean $f(x)$; the **residuals are the noise**. One error bar assumes that
-noise is constant — it never is. So fit a *second* model to the squared residuals
-→ $\sigma(x)$, and band with $f(x)\pm 2\sigma(x)$.
+## #2 Gaussian Monte-Carlo — In Pictures
 
 ```{python}
 #| echo: false
 #| fig-width: 11
-#| fig-height: 3.3
-x, y = datasets.heteroscedastic_noise(n=250, seed=0)
-mu = np.polyval(np.polyfit(x, y, 5), x)
-r = y - mu
-sig = np.sqrt(np.clip(np.polyval(np.polyfit(x, r**2, 2), x), 1e-6, None))
-const = r.std()
-fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 3.3), sharey=True)
-axL.fill_between(x, mu - 2 * const, mu + 2 * const, color=CRASH, alpha=0.18)
-axL.scatter(x, y, s=10, c=INK, alpha=0.55); axL.plot(x, mu, c=INK, lw=2)
-axL.set_title(f"one error bar (constant)  ·  {np.mean(np.abs(r) <= 2 * const):.0%}",
+#| fig-height: 3.4
+gauss_draws = rng.multivariate_normal(X.mean(0), np.cov(X.T), size=n_draw)
+pr, pg = X.mean(1), gauss_draws.mean(1)
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 3.4))
+axL.scatter(X[:, 0], X[:, 1], s=6, c=COOL, alpha=0.3, edgecolors="none", label="real")
+axL.scatter(gauss_draws[:2000, 0], gauss_draws[:2000, 1], s=6, c=WARM, alpha=0.25,
+            edgecolors="none", label="Gaussian MC")
+axL.set_xlim(-5, 4); axL.set_ylim(-5, 4); axL.set_xticks([]); axL.set_yticks([])
+axL.legend(fontsize=11, frameon=False, markerscale=2); despine(axL)
+bins = np.linspace(min(pr.min(), pg.min()), 3, 60)
+axR.hist(pr, bins=bins, density=True, color=COOL, alpha=0.55, label="real")
+axR.hist(pg, bins=bins, density=True, color=WARM, alpha=0.5, label="Gaussian MC")
+axR.axvline(np.quantile(pr, 0.01), color=COOL, lw=2, ls="--")
+axR.axvline(np.quantile(pg, 0.01), color=WARM, lw=2, ls="--")
+axR.set_title(f"1% VaR · real {np.quantile(pr, 0.01):.2f} vs Gaussian {np.quantile(pg, 0.01):.2f}",
+              fontsize=13)
+axR.set_yticks([]); axR.legend(fontsize=11, frameon=False); despine(axR)
+fig.tight_layout(); plt.show()
+```
+
+Same cloud in the middle — **too-optimistic VaR** exactly where it matters.
+
+---
+
+## #3 Student-t Monte-Carlo — The Idea
+
+Patch the tails **by hand**: keep $\mu$ and $\Sigma$, swap the bell for a fatter one.
+
+$$x = \mu + \frac{L z}{\sqrt{g/\nu}}, \qquad z \sim \mathcal N(0, I), \quad g \sim \chi^2_\nu$$
+
+- One new knob — $\nu$: smaller $\nu$, fatter tails ($\nu \to \infty$ recovers the Gaussian)
+- Real **tail dependence**: one big shock $g$ scales both assets at once
+- But the shape is still **assumed**: symmetric, one global $\nu$ for every tail
+
+. . .
+
+*Module 1's fork, again: **assume** the shape — or **learn** it.*
+
+## #3 Student-t Monte-Carlo — In Pictures
+
+```{python}
+#| echo: false
+#| fig-width: 11
+#| fig-height: 3.4
+from scipy.stats import multivariate_t
+PURPLE = plotting.PALETTE["purple"]
+
+
+def fit_t_df(D):
+    mu, S = D.mean(0), np.cov(D.T)
+    grid_df = (2.5, 3, 4, 5, 6, 8, 12)
+    lls = [multivariate_t(mu, S * (d - 2) / d, df=d).logpdf(D).sum() for d in grid_df]
+    return grid_df[int(np.argmax(lls))]
+
+
+def sample_t(D, df, size, rng_):
+    mu, S = D.mean(0), np.cov(D.T)
+    L = np.linalg.cholesky(S * (df - 2) / df)
+    z = rng_.normal(size=(size, 2)) @ L.T
+    g = rng_.chisquare(df, size)
+    return mu + z / np.sqrt(g / df)[:, None]
+
+
+df_fit = fit_t_df(X)
+t_draws = sample_t(X, df_fit, n_draw, rng)
+pt = t_draws.mean(1)
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 3.4))
+axL.scatter(X[:, 0], X[:, 1], s=6, c=COOL, alpha=0.3, edgecolors="none", label="real")
+axL.scatter(t_draws[:2000, 0], t_draws[:2000, 1], s=6, c=PURPLE, alpha=0.25,
+            edgecolors="none", label=f"Student-t (ν = {df_fit:g})")
+axL.set_xlim(-5, 4); axL.set_ylim(-5, 4); axL.set_xticks([]); axL.set_yticks([])
+axL.legend(fontsize=11, frameon=False, markerscale=2); despine(axL)
+bins = np.linspace(min(pr.min(), pt.min()), 3, 60)
+axR.hist(pr, bins=bins, density=True, color=COOL, alpha=0.55, label="real")
+axR.hist(pt, bins=bins, density=True, color=PURPLE, alpha=0.4, label="Student-t")
+axR.axvline(np.quantile(pr, 0.01), color=COOL, lw=2, ls="--")
+axR.axvline(np.quantile(pt, 0.01), color=PURPLE, lw=2, ls="--")
+axR.set_title(f"1% VaR · real {np.quantile(pr, 0.01):.2f} vs Student-t {np.quantile(pt, 0.01):.2f}",
+              fontsize=13)
+axR.set_yticks([]); axR.legend(fontsize=11, frameon=False); despine(axR)
+fig.tight_layout(); plt.show()
+```
+
+The fitted $\nu$ brings the tail back to life.  No surprise — these banks were
+*manufactured* from a Student-t, so the guessed family is exactly right.
+**Hold that thought for the punchline.**
+
+---
+
+## #4 RBIG Backward — The Spine
+
+$$\underbrace{z = T(x)}_{\text{forward: measure / remove}}
+\qquad
+\underbrace{x = T^{-1}(z)}_{\text{backward: propagate}}$$
+
+- The map that **measured** dependence (M1) and **removed** it (M2),
+  run in reverse, **generates**
+- Draw $z \sim \mathcal N(0, I)$, invert → a real, dependent, fat-tailed scenario
+- The change-of-variables formula is the warranty:
+  $p_X(x) = p_Z(T(x))\,\lvert\det J\rvert$
+
+## #4 RBIG Backward — In Pictures
+
+```{python}
+#| echo: false
+#| fig-width: 10
+#| fig-height: 3.6
+rbig_draws = AnnealedRBIG(n_layers=30, random_state=0).fit(X).sample(n_draw)
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(10, 3.6), sharex=True, sharey=True)
+for ax, D, col, name in [
+    (axL, X, COOL, f"real · co-crash {cocrash_fraction(a, b, 0.05):.0%}"),
+    (axR, rbig_draws[:2000], GREEN,
+     f"RBIG · co-crash {cocrash_fraction(rbig_draws[:, 0], rbig_draws[:, 1], 0.05):.0%}")]:
+    ax.scatter(D[:, 0], D[:, 1], s=6, c=col, alpha=0.3, edgecolors="none")
+    ax.set_xlim(-5, 4); ax.set_ylim(-5, 4); ax.set_title(name, fontsize=13)
+    ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+fig.tight_layout(); plt.show()
+```
+
+Learned joint, learned tails: the diagonal of joint crashes survives the
+round-trip through Gaussian space.
+
+---
+
+## Every Generator, Same Exam
+
+```{python}
+#| echo: false
+#| fig-width: 11
+#| fig-height: 3.6
+names = ["real\n(the data)", "#1\nindependent", "#2\nGaussian MC", "#3\nStudent-t", "#4\nRBIG"]
+sets = [X, indep_draws, gauss_draws, t_draws, rbig_draws]
+cols = [INK, CRASH, WARM, PURPLE, GREEN]
+cocrash = [cocrash_fraction(S[:, 0], S[:, 1], 0.05) for S in sets]
+var1s = [np.quantile(S.mean(1), 0.01) for S in sets]
+xs = np.arange(5)
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 3.6))
+axL.bar(xs, cocrash, 0.6, color=cols)
+axL.axhline(cocrash[0], color=INK, lw=1.4, ls="--")
+axL.set_title("co-crash rate (both in worst 5%)", fontsize=13)
+axR.bar(xs, var1s, 0.6, color=cols)
+axR.axhline(var1s[0], color=INK, lw=1.4, ls="--")
+axR.set_title("1% VaR of the 50/50 portfolio", fontsize=13)
+for ax in (axL, axR):
+    ax.set_xticks(xs); ax.set_xticklabels(names, fontsize=9.5)
+    despine(ax)
+fig.tight_layout(); plt.show()
+```
+
+Independent fails both; Gaussian shaves the tail.  Student-t nearly aces the
+exam — but these banks were *built* from a t, so its guess is exactly right.
+**RBIG gets there with no guess at all.**  Real data gets the final word —
+
+---
+
+## Act 2 · Doubt Around a Prediction {.center}
+
+Act 1 sampled the *world*.  Act 2 asks about a single model:
+how wrong is $\hat y = f(x)$ — **here, at this $x$**?
+
+. . .
+
+Two different doubts hide in that question, and they demand different tools:
+
+- **aleatoric** — *how noisy is the world here?* — predict it
+- **epistemic** — *have I even seen data here?* — admit it
+
+## Two Flavors, One Picture
+
+```{python}
+#| echo: false
+#| fig-width: 11
+#| fig-height: 3.8
+xs_grid = np.linspace(-4.0, 4.0, 400)
+# aleatoric: one net, two outputs (μ, log σ), trained with the Gaussian NLL
+char_net = make_mlp(n_out=2, seed=0)
+char_net.compile(optimizer=keras.optimizers.Adam(0.01), loss=gaussian_nll)
+char_net.fit(xg[:, None], yg[:, None], epochs=800, batch_size=xg.size, verbose=0)
+pred_char = char_net.predict(xs_grid[:, None], verbose=0)
+mu_fit, sig_alea = pred_char[:, 0], np.exp(pred_char[:, 1])
+# epistemic: a deep ensemble — retrain the same net on bootstrap resamples
+members = []
+for k in range(15):
+    rng_k = np.random.default_rng(k)
+    idx = rng_k.integers(0, xg.size, xg.size)
+    net_k = make_mlp(n_out=1, seed=k)
+    net_k.compile(optimizer=keras.optimizers.Adam(0.01), loss="mse")
+    net_k.fit(xg[idx][:, None], yg[idx][:, None], epochs=600, batch_size=xg.size, verbose=0)
+    members.append(net_k.predict(xs_grid[:, None], verbose=0)[:, 0])
+ens = np.stack(members)
+sig_epi = ens.std(0)
+fig, ax = plt.subplots(figsize=(11, 3.8))
+for member in ens[:16]:
+    ax.plot(xs_grid, member, c=GREEN, lw=0.7, alpha=0.5)
+ax.fill_between(xs_grid, mu_fit - 2 * sig_alea, mu_fit + 2 * sig_alea, color=COOL, alpha=0.30)
+ax.plot(xs_grid, mu_fit, c=INK, lw=2)
+ax.scatter(xg, yg, s=16, c=INK, zorder=5)
+ax.set_ylim(-3.0, 3.0)
+ax.annotate("EPISTEMIC\nmodel doubt — no data here\n(more data would fix it)",
+            (0, 2.0), ha="center", fontsize=12, color=GREEN, fontweight="bold")
+ax.annotate("ALEATORIC\nworld noise\n(more data won't help)",
+            (2.4, -2.5), ha="center", fontsize=12, color=COOL, fontweight="bold")
+ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+fig.tight_layout(); plt.show()
+```
+
+The litmus test: **would more data shrink it?**  Yes → epistemic.  No → aleatoric.
+
+---
+
+## Tool A · Predict the Noise — The Idea
+
+Give the network **two outputs** per input — the prediction *and* its own noise:
+
+$$y = \mu(x) + \sigma(x)\,\varepsilon
+\qquad\quad
+L = \frac{\big(y-\mu(x)\big)^2}{2\,\sigma(x)^2} + \log \sigma(x)$$
+
+1. One net, two heads: $\mu(x)$ and $\log\sigma(x)$ — trained **together**
+2. The loss is the Gaussian **negative log-likelihood**
+3. Big errors are *forgiven* where $\sigma(x)$ is declared large…
+4. …but declaring it large everywhere is *taxed* by $\log\sigma$
+
+. . .
+
+**The loss is the noise model, trained.**  Band with $\mu(x) \pm 2\,\sigma(x)$.
+
+## Tool A · Predict the Noise — In Pictures
+
+```{python}
+#| echo: false
+#| fig-width: 11
+#| fig-height: 3.0
+x2, y2 = datasets.heteroscedastic_noise(n=250, seed=0)
+order2 = np.argsort(x2)
+x2, y2 = x2[order2], y2[order2]
+# the alternative: an MSE net wearing one constant bar
+mean_net = make_mlp(n_out=1, seed=1)
+mean_net.compile(optimizer=keras.optimizers.Adam(0.01), loss="mse")
+mean_net.fit(x2[:, None], y2[:, None], epochs=500, batch_size=64, verbose=0)
+mu2 = mean_net.predict(x2[:, None], verbose=0)[:, 0]
+const = (y2 - mu2).std()
+# the tool: one net, two outputs, NLL loss
+noise_net = make_mlp(n_out=2, seed=2)
+noise_net.compile(optimizer=keras.optimizers.Adam(0.01), loss=gaussian_nll)
+noise_net.fit(x2[:, None], y2[:, None], epochs=800, batch_size=64, verbose=0)
+pred2 = noise_net.predict(x2[:, None], verbose=0)
+mu2b, sig2 = pred2[:, 0], np.exp(pred2[:, 1])
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 3.0), sharey=True)
+axL.fill_between(x2, mu2 - 2 * const, mu2 + 2 * const, color=CRASH, alpha=0.18)
+axL.scatter(x2, y2, s=10, c=INK, alpha=0.55); axL.plot(x2, mu2, c=INK, lw=2)
+axL.set_title(f"MSE net + one global bar  ·  {np.mean(np.abs(y2 - mu2) <= 2 * const):.0%}",
               fontsize=11)
-axR.fill_between(x, mu - 2 * sig, mu + 2 * sig, color=COOL, alpha=0.30)
-axR.scatter(x, y, s=10, c=INK, alpha=0.55); axR.plot(x, mu, c=INK, lw=2)
-axR.set_title(f"predicted σ(x) — breathes  ·  {np.mean(np.abs(r) <= 2 * sig):.0%}",
+axR.fill_between(x2, mu2b - 2 * sig2, mu2b + 2 * sig2, color=COOL, alpha=0.30)
+axR.scatter(x2, y2, s=10, c=INK, alpha=0.55); axR.plot(x2, mu2b, c=INK, lw=2)
+axR.set_title(f"NLL net — σ(x) breathes  ·  {np.mean(np.abs(y2 - mu2b) <= 2 * sig2):.0%}",
               fontsize=11)
 for ax in (axL, axR):
     ax.set_xlabel("x"); ax.set_xticks([]); ax.set_yticks([]); despine(ax)
 fig.tight_layout(); plt.show()
 ```
 
-Same coverage — but the constant bar cries wolf in the calm zone. $\sigma(x)$ puts
-the doubt where the world is actually noisy.
+Same coverage — but the constant bar cries wolf in the calm zone.  $\sigma(x)$
+puts the doubt where the world is actually noisy.
 
-## Aleatoric Is Volatility {auto-animate=true}
+## Aleatoric Is Volatility
 
-In markets the noise has a name — **volatility** — and it is *predictable*: it
-clusters. Forecast $\sigma_t$ from the recent past (EWMA) and band with
-$\pm 2\sigma_t$.
+Market noise — **volatility** — clusters, so it is *predictable*: forecast
+$\sigma_t$ from the recent past (EWMA) and band with $\pm 2\sigma_t$.
 
 ```{python}
 #| echo: false
 #| fig-width: 11
-#| fig-height: 3.4
-R = datasets.load_returns()
+#| fig-height: 3.0
 r = R["JPM"].to_numpy(); dates = R.index
 lam, v = 0.94, np.empty_like(r)
 v[0] = np.var(r[:20])
 for tt in range(1, len(r)):
     v[tt] = lam * v[tt - 1] + (1 - lam) * r[tt - 1] ** 2  # causal: uses only the past
-sig = np.sqrt(v)
-cover = np.mean(np.abs(r) <= 2 * sig)
-fig, ax = plt.subplots(figsize=(11, 3.4))
-ax.fill_between(dates, -2 * sig, 2 * sig, color=COOL, alpha=0.35,
+ewma_sig = np.sqrt(v)
+fig, ax = plt.subplots(figsize=(11, 3.0))
+ax.fill_between(dates, -2 * ewma_sig, 2 * ewma_sig, color=COOL, alpha=0.35,
                 label="±2σ̂  (volatility forecast)")
 ax.plot(dates, r, c=INK, lw=0.5, alpha=0.8)
 mark_event(ax, pd.Timestamp("2008-09-15"), "Lehman")
@@ -219,62 +524,172 @@ ax.legend(loc="lower left", fontsize=11, frameon=False); despine(ax)
 fig.tight_layout(); plt.show()
 ```
 
-The band widens exactly when it must — yet still misses ~6% of days (it should
-miss 5%): fat tails. Gaussianize the residuals to close the gap (Module 2).
+The band widens exactly when it must.  But did it keep its promise?  That
+question has a name —
 
-## Tool B · Ensembles — Does the Model Know?
+## Calibration — Keeping the 95% Promise
 
-Refit on resampled data → an **ensemble**. Where the members *agree*, the model is
-sure; where they *fan out*, it isn't — and that happens where it has seen no data.
+A 95% band is a **promise**: one day in twenty outside, *no matter when*.
 
 ```{python}
 #| echo: false
-#| fig-width: 9
-#| fig-height: 3.4
-x, y = datasets.heteroscedastic_gap(n=60, seed=0)
-xs = np.linspace(-5, 5, 300)
-rng = np.random.default_rng(0)
-ens = np.array([np.polyval(np.polyfit(x[i], y[i], 5), xs)
-                for i in (rng.integers(0, x.size, x.size) for _ in range(40))])
-em, esd = ens.mean(0), ens.std(0)
-fig, ax = plt.subplots(figsize=(9, 3.4))
-ax.fill_between(xs, em - 2 * esd, em + 2 * esd, color=plotting.PALETTE["green"], alpha=0.25)
-for member in ens[:12]:
-    ax.plot(xs, member, c=plotting.PALETTE["green"], lw=0.6, alpha=0.4)
-ax.plot(xs, em, c=INK, lw=2); ax.scatter(x, y, s=16, c=INK, zorder=5)
-ax.axvspan(-1, 1, color=CRASH, alpha=0.08); ax.set_ylim(-2.2, 2.2)
-ax.set_xlabel("x"); ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+#| fig-width: 11
+#| fig-height: 3.2
+const_sig = r.std()
+miss_c = np.abs(r) > 2 * const_sig
+miss_e = np.abs(r) > 2 * ewma_sig
+fig, axes = plt.subplots(2, 1, figsize=(11, 3.2), sharex=True)
+for ax, miss, name, col in [
+    (axes[0], miss_c, f"constant band — covers {1 - miss_c.mean():.0%} overall, but misses cluster in crises", CRASH),
+    (axes[1], miss_e, f"volatility band — covers {1 - miss_e.mean():.0%}, misses spread out", COOL)]:
+    ax.vlines(dates[miss], 0, 1, color=col, lw=0.7, alpha=0.8)
+    ax.set_yticks([]); ax.set_title(name, fontsize=12, loc="left")
+    despine(ax); ax.spines["left"].set_visible(False)
+axes[1].set_xlabel("days outside the 95% band — JPM, real data")
 fig.tight_layout(); plt.show()
 ```
 
-Epistemic uncertainty **balloons in the gap**. Add the two:
-$\sigma_{\text{aleatoric}}(x)^2 + \sigma_{\text{epistemic}}(x)^2$.
+Headline coverage can lie: the constant band passes *on average* and fails
+every crisis.  The honest band still runs ~1% hot — **fat tails** (Module 2's
+cure).
+
+---
+
+## Tool B · Ensembles — The Idea
+
+Aleatoric noise was learnable by a loss.  Model doubt is invisible to a
+single net — **a network cannot grade its own homework**.
 
 . . .
 
-*(A Bayesian net is the principled limit; a deep ensemble is the cheap, robust
-stand-in — same answer, far less machinery.)*
+So ask a committee:
 
-## The Capstone — One Machine, Three Uses {.center}
+1. **Retrain the same net** on resampled data, fresh init each time → a **deep ensemble**
+2. Where members **agree**, the data pinned the model down
+3. Where they **fan out**, the model is guessing — it has seen nothing there
+
+. . .
+
+*(MC dropout = a committee inside one net; a full Bayesian net is the
+principled limit.  The deep ensemble is the one you build with a `for` loop.)*
+
+## Tool B · Ensembles — In Pictures
+
+```{python}
+#| echo: false
+#| fig-width: 10.5
+#| fig-height: 3.2
+fig, ax = plt.subplots(figsize=(10.5, 3.2))
+ax.fill_between(xs_grid, ens.mean(0) - 2 * sig_epi, ens.mean(0) + 2 * sig_epi,
+                color=GREEN, alpha=0.25)
+for member in ens[:14]:
+    ax.plot(xs_grid, member, c=GREEN, lw=0.7, alpha=0.5)
+ax.plot(xs_grid, ens.mean(0), c=INK, lw=2)
+ax.scatter(xg, yg, s=16, c=INK, zorder=5)
+ax.axvspan(-1.4, 1.4, color=CRASH, alpha=0.07)
+ax.set_ylim(-3.0, 3.0)
+ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+fig.tight_layout(); plt.show()
+```
+
+Fifteen retrainings of the same net: agreement where there is data, a
+**balloon of honest doubt** over the hole — where a single net just
+confidently invents a curve.
+
+## Total Doubt = Noise + Ignorance
+
+The two flavors **add in quadrature** — and each dominates where it should:
+
+```{python}
+#| echo: false
+#| fig-width: 11
+#| fig-height: 3.6
+total = np.sqrt(sig_alea**2 + sig_epi**2)
+fig, ax = plt.subplots(figsize=(11, 3.6))
+ax.fill_between(xs_grid, mu_fit - 2 * total, mu_fit + 2 * total, color=GREEN, alpha=0.25,
+                label="total = √(aleatoric² + epistemic²)")
+ax.fill_between(xs_grid, mu_fit - 2 * sig_alea, mu_fit + 2 * sig_alea, color=COOL, alpha=0.40,
+                label="aleatoric  σ(x)")
+ax.plot(xs_grid, mu_fit, c=INK, lw=2)
+ax.scatter(xg, yg, s=16, c=INK, zorder=5)
+ax.set_ylim(-3.2, 3.2)
+ax.legend(fontsize=12, frameon=False, loc="upper left")
+ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+fig.tight_layout(); plt.show()
+```
+
+Where there is data, total ≈ aleatoric; over the hole, the epistemic balloon
+takes over.  **One band, two honest ingredients.**
+
+---
+
+## One Grid — Where Does the Doubt Live?
+
+|  | **ALEATORIC** · the world's noise | **EPISTEMIC** · the model's doubt |
+|---|---|---|
+| **diagnose** | residuals cluster; tails stay fat | ensemble members disagree |
+| **respond** | *predict it*: an NLL net's $\sigma(x)$, EWMA, learned joint | *admit it*: widen claims, gather data |
+| **at portfolio scale** | sample the learned joint (RBIG) | every generator takes the same exam |
+
+. . .
+
+More data shrinks only the **right-hand column** — confusing the two
+is how 95% promises get broken.
+
+## The Capstone — One Machine, Three Uses
 
 ```{python}
 #| echo: false
 #| fig-width: 11
 #| fig-height: 3.0
-rng = np.random.default_rng(0); n = 1400
-f = rng.standard_t(5, n)
-a = 0.85*f + 0.35*rng.standard_t(5, n); b = 0.85*f + 0.35*rng.standard_t(5, n)
-Xd = np.column_stack([a, b]); Xd = (Xd-Xd.mean(0))/Xd.std(0)
+rng3 = np.random.default_rng(0); n3 = 1400
+f3 = rng3.standard_t(5, n3)
+a3 = 0.85*f3 + 0.35*rng3.standard_t(5, n3); b3 = 0.85*f3 + 0.35*rng3.standard_t(5, n3)
+Xd = np.column_stack([a3, b3]); Xd = (Xd-Xd.mean(0))/Xd.std(0)
 Z = AnnealedRBIG(n_layers=30, random_state=0).fit_transform(Xd)
 fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 3.0))
 axL.scatter(Xd[:,0], Xd[:,1], s=6, c=COOL, alpha=0.35, edgecolors="none")
 axL.set_title("DATA  (correlated, fat-tailed)", fontsize=12); axL.set_xticks([]); axL.set_yticks([]); despine(axL)
-axR.scatter(Z[:,0], Z[:,1], s=6, c=plotting.PALETTE["green"], alpha=0.35, edgecolors="none")
+axR.scatter(Z[:,0], Z[:,1], s=6, c=GREEN, alpha=0.35, edgecolors="none")
 axR.set_title("GAUSSIAN  (independent, spherical)", fontsize=12); axR.set_xticks([]); axR.set_yticks([]); despine(axR)
 fig.tight_layout(); plt.show()
 ```
 
 **forward** → measure (M1) · remove (M4)    |    **backward** → propagate (M3)
+
+## The Punchline → Lab
+
+The exam, on **real JPM & BAC** — what does the 1-in-100 morning cost?
+
+```{python}
+#| echo: false
+#| fig-width: 8.5
+#| fig-height: 3.2
+Xr = R[["JPM", "BAC"]].to_numpy()
+rng4 = np.random.default_rng(0)
+gauss_r = rng4.multivariate_normal(Xr.mean(0), np.cov(Xr.T), size=20000)
+df_r = fit_t_df(Xr)
+t_r = sample_t(Xr, df_r, 20000, rng4)
+rbig_r = AnnealedRBIG(n_layers=30, random_state=0).fit(Xr).sample(20000)
+names_r = ["real data", "Gaussian MC", f"Student-t (ν = {df_r:g})", "RBIG"]
+vals = [np.quantile(S.mean(1), 0.01) for S in (Xr, gauss_r, t_r, rbig_r)]
+cols_r = [INK, WARM, PURPLE, GREEN]
+fig, ax = plt.subplots(figsize=(9.5, 3.2))
+ax.bar(np.arange(4), vals, 0.55, color=cols_r)
+ax.axhline(vals[0], color=INK, lw=1.4, ls="--")
+for k, vv in enumerate(vals):
+    ax.text(k, vv / 2, f"{vv:.1%}", ha="center", va="center", fontsize=15,
+            fontweight="bold", color="white")
+ax.set_xticks(np.arange(4)); ax.set_xticklabels(names_r, fontsize=12)
+ax.set_ylabel("1% VaR · JPM/BAC 50:50")
+ax.set_yticks([]); despine(ax)
+fig.tight_layout(); plt.show()
+```
+
+The Gaussian shaves a full point off the worst mornings — and the Student-t,
+hero of the synthetic exam, does **no better here**: real crashes are *skewed*,
+and no symmetric bell can say so.  RBIG, guessing nothing, wins back most of
+the gap.  *In the lab: you build this.*
 
 ## The Whole Course, One Line {.center}
 

@@ -5,7 +5,7 @@ format:
   revealjs:
     theme: [default, ../../../styles/slides.scss]
     slide-number: true
-    incremental: true
+    incremental: false # bullets show immediately; use explicit ". . ." pauses for staging
     transition: fade
     fig-align: center
     auto-stretch: false # keep figures at their natural aspect (no fill-to-height distortion)
@@ -62,15 +62,15 @@ $$p_X(x)\,\Delta x \;=\; p_Z(z)\,\Delta z$$
 
 ```{python}
 #| echo: false
-#| fig-width: 9.5
-#| fig-height: 3.0
+#| fig-width: 10.5
+#| fig-height: 2.6
 xs = np.linspace(0, 4.5, 500)
 pX = np.exp(-xs)  # an illustrative skewed source density
 x0, dx = 0.8, 0.7
 F = 1 - np.exp(-np.array([x0, x0 + dx]))  # mass to the left of each edge
 z0, z1 = norm.ppf(F)  # the same mass mapped onto N(0,1)
 zs = np.linspace(-3.5, 3.5, 500)
-fig, (axL, axR) = plt.subplots(1, 2, figsize=(9.5, 3.0))
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(10.5, 2.6))
 axL.plot(xs, pX, color=WARM, lw=2.2)
 axL.fill_between(xs, pX, where=(xs >= x0) & (xs <= x0 + dx), color=WARM, alpha=0.5)
 axL.set_ylim(-0.26, 1.05); axL.set_yticks([]); axL.set_xlabel("x")
@@ -91,8 +91,7 @@ fig.suptitle("same shaded mass · different width", fontsize=12)
 fig.tight_layout(); plt.show()
 ```
 
-**Density = mass ÷ width.** Stretch the slab and the density must drop to keep the
-two shaded areas equal.
+**Density = mass ÷ width** — stretch the slab and the density must drop.
 
 ## Change of Variables · The Jacobian Is the Stretch
 
@@ -113,7 +112,7 @@ d\text{-dim:}\quad & p_X(x) = p_Z\big(T(x)\big)\,\Big|\det \tfrac{\partial T}{\p
 
 ---
 
-## #1 The 1-D Move: Rank → Gaussian {auto-animate=true}
+## #1 The 1-D Move: Rank → Gaussian
 
 $$T(x) = \Phi^{-1}\big(\hat F(x)\big)$$
 
@@ -122,10 +121,10 @@ Empirical CDF (→ uniform), then inverse Gaussian CDF. Monotone ⇒ invertible.
 ```{python}
 #| echo: false
 #| fig-width: 10
-#| fig-height: 3.4
+#| fig-height: 3.0
 rng = np.random.default_rng(0)
 v = rng.exponential(size=4000); g = gaussianize_1d(v)
-fig, (axL, axR) = plt.subplots(1, 2, figsize=(10, 3.4))
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(10, 3.0))
 axL.hist(v, bins=40, color=WARM, alpha=0.85, density=True)
 axL.set_title("before: skewed", fontsize=12); despine(axL)
 grid = np.linspace(-4, 4, 200)
@@ -143,12 +142,12 @@ The 1-D move fixes one axis at a time. Apply it to **both** axes of a V:
 
 ```{python}
 #| echo: false
-#| fig-width: 9
-#| fig-height: 3.4
+#| fig-width: 10
+#| fig-height: 3.0
 u, v = datasets.convex_payoff(n=1200, seed=0)
 XV = np.column_stack([u, v]); XV = (XV - XV.mean(0)) / XV.std(0)
 GV = np.column_stack([gaussianize_1d(XV[:, 0]), gaussianize_1d(XV[:, 1])])
-fig, (axL, axR) = plt.subplots(1, 2, figsize=(9, 3.4))
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(10, 3.0))
 for ax, D, t in [(axL, XV, "data: a V"),
                  (axR, GV, r"both marginals $\to \mathcal{N}(0,1)$")]:
     ax.scatter(D[:, 0], D[:, 1], s=7, c=COOL, alpha=0.4, edgecolors="none")
@@ -156,9 +155,8 @@ for ax, D, t in [(axL, XV, "data: a V"),
 fig.tight_layout(); plt.show()
 ```
 
-Both axes are now exactly Gaussian — yet the joint is **still a V**. The dependence
-lives *between* the axes, where a per-axis map can't reach: **marginalizing alone
-can't make it Gaussian.**
+Both marginals are now exactly Gaussian — yet the joint is **still a V**: the
+dependence lives *between* the axes, beyond any per-axis map.
 
 ## #2 RBIG · Rotate, Re-Gaussianize, Repeat
 
@@ -190,9 +188,7 @@ for ax, (t, D) in zip(axes, seq):
 fig.tight_layout(); plt.show()
 ```
 
-Each rotation turns hidden dependence into visible non-Gaussian marginals; each
-gaussianize flattens it. Loop until the cloud is round — **that alternation, not
-marginals alone, is RBIG.**
+Loop until the cloud is round — **that alternation, not marginals alone, is RBIG.**
 
 ## #2 Forward to Gaussian, Backward to Data
 
@@ -223,8 +219,8 @@ they **overlap** — the room you save is exactly what they *share*.
 
 ```{python}
 #| echo: false
-#| fig-width: 8
-#| fig-height: 3.4
+#| fig-width: 9.5
+#| fig-height: 3.2
 from matplotlib.patches import Ellipse
 rng = np.random.default_rng(3)
 n = 1200
@@ -244,7 +240,7 @@ def cov_ellipse(ax, cov, color):
 
 
 lim = 3.6
-fig, (axL, axR) = plt.subplots(1, 2, figsize=(8, 3.4))
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(9.5, 3.2))
 for ax, D, cov, t in [
     (axL, L, [[1, 0], [0, 1]], "loose — fills the bowl"),
     (axR, M, [[1, rho], [rho, 1]], "bound into a meatball — tighter"),
@@ -256,38 +252,41 @@ for ax, D, cov, t in [
 fig.tight_layout(); plt.show()
 ```
 
-Same marginals both sides — only the binding differs. That saved room, every
-marginal's spread minus the joint's, is **total correlation**:
+Same marginals both sides — only the binding differs.
+
+## #3 The Saved Room *Is* Total Correlation
+
+That saved room — every marginal's spread minus the joint's — has a name:
 
 $$\mathrm{TC}(x) = \sum_i H(x_i) - H(x) = \operatorname{KL}\!\big(p \,\|\, \textstyle\prod_i p_i\big)$$
 
+. . .
+
 Gaussianize and you can squeeze it out — and *measure* it — even in high dimensions.
 
-## #3 Back to ρ — Comparable With the Other Roads
+## #3 From Bits Back to ρ
 
-Two variables ⇒ total correlation **is** mutual information. For a Gaussian it's a
-clean function of ρ:
-
-$$I(X;Y) = -\tfrac12\ln\!\big(1-\rho^2\big)$$
+Two variables ⇒ total correlation **is** mutual information — and for a Gaussian
+it's a clean function of ρ:
 
 ```{python}
 #| echo: false
-#| fig-width: 7
-#| fig-height: 3.0
+#| fig-width: 9
+#| fig-height: 2.8
 rng = np.random.default_rng(0)
 rhos = np.linspace(0, 0.9, 10)
 truth = [-0.5 * np.log(1 - r**2) for r in rhos]
 est = [mutual_information_xy(*rng.multivariate_normal([0, 0], [[1, r], [r, 1]],
        size=4000).T, bins=24) for r in rhos]
-fig, ax = plt.subplots(figsize=(7, 3.0))
+fig, ax = plt.subplots(figsize=(9, 2.8))
 ax.plot(rhos, truth, c=INK, lw=2.4, label="exact  −½ln(1−ρ²)")
 ax.plot(rhos, est, "o", c=COOL, label="estimate")
 ax.set_xlabel("ρ"); ax.set_ylabel("MI (nats)"); ax.legend(fontsize=10, frameon=False)
 despine(ax); fig.tight_layout(); plt.show()
 ```
 
-Linfoot puts those nats back on the correlation scale, $R=\sqrt{1-e^{-2I}}$, so MI
-lines up beside Pearson, Spearman, dCor and HSIC on the scorecard.
+Linfoot, $R=\sqrt{1-e^{-2I}}$, puts those nats back on the correlation scale —
+so MI sits beside Pearson, dCor and HSIC on the scorecard.
 
 ## #4 Normalizing Flows — Learn the Map {.center}
 
@@ -309,13 +308,14 @@ One invertible map, three jobs:
 
 . . .
 
-**measure** dependence (forward) · **remove** it (Module 4) · **generate** it
-(backward).
+- **measure** dependence — run it *forward*; what it removes is the answer
+- **remove** it — the same measure, as a training penalty *(Module 4)*
+- **generate** it — run it *backward*; sample the ball, invert *(Module 3)*
 
 . . .
 
-The demo fits RBIG and a flow on real returns, estimates mutual information, and
-samples scenarios that keep the co-crash.
+**The demo:** RBIG and a flow on real returns — estimate the mutual
+information, then sample scenarios that keep the co-crash.
 
 . . .
 

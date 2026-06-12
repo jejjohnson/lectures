@@ -1,7 +1,9 @@
 /*-- scss:defaults --*/
 // reveal.js slide theme — large type, finance-friendly, matches the site palette
 $font-family-sans-serif: "Inter", system-ui, sans-serif;
-$presentation-font-size-root: 34px;
+// 30px (down from 34) so dense slides stop wrapping every sentence onto two
+// lines — the main cause of content running off the bottom of the canvas.
+$presentation-font-size-root: 30px;
 $presentation-heading-font: "Inter", system-ui, sans-serif;
 $presentation-heading-color: #0f172a;
 $body-color: #1e293b;
@@ -15,7 +17,7 @@ $presentation-line-height: 1.5;
 .reveal h1, .reveal h2 { letter-spacing: -0.01em; }
 
 // Breathing room between the slide title and the body, and between blocks.
-.reveal h1, .reveal h2 { margin-bottom: 0.7em; line-height: 1.15; }
+.reveal h1, .reveal h2 { margin-bottom: 0.45em; line-height: 1.15; }
 .reveal h3, .reveal h4 { margin-top: 0.2em; margin-bottom: 0.5em; }
 .reveal .slides section p { margin: 0 0 0.75em; }
 .reveal .slides section p:last-child { margin-bottom: 0; }
@@ -25,14 +27,15 @@ $presentation-line-height: 1.5;
 .reveal .slides section li:last-child { margin-bottom: 0; }
 .reveal .slides section blockquote { margin: 0.8em 0; padding: 0.4em 1em; }
 // A touch more separation around tables and figures, too.
-.reveal .slides section table { margin: 0.6em 0; }
+// Tables get slightly smaller type so multi-column rows stay on one line.
+.reveal .slides section table { margin: 0.6em 0; font-size: 0.85em; }
 .reveal .slides section figure { margin: 0.5em 0; }
 
 // Cap figure height so tall plots never run off the bottom of a slide.
 // (auto-stretch is off to avoid aspect distortion, so we constrain here —
 // width:auto/height:auto keep the aspect ratio while max-height fits the slide.)
 .reveal .slides section img {
-  max-height: 500px;
+  max-height: 430px;
   width: auto;
   height: auto;
   display: block;        // center figures horizontally (prose stays left-aligned)

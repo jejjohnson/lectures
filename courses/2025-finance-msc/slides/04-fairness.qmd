@@ -5,7 +5,7 @@ format:
   revealjs:
     theme: [default, ../../../styles/slides.scss]
     slide-number: true
-    incremental: true
+    incremental: false # bullets show immediately; use explicit ". . ." pauses for staging
     transition: fade
     fig-align: center
     auto-stretch: false # keep figures at their natural aspect (no fill-to-height distortion)
@@ -99,7 +99,7 @@ measures from Module 1, now used to *audit* and to *train*.
 *(Other criteria condition on the true label — equalized odds, sufficiency — but
 all are dependence statements.)*
 
-## The Standard Check Is Blind {auto-animate=true}
+## The Standard Check Is Blind
 
 ```{python}
 #| echo: false
@@ -154,7 +154,7 @@ $$\text{loss} = \underbrace{\text{fit}(\hat y, y)}_{\text{predict well}}
 
 ---
 
-## #1 Drop the Feature — And Watch It Fail {auto-animate=true}
+## #1 Drop the Feature — And Watch It Fail
 
 The naive fix: delete $S$. But other features **proxy** for it.
 
@@ -288,9 +288,8 @@ axes[0].set_ylabel("E[ŷ | S]  (standardized)")
 fig.tight_layout(); plt.show()
 ```
 
-Each panel is the prediction's **average at each $S$**. Marginal Gaussianization
-barely bends the trend (CKA holds); only conditioning on $S$ makes
-$\mathrm{E}[\hat y \mid S]$ **flat** — the signature of genuine independence.
+Marginal Gaussianization barely bends the trend (CKA holds); only conditioning
+on $S$ flattens $\mathrm{E}[\hat y \mid S]$ — genuine independence.
 
 ## #3 The CKA Penalty — A Measure That Sees Curves
 
@@ -393,9 +392,8 @@ ax.set_xlabel("CKA(ŷ, S)  →  less neutral"); ax.set_ylabel("accuracy (R²)")
 despine(ax); fig.tight_layout(); plt.show()
 ```
 
-Read it right to left: each step left buys neutrality. Across the flat top it's
-nearly **free** — accuracy barely moves. Past the **elbow** the curve dives: every
-further drop in CKA now costs real accuracy.
+Read it right to left: across the flat top neutrality is nearly **free**; past
+the **elbow**, every further drop in CKA costs real accuracy.
 
 ## Reading the Frontier — Pick Your μ
 
