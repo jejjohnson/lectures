@@ -22,7 +22,33 @@ from rbig import AnnealedRBIG
 from lectures.measures import mutual_information_xy, cocrash_fraction
 plotting.set_style("slides")
 import numpy as np, matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
 from scipy.stats import norm
+
+
+def jointplot(fig, spec, data, color, title="", s=6, lim=None, equal=False, overlay=None):
+    """Scatter with top/right marginal histograms, drawn inside one GridSpec cell."""
+    sub = spec.subgridspec(2, 2, width_ratios=[5, 1.2], height_ratios=[1.2, 5],
+                           wspace=0.05, hspace=0.05)
+    axm = fig.add_subplot(sub[1, 0])
+    axt = fig.add_subplot(sub[0, 0], sharex=axm)
+    axr = fig.add_subplot(sub[1, 1], sharey=axm)
+    axm.scatter(data[:, 0], data[:, 1], s=s, c=color, alpha=0.4, edgecolors="none")
+    if overlay is not None:
+        overlay(axm)
+    axt.hist(data[:, 0], bins=42, color=color, alpha=0.8)
+    axr.hist(data[:, 1], bins=42, orientation="horizontal", color=color, alpha=0.8)
+    if lim is not None:
+        axm.set_xlim(*lim); axm.set_ylim(*lim)
+    if equal:
+        axm.set_aspect("equal")
+    axm.set_xticks([]); axm.set_yticks([]); despine(axm)
+    for a in (axt, axr):
+        a.set_xticks([]); a.set_yticks([])
+        for sp in a.spines.values():
+            sp.set_visible(False)
+    axt.set_title(title, fontsize=11)
+    return axm
 ```
 
 ## The Wish {.center}
@@ -112,29 +138,154 @@ d\text{-dim:}\quad & p_X(x) = p_Z\big(T(x)\big)\,\Big|\det \tfrac{\partial T}{\p
 
 ---
 
-## #1 The 1-D Move: Rank → Gaussian
+## #1 · Uniformize — the Probability Integral Transform
 
-$$T(x) = \Phi^{-1}\big(\hat F(x)\big)$$
+Push **any** variable through its **own** CDF $F_X$ and every shape collapses to a
+flat **Uniform(0,1)**:
 
-Empirical CDF (→ uniform), then inverse Gaussian CDF. Monotone ⇒ invertible.
+$$u = F_X(x)\ \sim\ \mathrm{Uniform}(0,1)$$
+
+```{python}
+#| echo: false
+#| fig-width: 10.5
+#| fig-height: 2.7
+rng = np.random.default_rng(0)
+x = rng.exponential(size=4000)
+xs = np.sort(x); Fc = np.arange(1, len(xs) + 1) / len(xs)
+u = np.interp(x, xs, Fc)
+fig, axes = plt.subplots(1, 3, figsize=(10.5, 2.7))
+axes[0].hist(x, bins=40, color=WARM, alpha=0.85, density=True)
+axes[0].set_title("data  x  (skewed)", fontsize=12)
+axes[1].plot(xs, Fc, color=INK, lw=2.4)
+axes[1].set_title(r"its CDF  $F_X$", fontsize=12); axes[1].set_xlabel("x")
+axes[2].hist(u, bins=20, color=COOL, alpha=0.85, density=True)
+axes[2].axhline(1.0, color=INK, lw=1.6, ls="--")
+axes[2].set_title(r"$u=F_X(x)$  — flat", fontsize=12)
+for a in axes:
+    a.set_yticks([]); despine(a)
+fig.tight_layout(); plt.show()
+```
+
+The CDF is a ruler in **probability** — it reads off *what fraction of the data sits
+below x*. That fraction is uniform by construction, whatever the original shape.
+
+## #1 · Inverse CDF — Uniform Becomes Anything
+
+Run it backward: feed a uniform into a **target's inverse CDF** $F^{-1}$ and you land
+in *any* law you choose:
+
+$$z = F^{-1}_{\text{target}}(u)$$
+
+```{python}
+#| echo: false
+#| fig-width: 10.5
+#| fig-height: 2.7
+from scipy.stats import laplace, t as student_t
+rng = np.random.default_rng(1)
+u = rng.uniform(size=9000)
+fig, axes = plt.subplots(1, 3, figsize=(10.5, 2.7))
+for ax, (name, z, c) in zip(axes, [
+        ("Gaussian  ·  Φ⁻¹", norm.ppf(u), COOL),
+        ("Laplace  ·  sharp peak", laplace.ppf(u), WARM),
+        ("Student-t(3)  ·  fat tails", student_t(3).ppf(u), plotting.PALETTE["green"])]):
+    ax.hist(np.clip(z, -6, 6), bins=60, range=(-6, 6), color=c, alpha=0.85, density=True)
+    ax.set_title(name, fontsize=12); ax.set_xlim(-6, 6); ax.set_yticks([]); despine(ax)
+fig.tight_layout(); plt.show()
+```
+
+Uniform is the **universal hub**: $x \to u \to$ *anything*. Gaussianizing is simply
+choosing the **Gaussian** exit.
+
+## #1 · Sampling, for Free — Invert the CDF
+
+To draw from *any* law: pick $u\sim$Uniform on the axis, ride up to the CDF, read off
+$z=F^{-1}(u)$. This *is* the backward, generative pass — no rejection, no MCMC.
+
+```{python}
+#| echo: false
+#| fig-width: 7.6
+#| fig-height: 3.3
+rng = np.random.default_rng(4)
+zs = np.linspace(-3.4, 3.4, 400)
+fig, ax = plt.subplots(figsize=(7.6, 3.3))
+ax.plot(zs, norm.cdf(zs), color=INK, lw=2.4)
+us = np.sort(rng.uniform(0.04, 0.96, size=9))
+for uu in us:
+    zz = norm.ppf(uu)
+    ax.plot([-3.5, zz], [uu, uu], color=COOL, lw=0.9, alpha=0.75)
+    ax.plot([zz, zz], [uu, 0], color=WARM, lw=0.9, alpha=0.75)
+    ax.scatter([zz], [0], color=WARM, s=26, zorder=5)
+ax.scatter([-3.5] * len(us), us, color=COOL, s=26, zorder=5)
+ax.set_xlim(-3.6, 3.6); ax.set_ylim(-0.01, 1.02)
+ax.set_xlabel(r"$z=\Phi^{-1}(u)$  →  Gaussian samples"); ax.set_ylabel(r"$u\sim$ Uniform")
+despine(ax); fig.tight_layout(); plt.show()
+```
+
+Even draws on $[0,1]$ in; correctly-shaped samples out — the density does the bending.
+
+## #1 · The 1-D Move = CDF, then Inverse-Gaussian
+
+Chain the two halves — uniformize, then exit through the **Gaussian**:
+
+$$T(x) = \Phi^{-1}\big(\hat F_X(x)\big)\,,\qquad
+\underbrace{\hat F_X}_{x\,\to\,u}\ \text{then}\ \underbrace{\Phi^{-1}}_{u\,\to\,z}$$
 
 ```{python}
 #| echo: false
 #| fig-width: 10
-#| fig-height: 3.0
+#| fig-height: 2.7
 rng = np.random.default_rng(0)
 v = rng.exponential(size=4000); g = gaussianize_1d(v)
-fig, (axL, axR) = plt.subplots(1, 2, figsize=(10, 3.0))
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(10, 2.7))
 axL.hist(v, bins=40, color=WARM, alpha=0.85, density=True)
-axL.set_title("before: skewed", fontsize=12); despine(axL)
+axL.set_title("before: skewed", fontsize=12)
 grid = np.linspace(-4, 4, 200)
 axR.hist(g, bins=40, color=COOL, alpha=0.85, density=True)
 axR.plot(grid, norm.pdf(grid), c=INK, lw=2)
-axR.set_title("after: standard normal", fontsize=12); despine(axR)
+axR.set_title("after: standard normal", fontsize=12)
+for a in (axL, axR):
+    a.set_yticks([]); despine(a)
 fig.tight_layout(); plt.show()
 ```
 
-It reshapes one marginal — but can't touch dependence *between* variables.
+One marginal, exactly **standard normal**, and monotone ⇒ **invertible** — but it
+reshapes one axis only. Dependence *between* axes is untouched.
+
+## Why Aim at a Gaussian?
+
+Any target is reachable — so why the bell?
+
+. . .
+
+```{python}
+#| echo: false
+#| fig-width: 7.4
+#| fig-height: 2.2
+rng = np.random.default_rng(1)
+G = rng.normal(size=(2500, 2)); U = rng.uniform(-1.7, 1.7, size=(2500, 2))
+
+
+def _rot(D, deg):
+    th = np.deg2rad(deg)
+    R = np.array([[np.cos(th), -np.sin(th)], [np.sin(th), np.cos(th)]])
+    return D @ R.T
+
+
+fig, axes = plt.subplots(1, 2, figsize=(7.4, 2.2))
+axes[0].scatter(*_rot(G, 35).T, s=4, c=COOL, alpha=0.3, edgecolors="none")
+axes[0].set_title("spin independent Gaussians\n→ still independent Gaussians", fontsize=10)
+axes[1].scatter(*_rot(U, 35).T, s=4, c=WARM, alpha=0.3, edgecolors="none")
+axes[1].set_title("spin independent uniforms\n→ now dependent", fontsize=10)
+for a in axes:
+    a.set_aspect("equal"); a.set_xticks([]); a.set_yticks([]); despine(a)
+fig.tight_layout(); plt.show()
+```
+
+. . .
+
+- **Maximum entropy** for a fixed variance — the least-committal target.
+- **Rotation-invariant** — the *only* shape a rotation keeps independent (the hinge the next step turns on).
+- Entropy, MI, tails — all in **closed form**.
 
 ## #2 RBIG · Why Gaussian Marginals Aren't Enough
 
@@ -142,21 +293,20 @@ The 1-D move fixes one axis at a time. Apply it to **both** axes of a V:
 
 ```{python}
 #| echo: false
-#| fig-width: 10
-#| fig-height: 3.0
+#| fig-width: 9.6
+#| fig-height: 3.4
 u, v = datasets.convex_payoff(n=1200, seed=0)
 XV = np.column_stack([u, v]); XV = (XV - XV.mean(0)) / XV.std(0)
 GV = np.column_stack([gaussianize_1d(XV[:, 0]), gaussianize_1d(XV[:, 1])])
-fig, (axL, axR) = plt.subplots(1, 2, figsize=(10, 3.0))
-for ax, D, t in [(axL, XV, "data: a V"),
-                 (axR, GV, r"both marginals $\to \mathcal{N}(0,1)$")]:
-    ax.scatter(D[:, 0], D[:, 1], s=7, c=COOL, alpha=0.4, edgecolors="none")
-    ax.set_title(t, fontsize=12); ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+fig = plt.figure(figsize=(9.6, 3.4))
+gs = GridSpec(1, 2, figure=fig, wspace=0.3)
+jointplot(fig, gs[0, 0], XV, COOL, "data: a V", s=7)
+jointplot(fig, gs[0, 1], GV, COOL, "both marginals → Gaussian", s=7)
 fig.tight_layout(); plt.show()
 ```
 
-Both marginals are now exactly Gaussian — yet the joint is **still a V**: the
-dependence lives *between* the axes, beyond any per-axis map.
+The marginal histograms on the right panel are now textbook bells — yet the joint is
+**still a V**: the dependence lives *between* the axes, beyond any per-axis map.
 
 ## #2 RBIG · Rotate, Re-Gaussianize, Repeat
 
@@ -181,10 +331,10 @@ seq = [("marginals Gaussian\n(still a V)", GV),
        ("rotate 45°\n→ marginals skew", R1),
        ("gaussianize\nmarginals", G2),
        ("…repeat → spherical", ZV)]
-fig, axes = plt.subplots(1, 4, figsize=(12, 3.0))
-for ax, (t, D) in zip(axes, seq):
-    ax.scatter(D[:, 0], D[:, 1], s=6, c=COOL, alpha=0.4, edgecolors="none")
-    ax.set_title(t, fontsize=10); ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+fig = plt.figure(figsize=(12.5, 3.2))
+gs = GridSpec(1, 4, figure=fig, wspace=0.4)
+for i, (t, D) in enumerate(seq):
+    jointplot(fig, gs[0, i], D, COOL, t, s=5)
 fig.tight_layout(); plt.show()
 ```
 
@@ -200,13 +350,13 @@ a, b = datasets.tail_dependent_pair(n=1500, seed=1)
 X = np.column_stack([a, b])
 rbig = AnnealedRBIG(n_layers=30, random_state=0).fit(X)
 Z = rbig.transform(X); gen = rbig.sample(len(X))
-fig, axes = plt.subplots(1, 3, figsize=(11, 3.6))
 panels = [(X, COOL, f"data · co-crash {cocrash_fraction(X[:,0],X[:,1]):.0%}"),
           (Z, plotting.PALETTE["green"], "RBIG forward (spherical)"),
           (gen, WARM, f"RBIG sample · co-crash {cocrash_fraction(gen[:,0],gen[:,1]):.0%}")]
-for ax, (data, col, t) in zip(axes, panels):
-    ax.scatter(data[:, 0], data[:, 1], s=7, c=col, alpha=0.35, edgecolors="none")
-    ax.set_title(t, fontsize=11); ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+fig = plt.figure(figsize=(11.5, 3.6))
+gs = GridSpec(1, 3, figure=fig, wspace=0.32)
+for i, (data, col, t) in enumerate(panels):
+    jointplot(fig, gs[0, i], data, col, t, s=7)
 fig.tight_layout(); plt.show()
 ```
 
@@ -239,16 +389,15 @@ def cov_ellipse(ax, cov, color):
                          edgecolor=color, lw=2.4))
 
 
-lim = 3.6
-fig, (axL, axR) = plt.subplots(1, 2, figsize=(9.5, 3.2))
-for ax, D, cov, t in [
-    (axL, L, [[1, 0], [0, 1]], "loose — fills the bowl"),
-    (axR, M, [[1, rho], [rho, 1]], "bound into a meatball — tighter"),
-]:
-    ax.scatter(D[:, 0], D[:, 1], s=6, c=WARM, alpha=0.35, edgecolors="none")
-    cov_ellipse(ax, np.array(cov), INK)
-    ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim); ax.set_aspect("equal")
-    ax.set_xticks([]); ax.set_yticks([]); ax.set_title(t, fontsize=11); despine(ax)
+lim = (-3.6, 3.6)
+fig = plt.figure(figsize=(9.6, 3.5))
+gs = GridSpec(1, 2, figure=fig, wspace=0.3)
+for i, (D, cov, t) in enumerate([
+    (L, [[1, 0], [0, 1]], "loose — fills the bowl"),
+    (M, [[1, rho], [rho, 1]], "bound into a meatball — tighter"),
+]):
+    jointplot(fig, gs[0, i], D, WARM, t, s=6, lim=lim, equal=True,
+              overlay=lambda ax, c=cov: cov_ellipse(ax, np.array(c), INK))
 fig.tight_layout(); plt.show()
 ```
 
@@ -301,6 +450,40 @@ likelihood — bending to dependence too rich for fixed rotations.
 
 Same forward/backward spine, more capacity, more training cost
 ([gauss_flows](https://github.com/jejjohnson/gauss_flows), JAX).
+
+## #4 · A Flow Bends to the Shape
+
+RBIG's rank-Gaussianize + rotate is a *fixed* recipe. A flow replaces it with
+**learned** invertible layers — so it can wrap shapes no rotation untangles:
+
+```{python}
+#| echo: false
+#| fig-width: 9.5
+#| fig-height: 3.0
+rng = np.random.default_rng(2)
+
+
+def _moons(n):
+    th = rng.uniform(0, np.pi, n); s = rng.integers(0, 2, n)
+    mx = np.where(s == 0, np.cos(th), 1 - np.cos(th))
+    my = np.where(s == 0, np.sin(th) - 0.25, 0.25 - np.sin(th))
+    return np.column_stack([mx, my]) + rng.normal(0, 0.06, (n, 2))
+
+
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(9.5, 3.0))
+axL.scatter(*_moons(2500).T, s=6, c=WARM, alpha=0.45, edgecolors="none")
+axL.set_title(r"data  ·  too curved for rotations", fontsize=12)
+axR.scatter(*rng.normal(size=(2500, 2)).T, s=6, c=COOL, alpha=0.4, edgecolors="none")
+axR.set_title(r"latent  $\mathcal{N}(0,I)$", fontsize=12)
+for a in (axL, axR):
+    a.set_aspect("equal"); a.set_xticks([]); a.set_yticks([]); despine(a)
+fig.suptitle(r"learned flow  $T_\theta$:   data  $\rightleftarrows$  Gaussian", fontsize=12)
+fig.tight_layout(); plt.show()
+```
+
+The building block is a **coupling layer**: keep half the coordinates, and
+scale-and-shift the other half by a small network of the first — invertible by
+construction, trained by maximum likelihood. *Reach for it when fixed rotations stall.*
 
 ## The Punchline → Demo {.center}
 

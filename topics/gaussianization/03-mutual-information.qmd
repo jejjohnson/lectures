@@ -13,6 +13,32 @@ from lectures.measures import mutual_information_xy
 plotting.set_style("notes")
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+
+
+def jointplot(fig, spec, data, color, title="", s=6, lim=None, equal=False, overlay=None):
+    """Scatter with top/right marginal histograms, drawn inside one GridSpec cell."""
+    sub = spec.subgridspec(2, 2, width_ratios=[5, 1.2], height_ratios=[1.2, 5],
+                           wspace=0.05, hspace=0.05)
+    axm = fig.add_subplot(sub[1, 0])
+    axt = fig.add_subplot(sub[0, 0], sharex=axm)
+    axr = fig.add_subplot(sub[1, 1], sharey=axm)
+    axm.scatter(data[:, 0], data[:, 1], s=s, c=color, alpha=0.4, edgecolors="none")
+    if overlay is not None:
+        overlay(axm)
+    axt.hist(data[:, 0], bins=42, color=color, alpha=0.8)
+    axr.hist(data[:, 1], bins=42, orientation="horizontal", color=color, alpha=0.8)
+    if lim is not None:
+        axm.set_xlim(*lim); axm.set_ylim(*lim)
+    if equal:
+        axm.set_aspect("equal")
+    axm.set_xticks([]); axm.set_yticks([]); despine(axm)
+    for a in (axt, axr):
+        a.set_xticks([]); a.set_yticks([])
+        for sp in a.spines.values():
+            sp.set_visible(False)
+    axt.set_title(title, fontsize=11)
+    return axm
 ```
 
 The forward map answers Chapter 1's hardest question — *how much do these
@@ -32,6 +58,51 @@ $$
 which for two variables is just the mutual information $I(x_1; x_2)$.  RBIG drives
 the joint to an *independent* Gaussian, so the information it destroys layer by
 layer (read off the Jacobian) is the total correlation that was there.
+
+A picture makes the $\sum_i H(x_i) - H(x)$ bookkeeping concrete.  Lay the same
+ingredients out loose and they fill the whole bowl; bind them into one ball and
+they **overlap** — the room you save is exactly what the variables *share*.  The
+two clouds below have **identical** $\mathcal N(0,1)$ marginals (same top/right
+histograms); only the binding — the off-diagonal correlation, drawn as a 2-σ
+covariance ellipse — differs.
+
+```{python}
+#| label: fig-meatball
+#| fig-cap: "Loose (independent) vs bound (ρ = 0.85) Gaussian clouds with identical N(0,1) marginals. The histograms match; only the binding — the covariance ellipse — tightens. That saved room is the total correlation."
+from matplotlib.patches import Ellipse
+
+rng = np.random.default_rng(3)
+n = 1200
+loose = rng.multivariate_normal([0, 0], [[1, 0], [0, 1]], n)
+rho = 0.85
+bound = rng.multivariate_normal([0, 0], [[1, rho], [rho, 1]], n)
+
+
+def cov_ellipse(ax, cov, color):
+    vals, vecs = np.linalg.eigh(cov)
+    order = vals.argsort()[::-1]
+    vals, vecs = vals[order], vecs[:, order]
+    ang = np.degrees(np.arctan2(vecs[1, 0], vecs[0, 0]))
+    w, h = 2 * 2 * np.sqrt(vals)  # 2-sigma footprint
+    ax.add_patch(Ellipse((0, 0), w, h, angle=ang, fill=False,
+                         edgecolor=color, lw=2.4))
+
+
+lim = (-3.6, 3.6)
+fig = plt.figure(figsize=(9.6, 3.6))
+gs = GridSpec(1, 2, figure=fig, wspace=0.3)
+for i, (D, cov, t) in enumerate([
+    (loose, [[1, 0], [0, 1]], "loose — fills the bowl  (ρ = 0)"),
+    (bound, [[1, rho], [rho, 1]], "bound into a meatball  (ρ = 0.85)"),
+]):
+    jointplot(fig, gs[0, i], D, WARM, t, s=6, lim=lim, equal=True,
+              overlay=lambda ax, c=cov: cov_ellipse(ax, np.array(c), INK))
+fig.tight_layout()
+plt.show()
+```
+
+Same marginals on both sides — the total correlation is everything in the
+*binding* that the marginals alone cannot see.
 
 ## Validate the Estimator Against a Known Answer
 

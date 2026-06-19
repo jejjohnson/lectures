@@ -13,6 +13,32 @@ from lectures.measures import cocrash_fraction
 plotting.set_style("notes")
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+
+
+def jointplot(fig, spec, data, color, title="", s=6, lim=None, equal=False, overlay=None):
+    """Scatter with top/right marginal histograms, drawn inside one GridSpec cell."""
+    sub = spec.subgridspec(2, 2, width_ratios=[5, 1.2], height_ratios=[1.2, 5],
+                           wspace=0.05, hspace=0.05)
+    axm = fig.add_subplot(sub[1, 0])
+    axt = fig.add_subplot(sub[0, 0], sharex=axm)
+    axr = fig.add_subplot(sub[1, 1], sharey=axm)
+    axm.scatter(data[:, 0], data[:, 1], s=s, c=color, alpha=0.4, edgecolors="none")
+    if overlay is not None:
+        overlay(axm)
+    axt.hist(data[:, 0], bins=42, color=color, alpha=0.8)
+    axr.hist(data[:, 1], bins=42, orientation="horizontal", color=color, alpha=0.8)
+    if lim is not None:
+        axm.set_xlim(*lim); axm.set_ylim(*lim)
+    if equal:
+        axm.set_aspect("equal")
+    axm.set_xticks([]); axm.set_yticks([]); despine(axm)
+    for a in (axt, axr):
+        a.set_xticks([]); a.set_yticks([])
+        for sp in a.spines.values():
+            sp.set_visible(False)
+    axt.set_title(title, fontsize=11)
+    return axm
 ```
 
 [RBIG](02-rbig.qmd) builds the map $T$ from a *fixed* recipe — rank-Gaussianize,
@@ -34,6 +60,116 @@ generates samples — exactly the forward/backward spine, now with a flexible $T
 | Training | none (closed-form per layer) | maximum likelihood (gradient descent) |
 | Capacity | limited by rotations | high; bends to rich dependence |
 | Cost | cheap | training-heavy (GPU/JAX) |
+
+## Fixed Recipe vs Learned Map
+
+RBIG's map is a *fixed recipe*: rank-Gaussianize every marginal, then apply a
+rotation, and loop.  Rotations are powerful but rigid — they can only *spin* the
+cloud, never *bend* it.  When dependence is sharply curved, a rotation untangles
+nothing: it just hands the next layer back a differently-oriented crescent.
+
+A flow instead **learns** the invertible map $T_\theta$ by maximum likelihood, so
+it can fold and stretch space until even a curved shape lands on a clean
+$\mathcal{N}(0, I)$ ball.  The figure below is *illustrative* — two interlocking
+moons are exactly the kind of shape no rotation can disentangle, and the learned
+flow $T_\theta$ is the map that carries them, both ways, to and from the Gaussian
+latent.
+
+```{python}
+#| label: fig-flow-moons
+#| fig-cap: "Illustrative. Data too curved for any rotation (left) and the Gaussian latent it is mapped to (right). The learned flow $T_\\theta$ is the invertible map running data ⇌ Gaussian; a fixed rank-Gaussianize-and-rotate recipe cannot untangle this shape."
+rng = np.random.default_rng(2)
+
+
+def _moons(n):
+    th = rng.uniform(0, np.pi, n)
+    s = rng.integers(0, 2, n)
+    mx = np.where(s == 0, np.cos(th), 1 - np.cos(th))
+    my = np.where(s == 0, np.sin(th) - 0.25, 0.25 - np.sin(th))
+    return np.column_stack([mx, my]) + rng.normal(0, 0.06, (n, 2))
+
+
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(9.5, 3.4))
+axL.scatter(*_moons(2500).T, s=7, c=WARM, alpha=0.45, edgecolors="none")
+axL.set_title(r"data  ·  too curved for rotations", fontsize=12)
+axR.scatter(*rng.normal(size=(2500, 2)).T, s=7, c=COOL, alpha=0.4, edgecolors="none")
+axR.set_title(r"latent  $\mathcal{N}(0, I)$", fontsize=12)
+for a in (axL, axR):
+    a.set_aspect("equal"); a.set_xticks([]); a.set_yticks([]); despine(a)
+fig.suptitle(r"learned flow  $T_\theta$:   data  $\rightleftarrows$  Gaussian", fontsize=12)
+fig.tight_layout(); plt.show()
+```
+
+A fixed rotation could never carry the moons onto that ball; a learned map can.
+That extra capacity is the whole reason to reach for a flow — and it comes from
+stacking one simple, invertible building block.
+
+## The Building Block — The Coupling Layer
+
+Each layer of a flow has to be *invertible* with a *cheap* Jacobian determinant,
+because the [change-of-variables](01-change-of-variables.qmd) loss needs both.  The
+**coupling layer** ([RealNVP](https://arxiv.org/abs/1605.08803)) is the canonical
+trick that gets both for free: split the coordinates into two halves $x_a, x_b$,
+leave the first half untouched, and scale-and-shift the second half using small
+networks $s(\cdot), t(\cdot)$ that see *only* the first half.
+
+$$
+\underbrace{\begin{aligned}
+z_a &= x_a \\
+z_b &= x_b \odot e^{s(x_a)} + t(x_a)
+\end{aligned}}_{\text{forward}}
+\qquad\Longleftrightarrow\qquad
+\underbrace{\begin{aligned}
+x_a &= z_a \\
+x_b &= \big(z_b - t(z_a)\big) \odot e^{-s(z_a)}
+\end{aligned}}_{\text{inverse}}
+$$
+
+Inversion needs no network inverse — $s$ and $t$ are re-evaluated on the
+*unchanged* half $z_a = x_a$, then we undo the affine step.  The Jacobian is
+**triangular** (changing $x_a$ moves both outputs, but $x_b$ moves only $z_b$), so
+its log-determinant is just the sum of the scale terms:
+
+$$
+\log\Big|\det \tfrac{\partial z}{\partial x}\Big| = \sum_i s_i(x_a)\,.
+$$
+
+```{python}
+#| label: fig-coupling
+#| fig-cap: "One coupling layer. The first half passes through unchanged and conditions a small net $s, t$ that affinely warps the second half — invertible by construction, with a cheap triangular log-det."
+fig, ax = plt.subplots(figsize=(8.2, 3.0))
+ax.set_xlim(0, 10); ax.set_ylim(0, 4); ax.axis("off")
+
+box = dict(boxstyle="round,pad=0.35", lw=1.6)
+ax.text(0.9, 3.0, r"$x_a$", ha="center", va="center", fontsize=13,
+        bbox={**box, "ec": COOL, "fc": "white"})
+ax.text(0.9, 1.0, r"$x_b$", ha="center", va="center", fontsize=13,
+        bbox={**box, "ec": WARM, "fc": "white"})
+ax.text(4.8, 1.9, r"$s(x_a),\ t(x_a)$", ha="center", va="center", fontsize=12,
+        bbox={**box, "ec": INK, "fc": plotting.PANEL})
+ax.text(7.6, 1.0, r"$\odot\,e^{s}+t$", ha="center", va="center", fontsize=12,
+        bbox={**box, "ec": INK, "fc": "white"})
+ax.text(9.3, 3.0, r"$z_a = x_a$", ha="center", va="center", fontsize=13,
+        bbox={**box, "ec": COOL, "fc": "white"})
+ax.text(9.3, 1.0, r"$z_b$", ha="center", va="center", fontsize=13,
+        bbox={**box, "ec": WARM, "fc": "white"})
+
+arrow = dict(arrowstyle="->", color=INK, lw=1.5)
+ax.annotate("", xy=(8.4, 3.0), xytext=(1.9, 3.0), arrowprops=arrow)   # x_a → z_a (pass-through)
+ax.annotate("", xy=(3.4, 1.9), xytext=(1.6, 2.7), arrowprops=arrow)   # x_a → net
+ax.annotate("", xy=(7.0, 1.4), xytext=(6.2, 1.9), arrowprops=arrow)   # net → warp
+ax.annotate("", xy=(6.9, 1.0), xytext=(1.9, 1.0), arrowprops=arrow)   # x_b → warp
+ax.annotate("", xy=(8.4, 1.0), xytext=(8.5, 1.0), arrowprops=arrow)   # warp → z_b
+ax.text(5.2, 3.25, "untouched half conditions the warp", ha="center",
+        fontsize=10, color=INK, style="italic")
+fig.tight_layout(); plt.show()
+```
+
+Stack many such layers — permuting which half is held fixed between them so every
+coordinate eventually gets warped — and the chain becomes a flexible, fully
+invertible $T_\theta$, trained end-to-end by maximum likelihood.  That is the
+machinery [gauss_flows](https://github.com/jejjohnson/gauss_flows) (JAX/FlowJax)
+provides.
 
 ## The Generative Direction, Illustrated
 
