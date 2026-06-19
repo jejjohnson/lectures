@@ -128,6 +128,104 @@ I(X;Y) = H(X) + H(Y) - H(X,Y)         # shared info BETWEEN two blocks
 
 ---
 
+## Entropy Goes Multidimensional — the Catch
+
+The window dial is innocent-looking, but turning it past $w=1$ quietly changes
+the *kind* of object every information measure consumes.  For a single series,
+entropy reads off a one-dimensional density: pile the values into a histogram
+and count.  For a $w$-day window each sample is a **vector**
+$\mathbf{x}=(x_t,\dots,x_{t+w-1})\in\mathbb{R}^w$, and its entropy is an average
+of surprise over the *whole joint density* of that vector:
+
+$$
+H(\mathbf{x})
+  = \mathbb{E}\!\left[\log\frac{1}{p(\mathbf{x})}\right]
+  = -\int p(\mathbf{x})\,\log p(\mathbf{x})\;\mathrm{d}\mathbf{x},
+\qquad \mathbf{x}\in\mathbb{R}^{d}.
+$$
+
+There is no shortcut around the $p(\mathbf{x})$ in that integral.  Total
+correlation, mutual information, and KL divergence all share the same shape — an
+average against the joint density — so the moment a "variable" becomes a vector,
+*every* Road-2 measure needs a $d$-dimensional density.  And that is exactly
+where the floor falls away.
+
+### The Curse of Dimensionality
+
+The naive estimate of $p(\mathbf{x})$ is a histogram: chop each axis into bins
+and count how many days land in each cell.  With $b$ bins per axis and $d$ axes
+there are $b^{d}$ cells, and a fixed sample of $N$ days has to fill all of them.
+The samples-per-cell budget collapses *geometrically* in $d$:
+
+```{python}
+#| label: fig-curse
+#| fig-cap: "The curse of dimensionality, in one line. With 8 bins per axis and N = 1000 days (≈ 4 trading years), the average number of samples landing in each histogram cell is N / 8^d. It is fine for a scalar or a pair, dips below the ~10-per-cell floor (dashed) you need for a usable density by d = 3, and is hopeless beyond. You cannot histogram the joint density of even a one-week window — let alone a 14-name basket."
+bins = 8
+N = 1000                                      # ≈ 4 years of trading days
+d = np.arange(1, 8)
+per_cell = N / np.power(float(bins), d)       # samples landing in each histogram cell
+
+fig, ax = plt.subplots(figsize=(8.6, 3.4))
+ax.semilogy(d, per_cell, "-o", color=COOL, lw=2.6, ms=8)
+ax.axhline(10, color=CRASH, ls="--", lw=1.6)
+ax.text(7, 14, "need ≳ 10 samples / cell", color=CRASH, ha="right", va="bottom",
+        fontsize=11)
+ax.annotate("d = 2: fine", (2, per_cell[1]), textcoords="offset points",
+            xytext=(10, 8), fontsize=11, color=INK)
+ax.annotate("d ≥ 3: cells go empty", (3, per_cell[2]), textcoords="offset points",
+            xytext=(10, -4), fontsize=11, color=INK)
+ax.set_xlabel("dimension d   (8 bins / axis,  N = 1000 days)")
+ax.set_ylabel("samples per cell  (log scale)")
+despine(ax); fig.tight_layout(); plt.show()
+```
+
+```{python}
+#| label: curse-table
+for dim in (1, 2, 3, 5, 10):
+    cells = bins ** dim
+    print(f"d={dim:2d}: {cells:>12,} cells   →   {N / cells:10.3g} samples/cell")
+```
+
+One week of daily returns is already a 5-dimensional vector, and its histogram
+asks for $8^{5}\approx 33{,}000$ cells — about **0.03 samples each**.  The
+density is essentially all holes.  This is the curse of dimensionality, and it
+is why every honest information estimate on this page falls back on one of two
+escapes: **assume** a tractable shape (the Gaussian closed forms below, where
+entropy needs no binning at all), or **learn** an invertible map that
+straightens the density into one — which is exactly what
+[Gaussianization](05-gaussianization.qmd) does.
+
+### It All Comes Back to $p(\mathbf{x})$
+
+Worth saying once, plainly, because it is the spine of the whole module: every
+Road-2 quantity is the *same integral* with a different integrand, and each is
+helpless without the joint density.
+
+$$
+H(\mathbf{x}) = -\int p(\mathbf{x})\,\log p(\mathbf{x})\;\mathrm{d}\mathbf{x}
+$$
+
+$$
+I(\mathbf{x};\mathbf{y})
+  = \int p(\mathbf{x},\mathbf{y})\,
+    \log\frac{p(\mathbf{x},\mathbf{y})}{p(\mathbf{x})\,p(\mathbf{y})}
+    \;\mathrm{d}\mathbf{x}\,\mathrm{d}\mathbf{y}
+$$
+
+$$
+T(\mathbf{x})
+  = \int p(\mathbf{x})\,
+    \log\frac{p(\mathbf{x})}{\prod_i p(x_i)}\;\mathrm{d}\mathbf{x}
+$$
+
+The direct-comparison measures (Pearson, distance correlation, HSIC) dodge this
+by working with reshaped points, distances, and kernels — they never touch a
+density.  The information measures cannot dodge it.  **The whole game, then, is
+estimating $p(\mathbf{x})$** — and the curse above is the reason that game is
+hard the instant the window opens.
+
+---
+
 ## Why Pairs Are Not Enough
 
 A pairwise view cannot see the redundancy three-or-more variables share in
@@ -186,6 +284,117 @@ ax.text(cx, 1.15, "T(x) = sum_i H(Xi) - H(X1...Xd)", family="monospace",
         bbox=dict(boxstyle="round,pad=0.4", fc=PANEL, ec=GRID))
 fig.tight_layout(); plt.show()
 ```
+
+Written out, total correlation is the gap between the surprise you'd budget if
+the names were independent (sum of the marginal entropies) and the surprise the
+basket actually carries (the joint entropy):
+
+$$
+T(\mathbf{x}) \;=\; \sum_{i=1}^{d} H(X_i) \;-\; H(\mathbf{x}) \;\ge\; 0.
+$$
+
+It is zero exactly when every part is independent — when knowing some names tells
+you nothing about the rest — and grows with redundancy.  Two facts make it the
+right multivariate measure.  First, **at $d=2$ it *is* the mutual information**
+$I(X;Y)=H(X)+H(Y)-H(X,Y)$ you already met: total correlation is the honest
+generalization, not a new idea.  Second, it inherits the curse of the section
+above — those entropies live on a $d$-dimensional density.  But for a **Gaussian
+vector** the curse evaporates: entropy has a closed form, and total correlation
+collapses to a determinant of the correlation matrix $R$, with **no density
+estimation at all**:
+
+$$
+T(\mathbf{x}) \;=\; -\tfrac12\,\log_2 \det R \qquad [\text{bits}].
+$$
+
+Here $\det R = 1$ when the names are uncorrelated (no redundancy, $T=0$) and
+shrinks toward $0$ as they line up, sending $T$ up.  A worked example makes the
+units concrete — three equicorrelated names at $\rho=0.6$:
+
+```{python}
+#| label: tc-worked-example
+def tc_gauss_bits(R_corr: Float[Array, "d d"]) -> float:
+    """T(x) = −½ · log₂ det(R)     [bits]   for a Gaussian with correlation matrix R."""
+    return -0.5 * np.log2(np.linalg.det(R_corr))
+
+
+# three equicorrelated names: every pair has correlation 0.6
+R_dep = np.full((3, 3), 0.6)
+np.fill_diagonal(R_dep, 1.0)
+R_ind = np.eye(3)                                # three independent names
+
+print(f"3 names at rho = 0.6 : T = {tc_gauss_bits(R_dep):.2f} bits")
+print(f"3 independent names  : T = {tc_gauss_bits(R_ind):.2f} bits")
+print(f"\ndet R (dependent) = {np.linalg.det(R_dep):.3f}   <-- < 1, so T > 0")
+print(f"det R (independent) = {np.linalg.det(R_ind):.3f}   <-- = 1, so T = 0")
+```
+
+Three quarters of a bit of redundancy is hiding in three names that each *look*
+only moderately correlated — and the only input was the $3\times3$ correlation
+matrix.
+That is the whole appeal of the closed form: turn the dial up to dozens of names
+and you still hand it nothing but $R$.
+
+```{python}
+#| label: fig-venn-tc-worked
+#| fig-cap: "The same Venn, now with a number on it. Three equicorrelated names at rho = 0.6: the shaded core they all share is total correlation, T = -½ log2 det R ≈ 0.75 bits. Set the correlations to zero (independent) and the circles pull apart — the core vanishes and T = 0. No density was estimated; the determinant of R did all the work."
+fig, ax = plt.subplots(figsize=(7.6, 5.6))
+ax.set_xlim(0, 10); ax.set_ylim(0, 8.6); ax.axis("off"); ax.set_aspect("equal")
+cols = [COOL, WARM, plotting.PALETTE["green"]]
+names = ["X1", "X2", "X3"]
+cx, cy, R, r = 5.0, 4.6, 1.15, 2.0
+for k in range(3):
+    ang = np.pi / 2 + k * 2 * np.pi / 3
+    _venn_circle(ax, (cx + R * np.cos(ang), cy + R * np.sin(ang)), r,
+                 cols[k], alpha=0.30)
+label_pos = [(cx, cy + R + r + 0.5),
+             (cx - (R + r) * 0.92, cy - R * 0.5 - 0.2),
+             (cx + (R + r) * 0.92, cy - R * 0.5 - 0.2)]
+for (lx, ly), nm, col in zip(label_pos, names, cols):
+    ax.text(lx, ly, f"H({nm})", family="monospace", fontsize=13, color=col,
+            fontweight="bold", ha="center", va="center")
+ax.text(cx, cy, "T(x)", family="monospace", fontsize=16, color=INK,
+        fontweight="bold", ha="center", va="center", zorder=8)
+ax.text(cx, 1.05, f"3 names at rho = 0.6   ->   T = {tc_gauss_bits(R_dep):.2f} bits   "
+        f"(independent -> 0)", family="monospace", fontsize=12, color=INK,
+        ha="center", bbox=dict(boxstyle="round,pad=0.4", fc=PANEL, ec=GRID))
+fig.tight_layout(); plt.show()
+```
+
+### A Real Book Is Dozens of Co-Moving Series
+
+The two-column picture is a teaching toy.  A real book is *dozens* of names that
+all breathe with the same market — and you cannot draw, let alone histogram,
+their joint density.  Plot forty-eight standardized cumulative-return paths that
+share one latent market factor and the redundancy is obvious to the eye even
+though no pairwise number is on screen:
+
+```{python}
+#| label: fig-many-series
+#| fig-cap: "What multidimensional data actually looks like. Forty-eight standardized cumulative-return series (faint band) that all load on a single hidden market factor; three are highlighted to show the family resemblance. They drift apart in the details but rise and fall together — that shared motion is redundancy. You cannot histogram this 48-dimensional joint density, yet total correlation reads its co-movement in one number."
+rng = np.random.default_rng(11)
+T_days, M = 200, 48
+common = np.cumsum(rng.normal(0, 1, T_days))          # one market factor everyone loads on
+
+fig, ax = plt.subplots(figsize=(9.6, 4.4))
+for _ in range(M):
+    s = rng.uniform(0.3, 1.0) * common + np.cumsum(rng.normal(0, 0.7, T_days))
+    s = (s - s.mean()) / s.std()
+    ax.plot(s, color=COOL, alpha=0.16, lw=0.9)
+for c, load, seed in [(CRASH, 0.95, 1), (WARM, 0.6, 2), (INK, 0.35, 3)]:  # a few highlighted names
+    rg = np.random.default_rng(seed)
+    s = load * common + np.cumsum(rg.normal(0, 0.7, T_days))
+    s = (s - s.mean()) / s.std()
+    ax.plot(s, color=c, lw=2.2)
+ax.set_xticks([]); ax.set_yticks([])
+ax.set_xlabel("time (trading days) →")
+ax.set_ylabel("standardized cumulative return")
+despine(ax); fig.tight_layout(); plt.show()
+```
+
+Pearson can compare one pair at a time; total correlation reads the whole grid at
+once.  That is the move the rest of this page cashes out — first on the abstract
+diagram, then on the real basket.
 
 And the most general view: two **blocks** of variables — a sector vs. another
 sector, or features vs. a target — each with its own internal redundancy $T$, and
@@ -343,10 +552,12 @@ plt.show()
 
 ## Now With Real Data
 
-Histograms cannot estimate the entropy of a 5-day window (a 5-dimensional
-density!), but the **Gaussian closed forms** can — and for these illustrations
-they are exactly the right crude-but-honest tool.  For a Gaussian vector with
-correlation matrix $R$:
+The curse above ruled out histogramming the joint density of even a one-week
+window, but the **Gaussian closed forms** sidestep it entirely — and for these
+illustrations they are exactly the right crude-but-honest tool.  Alongside the
+total correlation $T(\mathbf{x})=-\tfrac12\log_2\det R$ we already met, the same
+Gaussian assumption gives the mutual information *between* two blocks straight
+from the correlation matrices, again with no density to estimate:
 
 $$
 T(\mathbf{x}) = -\tfrac{1}{2}\,\log_2 \det R

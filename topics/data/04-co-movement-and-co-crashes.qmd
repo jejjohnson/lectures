@@ -91,6 +91,43 @@ That is `cocrash_fraction(x, y)` — a conditional probability,
 $P(Y \text{ crashes} \mid X \text{ crashes})$.  An **independent** pair scores ~10%
 (the threshold itself); a co-crashing pair scores far higher.
 
+Before tallying every name, watch the number built on a single pair. Take JPM and
+BAC, and shade the **10% of days JPM falls hardest** — that band *is* the
+condition. The co-crash fraction is then just a count inside the band: of those
+worst-JPM days, how many sit below BAC's crash line too (red), versus how many
+BAC shrugged off (blue)?
+
+```{python}
+#| label: fig-cocrash-anatomy
+#| fig-cap: "Anatomy of one co-crash number (JPM·BAC). The shaded band is the *condition* — the 10% of days JPM falls hardest. Among those days, red points fall below BAC's crash line too (a co-crash) and blue ones do not; their ratio is the co-crash fraction, here ~70%. The bar chart below runs this same tally for every name."
+x, y = R["JPM"].to_numpy(), R["BAC"].to_numpy()
+tx, ty = np.quantile(x, 0.10), np.quantile(y, 0.10)
+band = x <= tx                    # condition: JPM in its worst 10%
+co = band & (y <= ty)             # …and BAC craters too → a co-crash
+hold = band & (y > ty)            # …but BAC held up
+fig, ax = plt.subplots(figsize=(7.6, 5.0))
+ax.axvspan(x.min(), tx, color=CRASH, alpha=0.06)
+ax.axhline(ty, color=INK, lw=0.8, ls=":")
+ax.scatter(x[~band], y[~band], s=7, c="0.78", alpha=0.25, edgecolors="none")
+ax.scatter(x[hold], y[hold], s=26, c=COOL, alpha=0.8, edgecolors="none",
+           label=f"JPM crashes, BAC holds  ({int(hold.sum())})")
+ax.scatter(x[co], y[co], s=30, c=CRASH, alpha=0.9, edgecolors="none",
+           label=f"both crash — a co-crash  ({int(co.sum())})")
+ax.text(tx, ax.get_ylim()[1], "  condition: JPM in its worst 10%",
+        color=CRASH, fontsize=9, va="top", ha="left")
+ax.text(ax.get_xlim()[1], ty, "BAC's crash line  ", color=INK, fontsize=8.5,
+        va="bottom", ha="right")
+ax.set_xlabel("JPM return"); ax.set_ylabel("BAC return")
+ax.set_title(f"Of JPM's {int(band.sum())} worst days, BAC also craters on "
+             f"{int(co.sum())}  →  co-crash {int(co.sum()) / int(band.sum()):.0%}",
+             fontsize=11.5)
+ax.legend(fontsize=9, frameon=False, loc="upper left"); despine(ax)
+fig.tight_layout(); plt.show()
+```
+
+Run that same tally for **every** name against JPM and the contagion structure
+appears:
+
 ```{python}
 #| label: fig-cocrash-bars
 #| fig-cap: "Co-crash fraction of every name with JPM. The other banks land near 65–70% (when JPM has a worst-10% day, so do they). Even defensive utilities sit at ~30% — three times the 10% independence baseline (dashed) — because systemic crises drag everyone down. But the banks still tower over the rest."
@@ -107,6 +144,91 @@ ax.axvline(10, color=INK, lw=1.2, ls="--", label="independent baseline (10%)")
 ax.set_xlabel("co-crash with JPM (%)")
 ax.set_title("Banks crash hardest with JPM; defensives aren't immune", fontsize=12)
 ax.legend(fontsize=9, frameon=False, loc="lower right"); despine(ax)
+fig.tight_layout(); plt.show()
+```
+
+## 4 · More Than Correlation Predicts
+
+The 10% line is the wrong yardstick once names are correlated at all — a
+correlated pair *should* co-crash more than 10%. The sharper question: more than
+a **Gaussian** with that *exact* correlation would? Fit a bivariate normal to
+each pair's correlation and ask it the same co-crash question. Every pair beats
+it — even the diversified bank-utility pair crashes together more often than its
+correlation can account for. That surplus is genuine **tail dependence**: the
+part a covariance matrix, and the Gaussian risk model built on it, structurally
+misses.
+
+See it on one pair before totalling. Standardise JPM and BAC, then draw a
+bivariate Gaussian with their *exact* correlation beside the real cloud:
+
+```{python}
+#| label: fig-real-vs-gaussian
+#| fig-cap: "Same correlation, two worlds (JPM·BAC). Left: real standardized returns. Right: a bivariate Gaussian fit to that exact correlation, r ≈ 0.83. Same tilt, same ellipse — but the Gaussian barely passes ±4σ, while real crashes sprawl past −10σ and pack the lower-left corner, so the real co-crash (~70%) outruns the Gaussian's (~60%). Axes clipped at ±5σ; the gap is tail dependence."
+x, y = R["JPM"].to_numpy(), R["BAC"].to_numpy()
+xz = (x - x.mean()) / x.std(); yz = (y - y.mean()) / y.std()
+rho = np.corrcoef(xz, yz)[0, 1]
+rng = np.random.default_rng(0)
+g = rng.multivariate_normal([0, 0], [[1, rho], [rho, 1]], size=len(xz))
+LIM = 5
+
+def _corner(ax, u, v, title):
+    tu, tv = np.quantile(u, 0.10), np.quantile(v, 0.10)
+    box = (u <= tu) & (v <= tv)
+    ax.axvspan(-LIM, tu, color=CRASH, alpha=0.05)
+    ax.axhspan(-LIM, tv, color=CRASH, alpha=0.05)
+    ax.scatter(u[~box], v[~box], s=6, c="0.78", alpha=0.22, edgecolors="none")
+    ax.scatter(u[box], v[box], s=13, c=CRASH, alpha=0.8, edgecolors="none")
+    ax.set_title(f"{title}\nco-crash = {cocrash_fraction(u, v):.0%}", fontsize=11)
+    ax.set_xlim(-LIM, LIM); ax.set_ylim(-LIM, LIM)
+    ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(10.5, 5.0))
+_corner(axL, xz, yz, "Real returns (JPM·BAC, standardized)")
+_corner(axR, g[:, 0], g[:, 1], f"A Gaussian, same r = {rho:.2f}")
+fig.suptitle("Same correlation, same tilt — but real losses sprawl into the corner",
+             fontsize=12)
+fig.tight_layout(); plt.show()
+```
+
+The Gaussian is the right shape and the right tilt — it just can't reach the
+joint extremes the real corner is full of. Across pairs, that surplus is
+everywhere:
+
+```{python}
+#| label: fig-excess-tail
+#| fig-cap: "Co-crash for three pairs: what a Gaussian fit to the pair's own correlation predicts (blue) versus what actually happens (red), against the 10% independence baseline (dashed). Every real pair lands above its Gaussian — by 6–11 points — so the joint crashing is not just 'they're correlated'. The gap is tail dependence the correlation never sees, and it survives even for the loosely-tied bank-utility pair."
+from scipy.stats import multivariate_normal, norm
+
+def gaussian_cocrash(rho, q=0.10):
+    """Co-crash a bivariate normal with this correlation would produce."""
+    z = norm.ppf(q)
+    return float(multivariate_normal([0, 0], [[1, rho], [rho, 1]]).cdf([z, z]) / q)
+
+pairs = [("JPM", "BAC", "JPM·BAC\n(two banks)"),
+         ("JPM", "KO", "JPM·KO\n(bank · staple)"),
+         ("JPM", "DUK", "JPM·DUK\n(bank · utility)")]
+labels, data, gauss = [], [], []
+for x, y, lab in pairs:
+    xv, yv = R[x].to_numpy(), R[y].to_numpy()
+    rho = np.corrcoef(xv, yv)[0, 1]
+    labels.append(lab)
+    data.append(cocrash_fraction(xv, yv) * 100)
+    gauss.append(gaussian_cocrash(rho) * 100)
+
+xs = np.arange(len(pairs)); w = 0.38
+fig, ax = plt.subplots(figsize=(8.5, 4.2))
+ax.bar(xs - w / 2, gauss, w, color=COOL, label="a Gaussian with the same correlation")
+ax.bar(xs + w / 2, data, w, color=CRASH, label="what actually happens")
+ax.axhline(10, color=INK, lw=1.2, ls="--", label="independent baseline (10%)")
+for i, (g, d) in enumerate(zip(gauss, data)):
+    ax.annotate("", xy=(i + w / 2, d), xytext=(i + w / 2, g),
+                arrowprops=dict(arrowstyle="->", color=INK, lw=1.1))
+    ax.text(i + w / 2 + 0.04, (g + d) / 2, f"+{d - g:.0f}", fontsize=9, color=INK, va="center")
+ax.set_xticks(xs); ax.set_xticklabels(labels, fontsize=10)
+ax.set_ylabel("co-crash (%)"); ax.set_ylim(0, 80)
+ax.set_title("Even a Gaussian fit to the exact correlation under-counts joint crashes",
+             fontsize=11.5)
+ax.legend(fontsize=9, frameon=False, loc="upper right"); despine(ax)
 fig.tight_layout(); plt.show()
 ```
 

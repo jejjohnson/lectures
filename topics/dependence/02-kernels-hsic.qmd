@@ -7,7 +7,7 @@ title: "Kernel Measures: HSIC, CKA, and the Choice of Similarity"
 import sys, pathlib
 sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
 from lectures import plotting, datasets
-from lectures.plotting import INK, COOL, WARM, CRASH, BAND, despine, annotate_box
+from lectures.plotting import INK, COOL, WARM, CRASH, BAND, GRID, PANEL, despine, annotate_box
 from lectures.measures import hsic_rbf, cka_rbf, cka_linear, distance_correlation
 plotting.set_style("notes")
 import numpy as np
@@ -25,6 +25,127 @@ the same `compare(transform(x), transform(y))` template has one more, most
 general rung.  Distance correlation turned each day into its *distances* to
 every other day.  This page swaps distance for **kernel similarity** and
 completes Road 1.
+
+---
+
+## From Distance to Kernel
+
+Before the formula, the one idea that makes the swap painless: a **kernel is a
+distance read backwards**.  Distance correlation compared days by how *far*
+apart they are; a kernel compares them by how *alike* they are — and it gets
+that similarity by passing the very same pairwise distance through a Gaussian
+squash:
+
+$$
+k(x_i, x_j)
+  = \exp\!\Big(\!-\tfrac{\lVert x_i - x_j\rVert^2}{2\sigma^2}\Big)
+  \;\in\; (0, 1].
+$$
+
+Identical days ($\lVert x_i - x_j\rVert = 0$) map to $1$; days far apart decay
+toward $0$.  Nothing new enters — only the *direction of the reading* changes,
+from far/near to alike/unlike.
+
+```{python}
+#| label: fig-distance-to-kernel
+#| fig-cap: "The RBF kernel is the pairwise distance dCor already used, squashed through a Gaussian. Distance zero (identical days) maps to similarity 1; large distances decay smoothly toward 0. The kernel never adds information — it re-reads the same distance as nearness, bounded to (0, 1]."
+d = np.linspace(0, 3, 400)              # pairwise distance ‖xᵢ − xⱼ‖ (σ = 1 here)
+k = np.exp(-d**2 / 2.0)                  # the Gaussian squash
+
+fig, ax = plt.subplots(figsize=(8, 3))
+ax.plot(d, k, color=COOL, lw=2.6)
+ax.fill_between(d, k, color=COOL, alpha=0.08)
+ax.scatter([0], [1], s=70, c=CRASH, zorder=5)
+ax.annotate("identical days → 1", (0, 1), textcoords="offset points",
+            xytext=(14, -6), fontsize=11, color=INK)
+d_far = 2.2
+ax.scatter([d_far], [np.exp(-d_far**2 / 2)], s=70, c=CRASH, zorder=5)
+ax.annotate("far apart → ≈ 0", (d_far, np.exp(-d_far**2 / 2)),
+            textcoords="offset points", xytext=(2, 18), fontsize=11, color=INK)
+ax.set_xlabel("distance  ‖xᵢ − xⱼ‖   (what distance correlation used)")
+ax.set_ylabel("kernel similarity  k")
+ax.set_ylim(-0.02, 1.10)
+ax.set_title("A kernel is a distance, read as nearness", fontsize=12,
+             fontweight="bold")
+despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+The payoff is conceptual: **distance correlation and the kernel measures are the
+same move.**  Both build one pairwise matrix per variable — a *distance* matrix
+or a *kernel* matrix — double-center it with $H$, and take a normalized
+Frobenius inner product of the two centered matrices.  Swap the matrix you feed
+in and you slide between the two; the algebra around it is identical.
+
+### One Structure, Two Lenses
+
+Because the kernel matrix is the distance matrix inverted, the *same* scatter
+produces two readings of one structure: a distance view (what dCor sees) on top,
+a kernel view (what HSIC sees) on the bottom.  They are photographic negatives
+of each other — bright where the other is dark.
+
+```{python}
+#| label: fig-two-lenses
+#| fig-cap: "One scatter, two lenses. Left: the convex pair, with one anchor day joined to every other. Top row: the pairwise DISTANCE matrices in X and Y that distance correlation reads (dark = near). Bottom row: the kernel SIMILARITY matrices for the same days that HSIC reads (bright = alike). The two rows are inverses — HSIC sees alike exactly where dCor sees far."
+from matplotlib.gridspec import GridSpec
+
+def convex_clean(
+    n: int = 120, noise: float = 0.08, seed: int = 42
+) -> tuple[Float[Array, "n_days"], Float[Array, "n_days"]]:
+    # the convex pair v = |u| + noise·ε, noise turned down for readable matrices
+    rng = np.random.default_rng(seed)
+    u = rng.normal(0, 1, n)
+    return u, np.abs(u) + noise * rng.normal(0, 1, n)
+
+
+def rbf_gram(z: Float[Array, "n_days"]) -> Float[Array, "n_days n_days"]:
+    """RBF (Gaussian) kernel matrix: how ALIKE are days i and j?
+
+    Kᵢⱼ = exp( −(zᵢ − zⱼ)² / 2σ² )  ∈ (0, 1]    (1 = identical days)
+    """
+    sq_dist = einx.subtract("i, j -> i j", z, z) ** 2     # (zᵢ − zⱼ)²
+    σ = np.sqrt(np.median(sq_dist[sq_dist > 0]) / 2)      # median heuristic
+    return np.exp(-sq_dist / (2 * σ**2))
+
+
+u_l, v_l = convex_clean()
+order = np.argsort(u_l)                  # sort days by u so the matrices are readable
+us, vs = u_l[order], v_l[order]
+
+DX = np.abs(einx.subtract("i, j -> i j", us, us))    # distance matrix in X (dCor's view)
+DY = np.abs(einx.subtract("i, j -> i j", vs, vs))    # distance matrix in Y
+KX, KY = rbf_gram(us), rbf_gram(vs)                  # kernel matrices (HSIC's view)
+
+fig = plt.figure(figsize=(11, 4.4))
+gs = GridSpec(2, 3, width_ratios=[1.15, 1, 1], wspace=0.2, hspace=0.4)
+ax_s = fig.add_subplot(gs[:, 0])
+anchor = 12
+ax_s.scatter(us, vs, s=12, c=WARM, alpha=0.45, edgecolors="none")
+ax_s.scatter([us[anchor]], [vs[anchor]], s=70, c=CRASH, zorder=5)
+for j in range(0, len(us), 14):          # rays from the anchor day to the others
+    ax_s.plot([us[anchor], us[j]], [vs[anchor], vs[j]], color=GRID, lw=0.8, zorder=1)
+ax_s.set_title("one day vs every other", fontsize=11)
+ax_s.set_xticks([]); ax_s.set_yticks([]); despine(ax_s)
+
+for spec, M, ttl, cmap in [
+    (gs[0, 1], DX, "distance · X", "Blues"),
+    (gs[0, 2], DY, "distance · Y", "Oranges"),
+    (gs[1, 1], KX, "kernel · X", "Blues"),
+    (gs[1, 2], KY, "kernel · Y", "Oranges"),
+]:
+    ax = fig.add_subplot(spec)
+    ax.imshow(M, cmap=cmap, origin="lower")
+    ax.set_title(ttl, fontsize=11)
+    ax.set_xticks([]); ax.set_yticks([])
+fig.suptitle("Top: distance (distance correlation).  Bottom: kernel (HSIC) — "
+             "the same matrix, inverted", fontsize=12, fontweight="bold", y=1.02)
+fig.tight_layout()
+plt.show()
+```
+
+With both views in hand, the kernel rung is just the distance rung with the
+matrix swapped.  The trace formula below makes that swap precise.
 
 ---
 
@@ -209,7 +330,7 @@ Every rung of Road 1 made a choice you can now see as one dial:
 | distance corr | its distances to all days | product of centered distances |
 | HSIC / CKA | its kernel similarities to all days | product of centered similarities |
 
-Two of those choices deserve a closer look.
+Two knobs on that dial deserve a closer look — *which* kernel, and *how wide*.
 
 **The linear kernel recovers the classics.**  Set $k(z_i, z_j) = z_i z_j$ and
 CKA collapses to the squared Pearson correlation (for 1-D data) — the kernel
@@ -223,6 +344,139 @@ print(f"banks:  linear CKA = {cka_linear(a, b):.4f}   vs   Pearson r² = {r_bank
 print(f"convex: linear CKA = {cka_linear(u, v):.4f}   (blind, like Pearson)"
       f"   vs   RBF CKA = {cka_rbf(u, v):.2f}")
 ```
+
+---
+
+## Going Multidimensional — the RV Coefficient
+
+The linear-kernel collapse above hides a second, larger gift.  Everything on
+Road 1 was written for two *scalar* series — one number per day, per variable.
+But a sector is not one number: "tech" is a *basket* of names, and so is
+"banks".  Each day is now a **vector**.  What happens to dependence when a
+sample is $\mathbf{x} \in \mathbb{R}^p$ paired with $\mathbf{y} \in \mathbb{R}^q$?
+
+Pearson's covariance, a single scalar $\sigma_{xy} = \operatorname{cov}(x, y)$,
+becomes a whole **matrix** of cross-covariances:
+
+$$
+\sigma_{xy} = \operatorname{cov}(x, y) \in \mathbb{R}
+\qquad\longrightarrow\qquad
+\Sigma_{xy} = \operatorname{Cov}(\mathbf{x}, \mathbf{y}) \in \mathbb{R}^{p \times q}.
+$$
+
+With five tech names against five banks, that is $5 \times 5 = 25$ separate
+correlations.  Which one is *the* dependence between the two sectors?  None of
+them — and all of them.  We need a single honest number distilled from the whole
+block.
+
+```{python}
+#| label: fig-cross-correlation
+#| fig-cap: "Two baskets, twenty-five correlations. Five tech names and five banks, each name a noisy load on a shared latent sector factor (the two sectors co-move). The cross-correlation matrix Σ_xy has 25 entries — pairwise Pearson can rank any single tech-name-vs-bank-name pair, but it cannot say how dependent the *sectors* are. That is the question the RV coefficient answers."
+rng = np.random.default_rng(2)
+n = 300
+g_tech = rng.normal(0, 1, n)                                  # latent tech sector factor
+g_bank = 0.6 * g_tech + np.sqrt(1 - 0.36) * rng.normal(0, 1, n)   # bank factor — sectors co-move
+load_x = rng.uniform(0.4, 1.1, 5)                            # per-name loadings on the factor
+load_y = rng.uniform(0.4, 1.1, 5)
+idio_x = rng.uniform(0.4, 0.9, 5)                           # per-name idiosyncratic noise
+idio_y = rng.uniform(0.4, 0.9, 5)
+tech = g_tech[:, None] * load_x + idio_x * rng.normal(0, 1, (n, 5))   # 5 tech names  (n × 5)
+banks = g_bank[:, None] * load_y + idio_y * rng.normal(0, 1, (n, 5))  # 5 bank names  (n × 5)
+
+# the 5×5 block of pairwise Pearson correlations — Σ_xy, standardized
+C = np.array([[pearsonr(tech[:, i], banks[:, j])[0] for j in range(5)]
+              for i in range(5)])
+
+fig, ax = plt.subplots(figsize=(7.6, 2.6))
+ax.imshow(C, cmap="RdBu_r", vmin=-1, vmax=1, aspect="auto")   # wide cells so values read
+for i in range(5):
+    for j in range(5):
+        ax.text(j, i, f"{C[i, j]:.2f}", ha="center", va="center", fontsize=10,
+                color="white" if abs(C[i, j]) > 0.55 else INK)
+ax.set_xticks(range(5)); ax.set_yticks(range(5))
+ax.set_xticklabels([f"B{j+1}" for j in range(5)], fontsize=10)
+ax.set_yticklabels([f"T{i+1}" for i in range(5)], fontsize=10)
+ax.set_title("5 tech × 5 banks = 25 correlations — which is THE one?", fontsize=11)
+fig.tight_layout()
+plt.show()
+```
+
+The escape is the **RV coefficient** (Escoufier, 1973) — Pearson's $r^2$
+generalized from scalars to vectors.  Each day's vector is turned into its
+*outer product with every other day*, $\mathbf{x}\mathbf{x}^\top$ — exactly the
+**linear-kernel** Gram matrix $K_{ij} = \mathbf{x}_i^\top \mathbf{x}_j$ from the
+previous subsection.  RV then aligns the two Gram matrices with a normalized
+Frobenius inner product:
+
+$$
+\operatorname{RV}(\mathbf{x}, \mathbf{y})
+  = \frac{\langle\, \mathbf{x}\mathbf{x}^\top,\ \mathbf{y}\mathbf{y}^\top \,\rangle_F}
+         {\lVert \mathbf{x}\mathbf{x}^\top \rVert_F \;
+          \lVert \mathbf{y}\mathbf{y}^\top \rVert_F}
+  \;\in\; [0, 1].
+$$
+
+Read the denominator and it is the *same self-normalization* as CKA — and indeed
+**RV is exactly linear-kernel CKA**, now fed vectors instead of scalars:
+
+```
+CKA = corr( kernel(x) , kernel(y) )     ·  any kernel
+RV  = corr(   x xᵀ    ,   y yᵀ    )     ·  linear kernel, vector-valued days
+```
+
+So we do not need a new function: `cka_linear` already accepts $(n, d)$ arrays
+and returns the RV coefficient.  One score for the two baskets — and, as a
+sanity check, the same `cka_linear` reduces to squared Pearson the moment the
+vectors shrink back to scalars.
+
+```{python}
+#| label: fig-rv-coefficient
+#| fig-cap: "RV collapses the 25-entry block to one number (left): a single dependence score for the tech basket against the bank basket. Right: feeding cka_linear two 1-D series recovers squared Pearson exactly — RV is genuinely Pearson's r², lifted to vectors. The points sit on the diagonal across the full range of correlations."
+rv = cka_linear(tech, banks)             # ONE score for the two baskets = linear CKA
+
+rng2 = np.random.default_rng(5)
+r2_vals, lin_cka_vals = [], []
+for _ in range(14):                      # 1-D check: linear CKA == Pearson²
+    rho = rng2.uniform(-0.95, 0.95)
+    z = rng2.multivariate_normal([0, 0], [[1, rho], [rho, 1]], size=200)
+    r2_vals.append(pearsonr(z[:, 0], z[:, 1])[0] ** 2)
+    lin_cka_vals.append(cka_linear(z[:, 0], z[:, 1]))
+
+fig, (ax_bar, ax_chk) = plt.subplots(
+    1, 2, figsize=(9, 2.6), gridspec_kw={"width_ratios": [1.5, 1]}
+)
+ax_bar.barh([0], [1], color=PANEL, height=0.5, zorder=0)
+ax_bar.barh([0], [rv], color=COOL, height=0.5, zorder=1)
+ax_bar.set_xlim(0, 1); ax_bar.set_ylim(-0.5, 0.5)
+ax_bar.set_yticks([]); ax_bar.set_xticks([0, 0.5, 1])
+ax_bar.text(rv + 0.02, 0, f"RV = {rv:.2f}", va="center", fontsize=14,
+            color=INK, fontweight="bold")
+ax_bar.set_title("tech basket  ↔  bank basket  (one score)", fontsize=12)
+despine(ax_bar)
+
+ax_chk.scatter(r2_vals, lin_cka_vals, s=30, c=CRASH, alpha=0.85, edgecolors="none")
+ax_chk.plot([0, 1], [0, 1], color=GRID, lw=1.3, ls="--")
+ax_chk.set_xlim(0, 1); ax_chk.set_ylim(0, 1)
+ax_chk.set_xlabel("Pearson²", fontsize=11)
+ax_chk.set_ylabel("linear CKA", fontsize=11)
+ax_chk.set_title("1-D: RV = r²", fontsize=11)
+despine(ax_chk)
+fig.tight_layout()
+plt.show()
+```
+
+This closes a loop the whole road has been circling.  Distance correlation, the
+kernel measures, and (next page) mutual information were **vector-native from
+birth** — they build a pairwise matrix per *sample*, so it never mattered whether
+a sample was a scalar or a vector.  Only Pearson and Spearman were written for
+scalars and needed lifting; RV is precisely that lift for Pearson, and it lands
+back inside the kernel family as the linear-kernel rung.  The ladder is not four
+separate measures — it is one construction, read at four resolutions, in any
+dimension.
+
+---
+
+## Choosing the Kernel — the RBF Bandwidth
 
 **The RBF bandwidth is a magnifying glass.**  The bandwidth $\sigma$ sets the
 scale at which "similar" means anything.  Too small and every day is similar
