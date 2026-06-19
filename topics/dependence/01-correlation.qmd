@@ -114,6 +114,59 @@ plt.tight_layout()
 plt.show()
 ```
 
+### What the Number Conflates: Strength vs. Noise
+
+The previous figure changed $r$ by *tilting* the cloud — by altering the
+relationship itself.  But $r$ also moves when the relationship is held
+**fixed** and only the scatter around it grows.  This is the more insidious
+failure, because the underlying link never changes — yet the number says it
+weakened.
+
+Read the definition again with this in mind:
+
+$$
+r = \frac{\operatorname{cov}(x, y)}{\sigma_x \, \sigma_y}.
+$$
+
+Hold the slope of $y$ on $x$ constant and inject independent noise $\varepsilon$
+into $y$.  The covariance $\operatorname{cov}(x, y)$ is unchanged (noise is
+uncorrelated with $x$), but $\sigma_y$ grows — so the *ratio* shrinks.  Pearson
+is not reporting "is there a linear link?"; it is reporting "how **tightly** do
+the points hug that link?"  In risk terms it conflates the **strength of a
+linear relationship** with the **tightness** of the data around it: a perfectly
+real, perfectly linear relationship can be made to look weak with nothing but
+added noise.
+
+```{python}
+#| label: fig-pearson-noise
+#| fig-cap: "The same line in all four panels — only the scatter around it grows. The dashed reference line (slope 1) never moves, yet Pearson slides from ≈0.95 to ≈0.45. The number rates tightness, not the presence of a link: noise alone can make a real relationship look weak."
+rng = np.random.default_rng(0)
+n = 300
+x = rng.normal(0, 1, n)            # the predictor, fixed across panels
+eps = rng.normal(0, 1, n)          # one noise draw, reused so only its SCALE varies
+
+fig, axes = plt.subplots(1, 4, figsize=(13, 3.4))
+for ax, s in zip(axes, [0.33, 0.75, 1.33, 2.29]):
+    # y = x + s·ε   — slope 1 always; only the noise amplitude s changes.
+    # cov(x, y) is fixed (ε ⊥ x); σ_y grows with s, so r = cov / (σ_x σ_y) falls.
+    y = x + s * eps
+    ax.axline((0, 0), slope=1, color=INK, lw=1.3, ls="--", alpha=0.6)  # the unchanged line
+    ax.scatter(x, y, s=10, c=COOL, alpha=0.5, edgecolors="none")
+    ax.set_title(f"more noise →   r = {pearsonr(x, y)[0]:.2f}", fontsize=12)
+    ax.set_xlim(-3.5, 3.5); ax.set_ylim(-6, 6)
+    ax.set_xticks([]); ax.set_yticks([])
+    despine(ax)
+
+fig.suptitle("Same line, growing noise — Pearson rates tightness, not the link",
+             fontsize=12, fontweight="bold", y=1.02)
+fig.tight_layout()
+plt.show()
+```
+
+The slope never changed, yet $r$ slides from $0.95$ to $0.45$.  Whenever you
+read a low correlation, you cannot tell from the number alone whether the link
+is *weak* or merely *noisy* — two situations a risk model must not confuse.
+
 ---
 
 ## Rung 2 · Spearman — Ranks Rescue the Curved Case
@@ -457,6 +510,180 @@ fig.suptitle(
 fig.tight_layout()
 plt.show()
 ```
+
+---
+
+## From Points to a Density
+
+Everything so far lived on **Road 1**: take the raw points, push them through a
+transform (ranks, distances, kernels), and compare them *directly*.  No
+probability distribution ever appeared.  The remaining measures in this chapter
+— mutual information, entropy, total correlation — take **Road 2**: they step
+back from the individual points and ask about the whole **shape** they trace
+out, the density $p(x)$.  This short section builds that object from the ground
+up, so the independence reference and mutual information that follow rest on
+something concrete rather than a symbol.
+
+### One Variable: From a Pile of Points to a Curve
+
+Start with a single column of returns.  As a *pile of points* it is hard to
+reason about; bin the points and you get a **histogram**; let the bins shrink
+and smooth, and you recover a continuous **density** $p(x)$ — the curve the
+points were tracing all along.  A kernel density estimate (KDE) does exactly
+that smoothing:
+
+$$
+\hat{p}(x) = \frac{1}{n\,h}\sum_{i=1}^{n} K\!\left(\frac{x - x_i}{h}\right),
+$$
+
+with $K$ a smooth kernel and $h$ the bandwidth.  The same three frames recur for
+every density we draw later — keep them in mind.
+
+```{python}
+#| label: fig-points-to-density
+#| fig-cap: "One variable, three views of the same thing. Left: a pile of points (jittered vertically so they don't overlap). Centre: count them in bins — a histogram. Right: smooth the counts into a continuous density p(x). Pile up enough days and the cloud becomes a curve; that curve is what Road 2 measures."
+rng = np.random.default_rng(3)
+# a mildly fat-tailed return series: a tight core plus a wider, heavier component
+pts = np.concatenate([rng.normal(0.0, 1.0, 500), rng.normal(0.5, 2.6, 120)])
+
+fig, axes = plt.subplots(1, 3, figsize=(11.5, 3.0))
+axes[0].scatter(pts, rng.uniform(0, 1, len(pts)), s=9, c=COOL, alpha=0.35,
+                edgecolors="none")             # vertical jitter is cosmetic only
+axes[0].set_title("a pile of points", fontsize=13)
+axes[1].hist(pts, bins=28, color=COOL, alpha=0.75)
+axes[1].set_title("count them in bins", fontsize=13)
+gx = np.linspace(pts.min(), pts.max(), 250)
+pdf = gaussian_kde(pts)(gx)                     # p̂(x): smoothed, on a fine grid
+axes[2].fill_between(gx, pdf, color=COOL, alpha=0.45)
+axes[2].plot(gx, pdf, color=INK, lw=2)
+axes[2].set_title("a smooth density  p(x)", fontsize=13)
+for ax in axes:
+    ax.set_xticks([]); ax.set_yticks([])
+    despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+### A Density's Shape Is Its Moments
+
+We rarely carry the whole curve around; a few **moments** summarise its shape.
+The first four are the ones a risk report actually quotes:
+
+$$
+\underbrace{\mu = \mathbb{E}[X]}_{\text{mean — where}}, \quad
+\underbrace{\sigma^2 = \mathbb{E}[(X-\mu)^2]}_{\text{variance — how wide}}, \quad
+\underbrace{\gamma_1 = \mathbb{E}\!\left[\tfrac{(X-\mu)^3}{\sigma^3}\right]}_{\text{skew — lopsided}}, \quad
+\underbrace{\gamma_2 = \mathbb{E}\!\left[\tfrac{(X-\mu)^4}{\sigma^4}\right]-3}_{\text{kurtosis — fat tails}}.
+$$
+
+A crucial caveat that the rest of the chapter leans on: we **never know these
+exactly**.  Every moment is *estimated* from a finite sample, and the
+higher-order ones (skew, kurtosis) — precisely the tail behaviour that matters
+for crashes — are the noisiest to estimate.
+
+```{python}
+#| label: fig-moments
+#| fig-cap: "A density's shape, read off its moments. The mean says where the mass sits; the std how wide; skew that it leans right; kurtosis that the right tail is fat. These four numbers are estimated from a finite sample — the tail-sensitive ones (skew, kurtosis) least reliably of all."
+from scipy.stats import skewnorm
+
+a_sk, loc, sc = 5.0, -1.2, 2.2                  # a right-skewed, fat-tailed shape
+gx = np.linspace(-5, 7, 500)
+pdf = skewnorm.pdf(gx, a_sk, loc, sc)
+mu = skewnorm.mean(a_sk, loc, sc)               # the 1st moment (mean)
+sd = skewnorm.std(a_sk, loc, sc)                # √(2nd central moment)
+pk = pdf.max()
+
+fig, ax = plt.subplots(figsize=(9.5, 3.3))
+ax.fill_between(gx, pdf, color=COOL, alpha=0.30)
+ax.plot(gx, pdf, color=INK, lw=2.2)
+ax.axvline(mu, color=CRASH, lw=2.2)             # mean — the 1st moment
+ax.annotate("mean", (mu, pk * 0.78), textcoords="offset points", xytext=(7, 0),
+            color=CRASH, fontsize=12, fontweight="bold")
+ax.annotate("", xy=(mu + sd, pk * 0.40), xytext=(mu - sd, pk * 0.40),
+            arrowprops=dict(arrowstyle="<->", color=INK, lw=1.6))  # ±1 std
+ax.text(mu, pk * 0.44, "std (spread)", ha="center", fontsize=11, color=INK)
+ax.annotate("skew — leans right", xy=(mu + 1.9 * sd, pk * 0.16),
+            xytext=(mu + 1.0 * sd, pk * 0.62), fontsize=11, color="#555",
+            arrowprops=dict(arrowstyle="->", color="#999", lw=1.2))
+ax.annotate("kurtosis — fat tail", xy=(mu + 3.0 * sd, pk * 0.04),
+            xytext=(mu + 1.7 * sd, pk * 0.30), fontsize=11, color="#555",
+            arrowprops=dict(arrowstyle="->", color="#999", lw=1.2))
+ax.set_xticks([]); ax.set_yticks([])
+despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+### Two Variables: the Joint and Its Marginals
+
+Step up to two variables and the same logic holds, with one new subtlety.  There
+is now **one joint** density $p(x, y)$ — the full 2-D shape — and **two
+marginals** $p(x)$ and $p(y)$, the shadows it casts on each axis:
+
+$$
+p(x) = \int p(x, y)\,dy, \qquad p(y) = \int p(x, y)\,dx.
+$$
+
+The 2-D analogue of variance is the **covariance matrix**, drawn as an ellipse —
+and its tilt is exactly Pearson's $r$, rescaled.  But here is the point the
+whole rest of the chapter turns on: **the marginals cannot see dependence.**  You
+can keep both marginals fixed and slide the joint between "independent" and
+"strongly dependent" without the side panels changing at all.  Dependence lives
+in the joint, never in the marginals — which is precisely why we cannot stop at
+moments and must measure the joint directly.
+
+```{python}
+#| label: fig-joint-marginals
+#| fig-cap: "Two variables: one joint shape, two marginal shadows. The red ellipse is the covariance — the 2-D second moment, whose tilt is Pearson r rescaled. The top and side panels are the marginals p(x) and p(y). Dependence is encoded in the joint cloud, not in either marginal — the next section makes that the definition of independence."
+from matplotlib.gridspec import GridSpec
+from matplotlib.patches import Ellipse
+
+rng = np.random.default_rng(7)
+pts = rng.multivariate_normal([0, 0], [[1.0, 0.72], [0.72, 1.0]], 700)
+xx, yy = pts[:, 0], pts[:, 1]
+
+# covariance ellipse: eigenvectors give the axes, eigenvalues their lengths
+vals, vecs = np.linalg.eigh(np.cov(xx, yy))
+ordr = vals.argsort()[::-1]
+vals, vecs = vals[ordr], vecs[:, ordr]
+ang = np.degrees(np.arctan2(vecs[1, 0], vecs[0, 0]))   # tilt = Pearson, rescaled
+ew, eh = 2 * 2 * np.sqrt(vals)                         # 2-σ ellipse axes
+
+fig = plt.figure(figsize=(7.0, 4.6))
+gs = GridSpec(2, 2, width_ratios=[4, 1.15], height_ratios=[1.15, 4],
+              wspace=0.05, hspace=0.05)
+axm = fig.add_subplot(gs[1, 0])                 # the joint scatter
+axt = fig.add_subplot(gs[0, 0], sharex=axm)     # top marginal p(x)
+axr = fig.add_subplot(gs[1, 1], sharey=axm)     # right marginal p(y)
+
+axm.scatter(xx, yy, s=9, c=COOL, alpha=0.35, edgecolors="none")
+axm.add_patch(Ellipse([xx.mean(), yy.mean()], ew, eh, angle=ang,
+                      fc="none", ec=CRASH, lw=2.4))     # the covariance ellipse
+axm.scatter([xx.mean()], [yy.mean()], s=55, c=CRASH, zorder=6)  # the mean
+axm.text(0.03, 0.92, "JOINT  p(x, y)", transform=axm.transAxes,
+         fontsize=12, fontweight="bold", color=INK)
+axm.text(0.03, 0.04, "mean + covariance", transform=axm.transAxes,
+         fontsize=10.5, color=CRASH)
+axm.set_xlabel("X"); axm.set_ylabel("Y")
+axm.set_xticks([]); axm.set_yticks([])
+despine(axm)
+
+axt.hist(xx, bins=30, color=WARM, alpha=0.78)           # marginal p(x)
+axt.set_ylabel("p(x)", fontsize=11, rotation=0, ha="right", va="center")
+axr.hist(yy, bins=30, orientation="horizontal", color=WARM, alpha=0.78)  # p(y)
+axr.set_xlabel("p(y)", fontsize=11)
+for a in (axt, axr):
+    a.set_xticks([]); a.set_yticks([])
+    for sp in a.spines.values():
+        sp.set_visible(False)
+
+fig.tight_layout()
+plt.show()
+```
+
+**Covariance** — the ellipse — is just Pearson rescaled, so it inherits every
+blind spot from Rung 1.  To do better we must compare the *whole joint* against a
+reference for "no relationship at all."  That reference is next.
 
 ---
 

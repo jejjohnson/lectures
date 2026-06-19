@@ -81,20 +81,32 @@ represented. *(Module 3.)*
 #| echo: false
 #| fig-width: 9
 #| fig-height: 3.8
-a, b, crash = datasets.two_banks(n=600)
+rng = np.random.default_rng(0)
+n = 600
+z = rng.multivariate_normal([0, 0], [[1.0, 0.0], [0.0, 1.0]], size=n)  # calm days: independent
+a, b = z[:, 0].copy(), z[:, 1].copy()
+crash = rng.random(n) < 0.05                       # a rare crisis day…
+shock = rng.uniform(2.6, 4.2, int(crash.sum()))
+a[crash] -= shock; b[crash] -= shock               # …and both crater together
+r, cc = pearsonr(a, b)[0], cocrash_fraction(a, b)
 fig, ax = plt.subplots(figsize=(7.5, 3.8))
+tx, ty = np.quantile(a, 0.10), np.quantile(b, 0.10)
+ax.fill_between([a.min(), tx], b.min(), ty, color=CRASH, alpha=0.10, zorder=0)
 ax.scatter(a[~crash], b[~crash], s=12, c=COOL, alpha=0.5, edgecolors="none")
 ax.scatter(a[crash], b[crash], s=24, c=CRASH, alpha=0.9, edgecolors="none",
            label="they fall together")
-ax.set_title(f"Pearson r = {pearsonr(a, b)[0]:+.2f} — but look at the corner",
+ax.annotate("the crash corner", xy=(tx, ty), xytext=(tx, b.min()),
+            fontsize=10, color=CRASH, ha="right", va="bottom")
+ax.set_title(f"r = {r:+.2f} — looks diversified, yet crashes line up {cc:.0%} of the time",
              fontsize=12)
 ax.set_xticks([]); ax.set_yticks([])
-ax.legend(fontsize=11, frameon=False); despine(ax)
+ax.legend(fontsize=11, frameon=False, loc="upper left"); despine(ax)
 fig.tight_layout(); plt.show()
 ```
 
-Low average correlation, yet they crash **together**. Correlation only sees
-straight lines. *(Modules 1–2.)*
+On calm days the two move independently — a textbook **diversified** pair. Yet
+when one craters the other follows, far more often than that mild $r$ implies.
+One number averages the danger away; it hides in the **tail**. *(Modules 1–2.)*
 
 ## Failure 3 — "Fair" Because It Ignores the Attribute
 
@@ -135,9 +147,9 @@ the **Gaussian** is the least-committal joint of all.
 So *what we add to or remove from a Gaussian is exactly the dependence in the
 data.*
 
-## The Through-Line
+## The Through-Line — In the Abstract
 
-| Module | Verb | Question |
+| Module | Verb | The abstract question |
 |---|---|---|
 | 1 · Dependence | **measure** | how much do two things move together? |
 | 2 · Gaussianization | (the engine) | turn messy data Gaussian, invertibly |
@@ -149,19 +161,32 @@ data.*
 The same change-of-variables map runs **forward** to measure and remove,
 **backward** to propagate.
 
-## The Ideal vs. the Shortcut {.center}
+## The Through-Line — On the Desk
+
+| Module | Verb | The same question, on real money |
+|---|---|---|
+| 1 · Dependence | **measure** | do two holdings crash on the same days? |
+| 2 · Gaussianization | (the engine) | reshape fat-tailed returns into a clean bell |
+| 3 · Uncertainty | **propagate** | the chance the book loses >10% next month? |
+| 4 · Fair learning | **remove** | does the score secretly track a protected trait? |
+
+. . .
+
+Four desk questions — **one machine** underneath.
+
+## No Free Lunch {.center}
 
 That one invertible map is the **clean picture** — the exact way to see all four
 verbs as one operation.
 
 . . .
 
-But an exact map is expensive.
+But the exact map is expensive — there's **no free lunch.**
 
 . . .
 
-So in practice each module **trades exactness for a cheaper estimator** that
-measures the same dependence a different way.
+So each module trades it for a cheaper **shortcut** that measures the same
+dependence a different way. *Computation is a game of trade-offs.*
 
 ## The Shortcut, Module by Module
 

@@ -12,7 +12,7 @@ from lectures.gaussianization import gaussianize_1d
 plotting.set_style("notes")
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.stats import norm
+from scipy.stats import norm, laplace, t as student_t
 ```
 
 ## The One Formula
@@ -45,26 +45,157 @@ course.
   the generative direction used in [Uncertainty](../uncertainty/index.qmd).
 :::
 
-## The 1-D Building Block: Rank → Gaussian
+## Step 1: Uniformize — the Probability Integral Transform
 
-The simplest non-trivial $T$ makes a *single* variable Gaussian.  Send each value
-through its own empirical CDF $\hat F$ (which maps any distribution to a uniform),
-then through the inverse Gaussian CDF $\Phi^{-1}$:
+Before we can make anything Gaussian, we need a universal way station that erases
+every original shape.  That way station is the **uniform**, and the road to it is a
+variable's *own* CDF.
+
+Push **any** continuous variable $X$ through its own cumulative distribution
+function $F_X$ and the result is flat — exactly $\mathrm{Uniform}(0,1)$, no matter
+how skewed, fat-tailed, or oddly-shaped $X$ was to begin with:
 
 $$
-T(x) = \Phi^{-1}\big(\hat F(x)\big).
+u = F_X(x) \ \sim\ \mathrm{Uniform}(0,1).
 $$
 
-This is monotone, hence invertible, so it carries no information away — it only
+This is the **Probability Integral Transform**.  The reason is almost a tautology:
+$F_X(x)$ reads off *what fraction of the mass sits below $x$*, and "the fraction
+below me" is uniform by construction — a quarter of the data lands below the 0.25
+mark, half below the 0.5 mark, and so on.  Every feature of the original shape is
+washed out; only the *ranking* survives.
+
+```{python}
+#| label: fig-uniformize-pit
+#| fig-cap: "The Probability Integral Transform. A skewed exponential variable (left), read through its own empirical CDF (middle), comes out flat — a Uniform(0,1) (right). The shape is gone; only the ranking remains."
+rng = np.random.default_rng(0)
+v = rng.exponential(size=4000)          # a skewed source variable
+xs = np.sort(v)                          # sorted values define the empirical CDF
+Fc = np.arange(1, len(xs) + 1) / len(xs) # F̂(x) = fraction of data at or below x
+u = np.interp(v, xs, Fc)                 # u = F̂(x): each point's mass-fraction
+
+fig, axes = plt.subplots(1, 3, figsize=(11, 3.4))
+axes[0].hist(v, bins=40, color=WARM, alpha=0.85, density=True)
+axes[0].set_title("data  x  (skewed)", fontsize=12)
+axes[0].set_xlabel("x"); axes[0].set_ylabel("density")
+axes[1].plot(xs, Fc, color=INK, lw=2.4)
+axes[1].set_title(r"its CDF  $\hat F_X$  (a ruler in probability)", fontsize=12)
+axes[1].set_xlabel("x"); axes[1].set_ylabel("cumulative fraction")
+axes[2].hist(u, bins=20, color=COOL, alpha=0.85, density=True)
+axes[2].axhline(1.0, color=INK, lw=1.6, ls="--", label="Uniform(0,1)")
+axes[2].set_title(r"$u = \hat F_X(x)$  — flat", fontsize=12)
+axes[2].set_xlabel("u"); axes[2].legend(fontsize=9, frameon=False)
+for a in axes:
+    despine(a)
+fig.tight_layout()
+plt.show()
+```
+
+The CDF is a **ruler measured in probability**.  Whatever the original units —
+dollars, log-returns, waiting times — it relabels each point by the fraction of the
+population beneath it, and that relabelling is always uniform.
+
+## Step 2: Inverse CDF — a Uniform Becomes Anything
+
+A uniform is not the destination; it is a hub.  Run the transform *backward* — feed
+a uniform $u$ into some **target** distribution's inverse CDF $F^{-1}_{\text{target}}$
+— and you arrive in *any* law you choose:
+
+$$
+z = F^{-1}_{\text{target}}(u).
+$$
+
+The same uniform draws can be sculpted into a Gaussian, a sharp-peaked Laplace, a
+fat-tailed Student-$t$, or anything else with a CDF.  Uniform sits at the centre of
+a wheel; each inverse CDF is a different spoke out.
+
+```{python}
+#| label: fig-inverse-cdf-anything
+#| fig-cap: "One stream of uniform draws, pushed through three different inverse CDFs, lands in three different laws — Gaussian, Laplace (sharp peak), and Student-t with 3 degrees of freedom (fat tails)."
+rng = np.random.default_rng(1)
+u = rng.uniform(size=9000)               # the universal hub: one uniform stream
+
+targets = [
+    ("Gaussian  ·  Φ⁻¹", norm.ppf(u), COOL),
+    ("Laplace  ·  sharp peak", laplace.ppf(u), WARM),
+    ("Student-t(3)  ·  fat tails", student_t(3).ppf(u), plotting.PALETTE["green"]),
+]
+fig, axes = plt.subplots(1, 3, figsize=(11, 3.2))
+for ax, (name, z, c) in zip(axes, targets):
+    ax.hist(np.clip(z, -6, 6), bins=60, range=(-6, 6),
+            color=c, alpha=0.85, density=True)  # clip only so the t-tails fit the frame
+    ax.set_title(name, fontsize=12)
+    ax.set_xlim(-6, 6); ax.set_xlabel("z"); despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+So the full menu is $x \to u \to \text{anything}$.  **Gaussianizing is simply
+choosing the Gaussian exit** — $z = \Phi^{-1}(u)$ — out of all the spokes available.
+
+## Step 3: Sampling for Free — Invert the CDF
+
+Reading Step 2 as a recipe gives **inverse-transform sampling**, the cheapest
+sampler there is.  To draw from *any* law: pick $u \sim \mathrm{Uniform}(0,1)$, ride
+up to the CDF curve, and read off $z = F^{-1}(u)$.  No rejection, no MCMC — uniform
+noise in, correctly-shaped samples out, with the curvature of the CDF doing all of
+the bending.
+
+This *is* the **backward / generative** pass of the change-of-variables formula:
+draw simple noise in the easy world, invert the map to land in the data world.
+
+```{python}
+#| label: fig-inverse-transform-sampling
+#| fig-cap: "Inverse-transform sampling. Uniform draws sit on the y-axis; each rides across to the CDF curve, then drops to a sample on the x-axis. Densely-sloped regions of the CDF catch more uniform draws, so samples pile up where the density is high."
+rng = np.random.default_rng(4)
+zs = np.linspace(-3.4, 3.4, 400)
+us = np.sort(rng.uniform(0.04, 0.96, size=9))   # nine uniform draws on the y-axis
+
+fig, ax = plt.subplots(figsize=(7.2, 4.2))
+ax.plot(zs, norm.cdf(zs), color=INK, lw=2.4, label=r"CDF  $\Phi$")
+for uu in us:
+    zz = norm.ppf(uu)                            # z = Φ⁻¹(u): the sample for this draw
+    ax.plot([-3.5, zz], [uu, uu], color=COOL, lw=1.0, alpha=0.8)  # ride across to the curve
+    ax.plot([zz, zz], [uu, 0], color=WARM, lw=1.0, alpha=0.8)     # drop down to the x-axis
+    ax.scatter([zz], [0], color=WARM, s=30, zorder=5)
+ax.scatter([-3.5] * len(us), us, color=COOL, s=30, zorder=5)
+ax.set_xlim(-3.6, 3.6); ax.set_ylim(-0.01, 1.02)
+ax.set_xlabel(r"$z = \Phi^{-1}(u)$   →   Gaussian samples (x-axis)")
+ax.set_ylabel(r"$u \sim \mathrm{Uniform}(0,1)$  (y-axis)")
+ax.legend(fontsize=9, frameon=False, loc="lower right")
+despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+Uniform draws are spread evenly up the y-axis, but the CDF is steep where the
+density is high — so those flat draws get squeezed together near the mode and spread
+out in the tails.  The shape of the samples is the shape of the inverse CDF.
+
+## Step 4: The 1-D Gaussianization Move = Uniformize, then Exit Gaussian
+
+Chaining the two halves gives the simplest non-trivial $T$: it makes a *single*
+variable Gaussian.  Send each value through its own empirical CDF $\hat F_X$ (Step 1,
+$x \to u$), then out through the inverse Gaussian CDF $\Phi^{-1}$ (the Gaussian
+spoke of Step 2, $u \to z$):
+
+$$
+T(x) = \Phi^{-1}\big(\hat F_X(x)\big)\,,
+\qquad
+\underbrace{\hat F_X}_{x \,\to\, u}\ \text{then}\ \underbrace{\Phi^{-1}}_{u \,\to\, z}.
+$$
+
+Both pieces are monotone, so their composition is monotone — hence **invertible**,
+exactly as the formula above requires.  It carries no information away; it only
 *reshapes the marginal*.  Cross-dependence between variables is untouched (that is
 what [rotation](02-rbig.qmd) is for).
 
 ```{python}
 #| label: fig-gaussianize-1d
-#| fig-cap: "A skewed (exponential) variable, before and after the rank → Gaussian transform. The shape becomes a standard normal; the ordering of points is preserved."
+#| fig-cap: "A skewed (exponential) variable, before and after the rank → Gaussian transform T(x) = Φ⁻¹(F̂(x)). The shape becomes a standard normal; the ordering of points is preserved."
 rng = np.random.default_rng(0)
 v = rng.exponential(size=4000)
-g = gaussianize_1d(v)
+g = gaussianize_1d(v)                     # T(x) = Φ⁻¹(F̂(x)): uniformize, then exit Gaussian
 
 fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.0))
 axL.hist(v, bins=40, color=WARM, alpha=0.8, density=True)
@@ -82,6 +213,65 @@ despine(axR)
 fig.tight_layout()
 plt.show()
 ```
+
+One marginal, now exactly standard normal — and because the map is monotone it is
+invertible, so the next section's promise (a perfect dictionary back to the data)
+still holds.
+
+## Why Aim at a Gaussian?
+
+Step 2 showed that *any* target is reachable — Laplace, Student-$t$, anything with a
+CDF.  So why do we always aim at the bell?  Three reasons, and the second is the
+hinge the whole iterative method (next note) turns on.
+
+**(a) Maximum entropy for a fixed variance.**  Among all distributions with a given
+variance, the Gaussian is the one with the largest entropy — the *least committal*,
+most spread-out choice.  Picking it as the target adds no structure of our own
+beyond the scale we fixed.
+
+**(b) Rotation-invariance — the unique fixed point of a spin.**  A standard Gaussian
+in $d$ dimensions is spherically symmetric: rotate it and it is unchanged.  Crucially,
+it is the **only** shape for which independent coordinates *stay* independent under a
+rotation.  Spin a cloud of independent Gaussians and you get independent Gaussians
+again; spin a cloud of independent *uniforms* (or any non-Gaussian) and the axes
+become dependent.  This is exactly the lever [RBIG](02-rbig.qmd) pulls: rotate, and
+any leftover dependence is forced to *resurface as non-Gaussian marginals*, which the
+1-D move can then flatten.
+
+**(c) Closed form everywhere.**  Entropy, mutual information, and tail probabilities
+of a Gaussian are all available in closed form, which is what makes the dependence
+measures of [the next notes](03-mutual-information.qmd) computable rather than merely
+defined.
+
+```{python}
+#| label: fig-rotation-invariance
+#| fig-cap: "Why the Gaussian is special. Left: independent Gaussians, spun by 35°, are still independent Gaussians (round, axis-aligned marginals). Right: independent uniforms, spun by the same angle, become dependent — the square tilts into a diamond and the axes now carry information about each other."
+rng = np.random.default_rng(1)
+G = rng.normal(size=(2500, 2))               # independent standard Gaussians
+U = rng.uniform(-1.7, 1.7, size=(2500, 2))   # independent uniforms (matched spread)
+
+
+def rotate(D, deg):
+    """Rotate a 2-D point cloud by `deg` degrees."""
+    th = np.deg2rad(deg)
+    R = np.array([[np.cos(th), -np.sin(th)],
+                  [np.sin(th),  np.cos(th)]])
+    return D @ R.T
+
+
+fig, axes = plt.subplots(1, 2, figsize=(8.4, 4.0))
+axes[0].scatter(*rotate(G, 35).T, s=5, c=COOL, alpha=0.35, edgecolors="none")
+axes[0].set_title("spin independent Gaussians\n→ still independent Gaussians", fontsize=11)
+axes[1].scatter(*rotate(U, 35).T, s=5, c=WARM, alpha=0.35, edgecolors="none")
+axes[1].set_title("spin independent uniforms\n→ now dependent", fontsize=11)
+for a in axes:
+    a.set_aspect("equal"); a.set_xticks([]); a.set_yticks([]); despine(a)
+fig.tight_layout()
+plt.show()
+```
+
+Reachability says we *could* aim anywhere; entropy, rotation-invariance, and
+closed-form tractability say the Gaussian is where we *should*.
 
 ## Why Invertibility Is the Whole Point
 

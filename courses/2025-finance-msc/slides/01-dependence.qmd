@@ -17,7 +17,7 @@ import sys, pathlib
 sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
 from lectures import plotting, datasets
 from lectures.plotting import INK, COOL, WARM, CRASH, GRID, PANEL, despine, annotate_box
-from lectures.measures import distance_correlation, mutual_information_bits, mutual_information_xy, linfoot_r, hsic_rbf, cka_rbf
+from lectures.measures import distance_correlation, mutual_information_bits, mutual_information_xy, linfoot_r, hsic_rbf, cka_rbf, cka_linear
 from lectures.gaussianization import gaussianize_1d
 plotting.set_style("slides")
 import numpy as np, matplotlib.pyplot as plt
@@ -202,6 +202,33 @@ plt.tight_layout()
 plt.show()
 ```
 
+## #1 Pearson — What Noise Does
+
+Same line every panel — only the **scatter around it** grows:
+
+```{python}
+#| echo: false
+#| fig-width: 11.5
+#| fig-height: 3.3
+rng = np.random.default_rng(0)
+n = 300
+x = rng.normal(0, 1, n)
+eps = rng.normal(0, 1, n)
+fig, axes = plt.subplots(1, 4, figsize=(11.5, 3.3))
+for ax, s in zip(axes, [0.33, 0.75, 1.33, 2.29]):
+    y = x + s * eps
+    ax.axline((0, 0), slope=1, color=INK, lw=1.3, ls="--", alpha=0.6)
+    ax.scatter(x, y, s=10, c=COOL, alpha=0.5, edgecolors="none")
+    ax.set_title(f"more noise →   r = {pearsonr(x, y)[0]:.2f}", fontsize=12)
+    ax.set_xlim(-3.5, 3.5); ax.set_ylim(-6, 6)
+    ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+fig.tight_layout(); plt.show()
+```
+
+The slope never changed — yet $r$ slides from 0.95 to 0.45. Pearson rates how
+**tightly** points hug the line, not whether a link is there: noise alone can make
+a real relationship look weak.
+
 ## #1 Pearson — Our Characters
 
 ```{python}
@@ -240,6 +267,9 @@ Catches any *monotonic* relationship.  Fails on U-shapes.
 
 ## #2 Spearman — The Transform, Seen
 
+Take a **compounding payoff** — money that grows multiplicatively, like reinvested
+returns or compound interest ($y \approx e^{0.9x}$). Monotonic, but curved:
+
 ```{python}
 #| echo: false
 rng = np.random.default_rng(11)
@@ -257,8 +287,8 @@ for ax in (axL, axR):
 fig.tight_layout(); plt.show()
 ```
 
-The payoff compounds, so the relationship bends and Pearson under-reports.
-**Ranks straighten the curve** — Spearman *is* Pearson on the right panel.
+The bend costs Pearson about a third of its value; **ranks straighten the curve**
+— Spearman *is* Pearson on the right panel.
 
 ## #2 Spearman — The Seed
 
@@ -451,24 +481,124 @@ Pearson sees a line and misses the V; distance correlation catches both.
 
 ---
 
-## #4 HSIC — Dependence Without a Density {.center}
+## From Distance to Kernel
 
-$$\operatorname{HSIC}(X, Y) = \frac{1}{(n-1)^2}\operatorname{tr}(K_X H K_Y H)$$
+dCor compared days by **distance**. A **kernel** measures the opposite —
+**similarity** — by squashing that same distance through a Gaussian:
 
-- Zero *exactly* under independence
-- No density estimate needed
-- **Differentiable** → usable as a training penalty
+$$k(x_i, x_j) = \exp\!\Big(\!-\tfrac{|x_i - x_j|^2}{2\sigma^2}\Big) \in (0, 1]$$
 
 . . .
 
-The kernel generalization of distance correlation — the most general Road 1 test.
-*The same HSIC becomes the fairness penalty in Lecture 2.*
+```{python}
+#| echo: false
+#| fig-width: 8
+#| fig-height: 2.5
+d = np.linspace(0, 3, 400)
+k = np.exp(-d**2 / 2.0)
+fig, ax = plt.subplots(figsize=(8, 2.5))
+ax.plot(d, k, color=COOL, lw=3)
+ax.fill_between(d, k, color=COOL, alpha=0.08)
+ax.scatter([0], [1], s=80, c=CRASH, zorder=5)
+ax.annotate("identical days → 1", (0, 1), textcoords="offset points", xytext=(14, -4),
+            fontsize=12, color=INK)
+df = 2.2
+ax.scatter([df], [np.exp(-df**2 / 2)], s=80, c=CRASH, zorder=5)
+ax.annotate("far apart → ~0", (df, np.exp(-df**2 / 2)), textcoords="offset points",
+            xytext=(2, 18), fontsize=12, color=INK)
+ax.set_xlabel("distance  |xᵢ − xⱼ|   (what dCor used)")
+ax.set_ylabel("kernel similarity  k")
+ax.set_ylim(-0.02, 1.10)
+despine(ax); fig.tight_layout(); plt.show()
+```
+
+. . .
+
+Same ingredient as dCor — the pairwise distance — now read as **nearness**,
+bounded to $[0, 1]$.
+
+---
+
+## One Structure, Two Lenses
+
+The pairwise matrix dCor built from **distances** is the one HSIC reads as
+**similarity** — top row vs bottom row, same days:
+
+. . .
+
+```{python}
+#| echo: false
+#| fig-width: 11
+#| fig-height: 4.1
+from matplotlib.gridspec import GridSpec
+
+def _convex(n=120, noise=0.08, seed=42):
+    rng = np.random.default_rng(seed)
+    u = rng.normal(0, 1, n)
+    return u, np.abs(u) + noise * rng.normal(0, 1, n)
+
+def _rbf(z):
+    d2 = (z[:, None] - z[None, :]) ** 2
+    s = np.sqrt(np.median(d2[d2 > 0]) / 2)
+    return np.exp(-d2 / (2 * s * s))
+
+uq, vq = _convex(); order = np.argsort(uq); us, vs = uq[order], vq[order]
+DX = np.abs(us[:, None] - us[None, :]); DY = np.abs(vs[:, None] - vs[None, :])
+KX, KY = _rbf(us), _rbf(vs)
+fig = plt.figure(figsize=(11, 4.1))
+gs = GridSpec(2, 3, width_ratios=[1.15, 1, 1], wspace=0.2, hspace=0.4)
+axS = fig.add_subplot(gs[:, 0]); anchor = 12
+axS.scatter(us, vs, s=12, c=WARM, alpha=0.45, edgecolors="none")
+axS.scatter([us[anchor]], [vs[anchor]], s=70, c=CRASH, zorder=5)
+for j in range(0, len(us), 14):
+    axS.plot([us[anchor], us[j]], [vs[anchor], vs[j]], color=GRID, lw=0.8, zorder=1)
+axS.set_title("one day vs every other", fontsize=12)
+axS.set_xticks([]); axS.set_yticks([]); despine(axS)
+for spec, M, ttl, cmap in [(gs[0, 1], DX, "distance · X", "Blues"),
+                           (gs[0, 2], DY, "distance · Y", "Oranges"),
+                           (gs[1, 1], KX, "kernel · X", "Blues"),
+                           (gs[1, 2], KY, "kernel · Y", "Oranges")]:
+    ax = fig.add_subplot(spec); ax.imshow(M, cmap=cmap, origin="lower")
+    ax.set_title(ttl, fontsize=12); ax.set_xticks([]); ax.set_yticks([])
+fig.tight_layout(); plt.show()
+```
+
+. . .
+
+Top: **distance** (dCor); bottom: the **kernel** — the same matrix inverted. HSIC
+reads *alike* where dCor read *far*.
+
+---
+
+## #4 HSIC — Dependence Without a Density {.center}
+
+Same template as every rung — a new transform, then **correlate**:
+
+```
+Pearson  = corr(  x         ,  y         )
+Spearman = corr(  rank(x)   ,  rank(y)   )
+dCor     = corr(  dist(x)   ,  dist(y)   )
+CKA      = corr(  kernel(x) ,  kernel(y) )
+```
+
+. . .
+
+- Zero *exactly* under independence
+- No density estimate needed
+- **Any kernel** → vectors, sequences, even whole distributions
+
+. . .
+
+CKA is HSIC rescaled to $[0,1]$ — the kernel cousin of dCor.
+*The same score becomes the fairness penalty in Lecture 2.*
 
 ---
 
 ## #4 HSIC — In Pictures
 
 Swap *distance* for **kernel similarity**: $K_{ij}$ = how alike days $i$ and $j$ are.
+
+. . .
 
 ```{python}
 #| echo: false
@@ -501,8 +631,10 @@ for ax, M, ttl, cmap, kw in [
 fig.tight_layout(); plt.show()
 ```
 
-$\operatorname{tr}(K_X H K_Y H)$ just **sums the third panel** — HSIC is large
-when the two similarity patterns light up in the same places.
+. . .
+
+The score just **sums the third panel** — HSIC (and its $[0,1]$ cousin CKA) is
+large when the two similarity patterns light up in the same places.
 
 ---
 
@@ -514,7 +646,7 @@ Same two characters, all four rungs.  Each new rung catches what the last missed
 #| echo: false
 a, b, _ = datasets.two_banks(n=500)
 u, v = datasets.convex_payoff(n=500)
-methods = ["Pearson", "Spearman", "distance\ncorr", "HSIC"]
+methods = ["Pearson", "Spearman", "distance\ncorr", "CKA"]
 banks = [abs(pearsonr(a, b)[0]), abs(spearmanr(a, b)[0]),
          distance_correlation(a, b), cka_rbf(a, b)]
 convex = [abs(pearsonr(u, v)[0]), abs(spearmanr(u, v)[0]),
@@ -525,25 +657,168 @@ ax.axvspan(-0.5, 1.5, color=CRASH, alpha=0.06)
 ax.bar(xs - wbar / 2, banks, wbar, color=COOL, label="Banks (a line)")
 ax.bar(xs + wbar / 2, convex, wbar, color=WARM, label="Convex (a V)")
 ax.set_xticks(xs); ax.set_xticklabels(methods, fontsize=14)
-ax.set_ylabel("dependence detected"); ax.set_ylim(0, 1)
-ax.text(0.5, 0.93, "blind to the V", ha="center", fontsize=13, color=CRASH,
+ax.set_ylabel("dependence detected"); ax.set_ylim(0, 1.0)
+ax.text(0.5, 0.9, "blind to the V", ha="center", fontsize=13, color=CRASH,
         style="italic", fontweight="bold")
-ax.text(2.5, 0.93, "sees any shape", ha="center", fontsize=13,
+ax.text(2.5, 0.9, "sees any shape", ha="center", fontsize=13,
         color=plotting.PALETTE["green"], style="italic", fontweight="bold")
-ax.legend(fontsize=12, frameon=False, loc="center right")
+ax.legend(fontsize=12, frameon=False, ncol=2, loc="lower center",
+          bbox_to_anchor=(0.5, 1.0))
 despine(ax); fig.tight_layout(); plt.show()
 ```
 
-Pearson & Spearman collapse on the convex V; distance correlation and HSIC hold.
+Pearson & Spearman collapse on the convex V; distance correlation and CKA hold.
+
+---
+
+## One Family — What Each Rung Trades
+
+```{python}
+#| echo: false
+#| fig-width: 11
+#| fig-height: 4.6
+fig, ax = plt.subplots(figsize=(11, 4.6))
+ax.set_xlim(0, 10); ax.set_ylim(0, 10); ax.axis("off")
+for x, m in zip([1.5, 3.7, 6.0, 8.5],
+                ["Pearson", "Spearman", "distance corr.", "HSIC / CKA"]):
+    ax.text(x, 9.4, m, ha="center", va="center", fontsize=14, fontweight="bold", color=INK)
+ax.annotate("", xy=(9.5, 8.5), xytext=(0.9, 8.5),
+            arrowprops=dict(arrowstyle="-|>", lw=2.6, color=COOL))
+ax.text(5.2, 7.85, "each rung catches what the last missed", ha="center",
+        fontsize=11.5, style="italic", color="#666")
+for left, right, y in [("linear", "any shape", 6.3), ("simple", "complex", 4.9),
+                       ("cheap  O(n)", "expensive  O(n²)", 3.5),
+                       ("no parameters", "kernel + bandwidth", 2.1)]:
+    ax.annotate("", xy=(7.3, y), xytext=(2.7, y),
+                arrowprops=dict(arrowstyle="-|>", lw=1.8, color=GRID))
+    ax.text(2.5, y, left, ha="right", va="center", fontsize=13, color=COOL, fontweight="bold")
+    ax.text(7.5, y, right, ha="left", va="center", fontsize=13, color=CRASH, fontweight="bold")
+fig.tight_layout(); plt.show()
+```
+
+Same ladder, four trade-offs: each rung up buys **reach** and pays in **cost** and
+**parameters**. Pick the lowest rung that still sees your dependence.
+
+---
+
+## From Points to a Density
+
+Road 1 compared the **points**. Road 2 steps back to their whole **shape** — the
+density $p(x)$ the points trace out:
+
+```{python}
+#| echo: false
+#| fig-width: 11
+#| fig-height: 2.9
+rng = np.random.default_rng(3)
+pts1d = np.concatenate([rng.normal(0, 1.0, 500), rng.normal(0.5, 2.6, 120)])
+fig, axes = plt.subplots(1, 3, figsize=(11, 2.9))
+axes[0].scatter(pts1d, rng.uniform(0, 1, len(pts1d)), s=9, c=COOL, alpha=0.35, edgecolors="none")
+axes[0].set_title("a pile of points", fontsize=13)
+axes[1].hist(pts1d, bins=28, color=COOL, alpha=0.75)
+axes[1].set_title("count them in bins", fontsize=13)
+gx = np.linspace(pts1d.min(), pts1d.max(), 250)
+axes[2].fill_between(gx, gaussian_kde(pts1d)(gx), color=COOL, alpha=0.45)
+axes[2].plot(gx, gaussian_kde(pts1d)(gx), color=INK, lw=2)
+axes[2].set_title("a smooth density  p(x)", fontsize=13)
+for ax in axes:
+    ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+fig.tight_layout(); plt.show()
+```
+
+. . .
+
+Pile up enough days and the cloud becomes a curve. *That curve is what the second
+road measures.*
+
+---
+
+## A Distribution's Shape — Its Moments
+
+A density's shape is captured by a few **moments**:
+
+```{python}
+#| echo: false
+#| fig-width: 9.5
+#| fig-height: 3.2
+from scipy.stats import skewnorm
+a_sk, loc, sc = 5.0, -1.2, 2.2
+gx = np.linspace(-5, 7, 500); pdf = skewnorm.pdf(gx, a_sk, loc, sc)
+mu = skewnorm.mean(a_sk, loc, sc); sd = skewnorm.std(a_sk, loc, sc); pk = pdf.max()
+fig, ax = plt.subplots(figsize=(9.5, 3.2))
+ax.fill_between(gx, pdf, color=COOL, alpha=0.30); ax.plot(gx, pdf, color=INK, lw=2.2)
+ax.axvline(mu, color=CRASH, lw=2.2)
+ax.annotate("mean", (mu, pk * 0.78), textcoords="offset points", xytext=(7, 0),
+            color=CRASH, fontsize=12, fontweight="bold")
+ax.annotate("", xy=(mu + sd, pk * 0.40), xytext=(mu - sd, pk * 0.40),
+            arrowprops=dict(arrowstyle="<->", color=INK, lw=1.6))
+ax.text(mu, pk * 0.44, "std (spread)", ha="center", fontsize=11, color=INK)
+ax.annotate("skew — leans right", xy=(mu + 1.9 * sd, pk * 0.16), xytext=(mu + 1.0 * sd, pk * 0.62),
+            fontsize=11, color="#555", arrowprops=dict(arrowstyle="->", color="#999", lw=1.2))
+ax.annotate("kurtosis — fat tail", xy=(mu + 3.0 * sd, pk * 0.04), xytext=(mu + 1.7 * sd, pk * 0.30),
+            fontsize=11, color="#555", arrowprops=dict(arrowstyle="->", color="#999", lw=1.2))
+ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+fig.tight_layout(); plt.show()
+```
+
+. . .
+
+**mean** (where) · **variance** (how wide) · **skew** (lopsided) · **kurtosis**
+(fat tails) — and we never know them exactly, only **estimate** them from a sample.
+
+---
+
+## Two Variables: the Joint and Its Marginals
+
+Two variables have one **joint** shape and two **marginal** shadows:
+
+```{python}
+#| echo: false
+#| fig-width: 7.0
+#| fig-height: 4.3
+rng = np.random.default_rng(7)
+pts = rng.multivariate_normal([0, 0], [[1.0, 0.72], [0.72, 1.0]], 700)
+xx, yy = pts[:, 0], pts[:, 1]
+vals, vecs = np.linalg.eigh(np.cov(xx, yy))
+ordr = vals.argsort()[::-1]; vals, vecs = vals[ordr], vecs[:, ordr]
+ang = np.degrees(np.arctan2(vecs[1, 0], vecs[0, 0])); ew, eh = 2 * 2 * np.sqrt(vals)
+fig = plt.figure(figsize=(7.0, 4.3))
+gs = GridSpec(2, 2, width_ratios=[4, 1.15], height_ratios=[1.15, 4], wspace=0.05, hspace=0.05)
+axm = fig.add_subplot(gs[1, 0])
+axt = fig.add_subplot(gs[0, 0], sharex=axm)
+axrt = fig.add_subplot(gs[1, 1], sharey=axm)
+axm.scatter(xx, yy, s=9, c=COOL, alpha=0.35, edgecolors="none")
+axm.add_patch(Ellipse([xx.mean(), yy.mean()], ew, eh, angle=ang, fc="none", ec=CRASH, lw=2.4))
+axm.scatter([xx.mean()], [yy.mean()], s=55, c=CRASH, zorder=6)
+axm.text(0.03, 0.92, "JOINT  p(x, y)", transform=axm.transAxes, fontsize=12, fontweight="bold", color=INK)
+axm.text(0.03, 0.04, "mean + covariance", transform=axm.transAxes, fontsize=10.5, color=CRASH)
+axm.set_xlabel("X"); axm.set_ylabel("Y"); axm.set_xticks([]); axm.set_yticks([]); despine(axm)
+axt.hist(xx, bins=30, color=WARM, alpha=0.78); axt.set_ylabel("p(x)", fontsize=11, rotation=0, ha="right", va="center")
+axrt.hist(yy, bins=30, orientation="horizontal", color=WARM, alpha=0.78); axrt.set_xlabel("p(y)", fontsize=11)
+for a in (axt, axrt):
+    a.set_xticks([]); a.set_yticks([])
+    for sp in a.spines.values():
+        sp.set_visible(False)
+fig.tight_layout(); plt.show()
+```
+
+. . .
+
+**Covariance** (the ellipse) is the 2-D 2nd moment — Pearson, rescaled. But
+dependence lives in the **joint**; the marginals alone can't see it.
 
 ---
 
 ## Road 2 · Through the Density {.center}
 
-A different question: *how far is the joint from independent — in bits?*
+Now the question is concrete: how far does the **joint** sit from the
+**independent** version — the product of its marginals $p(x)\,p(y)$? Measure that
+gap, in **bits**.
 
-That needs the **density** $p(x,y)$ — **assume** its shape (parametric, fast, wrong
-in the tails) or **learn** it (Gaussianization).
+. . .
+
+**Assume** the density's shape (parametric — fast, wrong in the tails) or **learn**
+it (Gaussianization).
 
 . . .
 
@@ -573,6 +848,42 @@ for ax in (axL, axR):
     despine(ax)
 fig.tight_layout(); plt.show()
 ```
+
+---
+
+## Information & Entropy — the Intuition
+
+Before any formula, two ideas:
+
+- **Information = surprise** — a rare outcome tells you a lot; a near-certain one, almost nothing.
+- **Entropy = average surprise** — how unpredictable a variable is.
+
+```{python}
+#| echo: false
+#| fig-width: 10
+#| fig-height: 2.9
+from scipy.stats import norm as _N
+gx = np.linspace(-6, 6, 400)
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(10, 2.9), sharey=True)
+axL.fill_between(gx, _N.pdf(gx, 0, 0.5), color=COOL, alpha=0.4)
+axL.plot(gx, _N.pdf(gx, 0, 0.5), color=INK, lw=2)
+axL.set_title("peaked → predictable", fontsize=13)
+axL.text(0.5, 0.55, "little surprise", transform=axL.transAxes, ha="center",
+         fontsize=12, color=CRASH, fontweight="bold")
+axR.fill_between(gx, _N.pdf(gx, 0, 2.3), color=WARM, alpha=0.4)
+axR.plot(gx, _N.pdf(gx, 0, 2.3), color=INK, lw=2)
+axR.set_title("spread → uncertain", fontsize=13)
+axR.text(0.5, 0.55, "lots of surprise", transform=axR.transAxes, ha="center",
+         fontsize=12, color=CRASH, fontweight="bold")
+for ax in (axL, axR):
+    ax.set_xticks([]); ax.set_yticks([]); ax.set_xlabel("outcome"); despine(ax)
+fig.tight_layout(); plt.show()
+```
+
+. . .
+
+A peaked density is predictable (low entropy); a spread one keeps you guessing
+(high). The next slides put **numbers** on this.
 
 ---
 
@@ -662,6 +973,40 @@ fig.tight_layout(); plt.show()
 
 The wider the distribution, the more average surprise — the more **bits** it takes
 to describe a day.
+
+---
+
+## KL Divergence — the Gap Between Densities
+
+Entropy scored *one* density. **KL divergence** scores the gap between *two* — the
+bits wasted using model $q$ when the truth is $p$ (zero only when they match):
+
+$$D_{\mathrm{KL}}(p\,\|\,q)=\mathbb{E}_p\!\left[\log\frac{p}{q}\right]\;\ge\;0$$
+
+```{python}
+#| echo: false
+#| fig-width: 8.6
+#| fig-height: 2.4
+from scipy.stats import norm as _Nk
+xs = np.linspace(-5, 6.5, 400)
+pp = _Nk.pdf(xs, 0.0, 1.0)                 # truth p
+qq = _Nk.pdf(xs, 1.3, 1.7)                 # wrong model q
+kl = float(np.sum(pp * np.log2(pp / qq)) * (xs[1] - xs[0]))
+fig, ax = plt.subplots(figsize=(8.6, 2.4))
+ax.fill_between(xs, pp, color=COOL, alpha=0.35)
+ax.plot(xs, pp, color=INK, lw=2.2, label="p — truth")
+ax.plot(xs, qq, color=WARM, lw=2.4, label="q — model")
+ax.set_title(f"D_KL(p ‖ q) = {kl:.2f} bits", fontsize=13)
+ax.set_yticks([]); ax.set_xlabel("outcome")
+ax.legend(fontsize=12, frameon=False); despine(ax)
+fig.tight_layout(); plt.show()
+```
+
+. . .
+
+Dependence is just KL **from independence**:
+$I(X;Y)=D_{\mathrm{KL}}(p_{x,y}\,\|\,p_x\,p_y)$ — and total correlation is the same
+for a whole vector. (Last slide's *shuffle* built exactly that reference.)
 
 ---
 
@@ -813,6 +1158,153 @@ Shared surprise between two single values → $I(X;Y)$, mutual information.
 
 ---
 
+## Going Multidimensional
+
+Each sample is now a **vector**, not a number — covariance becomes a **matrix**:
+
+$$\sigma_{xy}=\operatorname{cov}(x,y)\in\mathbb{R}\qquad\longrightarrow\qquad\Sigma_{xy}=\operatorname{Cov}(\mathbf{x},\mathbf{y})\in\mathbb{R}^{p\times q}$$
+
+```{python}
+#| echo: false
+#| fig-width: 7.6
+#| fig-height: 2.3
+rng = np.random.default_rng(2)
+n = 300
+gT = rng.normal(0, 1, n)                                       # latent tech factor
+gB = 0.6 * gT + np.sqrt(1 - 0.36) * rng.normal(0, 1, n)        # bank factor — sectors co-move
+LX = rng.uniform(0.4, 1.1, 5); LY = rng.uniform(0.4, 1.1, 5)   # per-name factor loadings
+eX = rng.uniform(0.4, 0.9, 5); eY = rng.uniform(0.4, 0.9, 5)   # per-name idiosyncratic noise
+Xb = gT[:, None] * LX + eX * rng.normal(0, 1, (n, 5))          # 5 tech names   (n × 5)
+Yb = gB[:, None] * LY + eY * rng.normal(0, 1, (n, 5))          # 5 bank names   (n × 5)
+C = np.array([[pearsonr(Xb[:, i], Yb[:, j])[0] for j in range(5)] for i in range(5)])
+fig, ax = plt.subplots(figsize=(7.6, 2.3))
+ax.imshow(C, cmap="RdBu_r", vmin=-1, vmax=1, aspect="auto")   # wide cells so values don't crowd
+for i in range(5):
+    for j in range(5):
+        ax.text(j, i, f"{C[i, j]:.2f}", ha="center", va="center", fontsize=11,
+                color="white" if abs(C[i, j]) > 0.55 else INK)
+ax.set_xticks(range(5)); ax.set_yticks(range(5))
+ax.set_xticklabels([f"B{j+1}" for j in range(5)], fontsize=10)
+ax.set_yticklabels([f"T{i+1}" for i in range(5)], fontsize=10)
+ax.set_title("5 tech × 5 banks = 25 correlations — which is THE one?", fontsize=11)
+fig.tight_layout(); plt.show()
+```
+
+. . .
+
+One honest number from the whole matrix — same `corr(transform)` template.
+
+---
+
+## Pearson, Generalized — the RV Coefficient
+
+One number from that whole matrix — the **same template**, a linear-kernel transform:
+
+$$\mathrm{RV}(\mathbf{x},\mathbf{y})=\frac{\langle\,\mathbf{x}\mathbf{x}^\top,\ \mathbf{y}\mathbf{y}^\top\,\rangle_F}{\lVert\mathbf{x}\mathbf{x}^\top\rVert_F\;\lVert\mathbf{y}\mathbf{y}^\top\rVert_F}\in[0,1]$$
+
+```
+CKA = corr( kernel(x) , kernel(y) )    ·  any kernel
+RV  = corr(   x xᵀ    ,   y yᵀ    )    ·  linear kernel
+```
+
+```{python}
+#| echo: false
+#| fig-width: 9
+#| fig-height: 2.3
+rv = cka_linear(Xb, Yb)                                       # one score for the two baskets
+rng2 = np.random.default_rng(5)
+r2s, lcka = [], []
+for _ in range(14):                                           # 1-D check: linear CKA == r²
+    rho = rng2.uniform(-0.95, 0.95)
+    z = rng2.multivariate_normal([0, 0], [[1, rho], [rho, 1]], 200)
+    r2s.append(pearsonr(z[:, 0], z[:, 1])[0] ** 2)
+    lcka.append(cka_linear(z[:, 0], z[:, 1]))
+fig, (axg, axc) = plt.subplots(1, 2, figsize=(9, 2.3), gridspec_kw={"width_ratios": [1.5, 1]})
+axg.barh([0], [1], color=PANEL, height=0.5, zorder=0)
+axg.barh([0], [rv], color=COOL, height=0.5, zorder=1)
+axg.set_xlim(0, 1); axg.set_ylim(-0.5, 0.5); axg.set_yticks([]); axg.set_xticks([0, 0.5, 1])
+axg.text(rv + 0.02, 0, f"RV = {rv:.2f}", va="center", fontsize=15, color=INK, fontweight="bold")
+axg.set_title("tech basket  ↔  bank basket  (one score)", fontsize=13); despine(axg)
+axc.scatter(r2s, lcka, s=30, c=CRASH, alpha=0.85, edgecolors="none")
+axc.plot([0, 1], [0, 1], color=GRID, lw=1.3, ls="--")
+axc.set_xlim(0, 1); axc.set_ylim(0, 1)
+axc.set_xlabel("Pearson²", fontsize=11); axc.set_ylabel("linear CKA", fontsize=11)
+axc.set_title("1-D: RV = r²", fontsize=12); despine(axc)
+fig.tight_layout(); plt.show()
+```
+
+. . .
+
+So **RV = CKA with a linear kernel** — the rung we already built. dCor, kernel-CKA
+and MI were vector-native from birth; only **Pearson** & **Spearman** needed lifting.
+
+---
+
+## Entropy Goes Multidimensional — the Catch
+
+RV needed no density. The **information road** does — a vector's entropy is built
+from its whole **joint density** $p(\mathbf{x})$:
+
+$$H(\mathbf{x}) = \mathbb{E}\!\left[\log\frac{1}{p(\mathbf{x})}\right],\qquad \mathbf{x}\in\mathbb{R}^{d}$$
+
+```{python}
+#| echo: false
+#| fig-width: 8.6
+#| fig-height: 2.4
+bins = 8
+N = 1000                                          # ≈ 4 years of trading days
+d = np.arange(1, 8)
+per_cell = N / np.power(float(bins), d)           # samples landing in each histogram cell
+fig, ax = plt.subplots(figsize=(8.6, 2.4))
+ax.semilogy(d, per_cell, "-o", color=COOL, lw=2.6, ms=7)
+ax.axhline(10, color=CRASH, ls="--", lw=1.6)
+ax.text(7, 16, "need ≳ 10 per cell", color=CRASH, ha="right", va="bottom", fontsize=12)
+ax.annotate("d = 2: ok", (2, per_cell[1]), textcoords="offset points", xytext=(10, 6),
+            fontsize=12, color=INK)
+ax.annotate("d ≥ 4: cells empty", (4, per_cell[3]), textcoords="offset points",
+            xytext=(8, -2), fontsize=12, color=INK)
+ax.set_xlabel("dimension d   (8 bins / axis,  N = 1000 days)")
+ax.set_ylabel("samples / cell")
+despine(ax); fig.tight_layout(); plt.show()
+```
+
+. . .
+
+You can't histogram a 10-D density — the **curse of dimensionality**. The escape:
+**Gaussianize** (entropy gets a closed form) or bound it with a surrogate (CKA, dCor).
+
+---
+
+## Total Correlation — MI for a Vector
+
+Just as Pearson became RV, **mutual information becomes total correlation** — the
+redundancy shared across *all* $d$ parts of a vector:
+
+$$\mathrm{TC}(\mathbf{x}) = \sum_i H(X_i) - H(\mathbf{x}) \;\ge\; 0$$
+
+```{python}
+#| echo: false
+#| fig-width: 8.6
+#| fig-height: 2.4
+rho = np.linspace(0, 0.95, 200)
+tc2 = -0.5 * np.log2(1 - rho**2)                   # two Gaussians: total correlation == MI
+fig, ax = plt.subplots(figsize=(8.6, 2.4))
+ax.plot(rho, tc2, color=COOL, lw=3)
+ax.scatter([0.6], [-0.5 * np.log2(1 - 0.36)], s=80, c=CRASH, zorder=5)
+ax.annotate("ρ = 0.6  →  0.32 bits", xy=(0.6, -0.5 * np.log2(1 - 0.36)),
+            xytext=(0.04, 1.5), fontsize=12, color=INK,
+            arrowprops=dict(arrowstyle="->", color=GRID, lw=1.2))
+ax.set_xlabel("correlation ρ   (two variables)"); ax.set_ylabel("TC  (bits)")
+ax.set_ylim(0, 2.0); despine(ax); fig.tight_layout(); plt.show()
+```
+
+. . .
+
+For two variables it **is** the mutual information $I(X;Y)$ you already met — zero
+only when every part is independent. Next: see it on the **dial**.
+
+---
+
 ## The Dial · One Window: $T(\mathbf{x})$
 
 Widen the box: a sample is now a **vector** of consecutive days.
@@ -842,9 +1334,12 @@ What the two windows share → $I(\mathbf{x};\mathbf{y})$, mutual information be
 
 ## A Portfolio Is Not Two Columns
 
+Two columns was a toy. A real book is **dozens** of names — the pairs explode, and
+pairwise still can't see a move shared by *three or more*.
+
 ```{python}
 #| echo: false
-fig, ax = plt.subplots(figsize=(8.4, 4.6))
+fig, ax = plt.subplots(figsize=(8.4, 3.5))
 ax.set_xlim(0, 10); ax.set_ylim(0, 6); ax.axis("off")
 d = 8; cx, cy, Rr = 5.0, 3.1, 2.2
 pts = [(cx + Rr * np.cos(2 * np.pi * k / d + np.pi / 2),
@@ -859,31 +1354,69 @@ ax.text(cx, cy, f"{d * (d - 1) // 2}\npairs", fontsize=16, color=CRASH, fontweig
 fig.tight_layout(); plt.show()
 ```
 
-Pairwise MI checks every pair — but redundancy shared by three or more names is invisible to any pair.
+One number for the whole book — **total correlation** — beats $\binom{d}{2}$ blind pairwise checks.
 
 ---
 
-## The Shared Core Is Total Correlation
+## A Real Book — Fifty Series at Once
 
 ```{python}
 #| echo: false
-fig, ax = plt.subplots(figsize=(7.6, 5.2))
+#| fig-width: 9.6
+#| fig-height: 3.7
+rng = np.random.default_rng(11)
+T, M = 200, 48
+common = np.cumsum(rng.normal(0, 1, T))            # one market factor everyone loads on
+fig, ax = plt.subplots(figsize=(9.6, 3.7))
+for m in range(M):
+    s = rng.uniform(0.3, 1.0) * common + np.cumsum(rng.normal(0, 0.7, T))
+    s = (s - s.mean()) / s.std()
+    ax.plot(s, color=COOL, alpha=0.16, lw=0.9)
+for c, ld, sd in [(CRASH, 0.95, 1), (WARM, 0.6, 2), (INK, 0.35, 3)]:   # a few highlighted names
+    rg = np.random.default_rng(sd)
+    s = ld * common + np.cumsum(rg.normal(0, 0.7, T))
+    s = (s - s.mean()) / s.std()
+    ax.plot(s, color=c, lw=2.2)
+ax.set_xticks([]); ax.set_yticks([])
+ax.set_xlabel("time (trading days) →"); ax.set_ylabel("standardized return")
+despine(ax); fig.tight_layout(); plt.show()
+```
+
+48 names, one hidden factor. Pearson reads **one pair**; total correlation reads the
+whole grid at once — and its joint density is the one you *can't* histogram.
+
+---
+
+## The Shared Core — Total Correlation
+
+Sum each name's surprise, subtract the joint's — the **overlap** is the redundancy
+binding a basket ($\mathrm{TC}\ge0$; exactly $I(X;Y)$ at $d{=}2$). For a Gaussian it
+comes **free** — no density to estimate:
+
+$$\mathrm{TC}(\mathbf{x}) = \sum_i H(X_i) - H(\mathbf{x}) = -\tfrac12\log_2\det\mathbf{R}$$
+
+```{python}
+#| echo: false
+#| fig-width: 6.8
+#| fig-height: 2.7
+R3 = np.full((3, 3), 0.6); np.fill_diagonal(R3, 1.0)          # 3 names, equicorrelated
+tc_ex = -0.5 * np.log2(np.linalg.det(R3))                     # Gaussian total correlation, bits
+fig, ax = plt.subplots(figsize=(6.8, 2.7))
 ax.set_xlim(0, 10); ax.set_ylim(0, 8.6); ax.axis("off"); ax.set_aspect("equal")
 cols = [COOL, WARM, plotting.PALETTE["green"]]; names = ["X1", "X2", "X3"]
-cx, cy, R, r = 5.0, 4.6, 1.15, 2.0
+cx, cy, R, r = 5.0, 4.9, 1.15, 2.0
 for k in range(3):
     ang = np.pi / 2 + k * 2 * np.pi / 3
     _venn_circle(ax, (cx + R * np.cos(ang), cy + R * np.sin(ang)), r, cols[k], alpha=0.30)
 for (lx, ly), nm, col in zip([(cx, cy + R + r + 0.5), (cx - (R + r) * 0.92, cy - R * 0.5 - 0.2),
                               (cx + (R + r) * 0.92, cy - R * 0.5 - 0.2)], names, cols):
-    ax.text(lx, ly, f"H({nm})", family="monospace", fontsize=16, color=col, fontweight="bold", ha="center", va="center")
-ax.text(cx, cy, "T(x)", family="monospace", fontsize=20, color=INK, fontweight="bold", ha="center", va="center", zorder=8)
-ax.text(cx, 1.0, "T(x) = sum_i H(Xi) - H(X1...Xd)", family="monospace", fontsize=15, color=INK, ha="center",
+    ax.text(lx, ly, f"H({nm})", family="monospace", fontsize=15, color=col, fontweight="bold", ha="center", va="center")
+ax.text(cx, cy, "TC", family="monospace", fontsize=20, color=INK, fontweight="bold", ha="center", va="center", zorder=8)
+ax.text(cx, 0.7, f"3 names at ρ = 0.6   ⇒   TC = {tc_ex:.2f} bits   "
+        f"(independent → 0)", family="monospace", fontsize=13, color=INK, ha="center",
         bbox=dict(boxstyle="round,pad=0.4", fc=PANEL, ec=GRID))
 fig.tight_layout(); plt.show()
 ```
-
-Multivariate mutual information — the redundancy binding a basket together.
 
 ---
 
@@ -1030,166 +1563,348 @@ Bits map onto the familiar $[0, 1]$ axis — and for a Gaussian pair, $R = |\rho
 
 ---
 
-## The Gaussian Shadow
+## It All Comes Back to $p(\mathbf{x})$
 
-> **Correlation is the shadow that mutual information casts when the world is Gaussian.**
+Every Road-2 measure is the **same integral** — an average over the density. Each is
+helpless without $p(\mathbf{x})$:
+
+$$H(\mathbf{x}) \;=\; -\int p(\mathbf{x})\,\log p(\mathbf{x})\;\mathrm{d}\mathbf{x}$$
+
+$$I(X;Y) \;=\; \int p(\mathbf{x})\,\log\frac{p(\mathbf{x})}{p(x)\,p(y)}\;\mathrm{d}\mathbf{x}$$
+
+$$\mathrm{TC}(\mathbf{x}) \;=\; \int p(\mathbf{x})\,\log\frac{p(\mathbf{x})}{\prod_i p(x_i)}\;\mathrm{d}\mathbf{x}$$
+
+. . .
+
+Road 1 dodged this with **distances and kernels**. Road 2 must face it head-on —
+**estimate $p(\mathbf{x})$.** So how hard is that, dimension by dimension?
+
+---
+
+## Estimating $p(\mathbf{x})$ · One Dimension
 
 ```{python}
 #| echo: false
-a, b, _ = datasets.two_banks(n=800)
-u, v = datasets.convex_payoff(n=800)
-fig, axes = plt.subplots(1, 2, figsize=(10.5, 3.7))
-for ax, x, y, col, name in [(axes[0], a, b, COOL, "Banks — a Gaussian-ish world"),
-                            (axes[1], u, v, WARM, "Convex — not Gaussian at all")]:
+#| fig-width: 10
+#| fig-height: 3.3
+from scipy.stats import norm as _Nd, skewnorm as _SN
+rng = np.random.default_rng(3)
+easy = rng.normal(0, 1, 1500)                          # a clean bell
+hard = _SN.rvs(6, size=1500, random_state=7)           # skewed, heavy on one side
+fig, axes = plt.subplots(1, 2, figsize=(10, 3.3))
+for ax, data, name in [(axes[0], easy, "easy — a bell"), (axes[1], hard, "hard — skewed")]:
+    g = np.linspace(data.min() - 0.5, data.max() + 0.5, 300)
+    ax.hist(data, bins=32, density=True, color="#c9cdd4", alpha=0.95,
+            edgecolor="white", lw=0.6, label="histogram (data)")
+    ax.plot(g, _Nd.pdf(g, data.mean(), data.std()), color=CRASH, lw=2.4, ls="--",
+            label="parametric (Gaussian)")
+    ax.plot(g, gaussian_kde(data)(g), color=COOL, lw=2.6, label="learned (KDE)")
+    ax.set_title(name, fontsize=13); ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+axes[0].legend(fontsize=10.5, frameon=False, loc="upper left")
+fig.tight_layout(); plt.show()
+```
+
+Start from the **histogram** of the data, then **assume** a Gaussian *or* **learn** it
+(KDE). The Gaussian nails the bell and misses the skew; the learned curve fits both.
+
+---
+
+## Estimating $p(\mathbf{x})$ · Two Dimensions
+
+```{python}
+#| echo: false
+#| fig-width: 10
+#| fig-height: 3.6
+a, b, _ = datasets.two_banks(n=900)
+u, v = datasets.convex_payoff(n=900)
+fig, axes = plt.subplots(1, 2, figsize=(10, 3.6))
+for ax, x, y, col, name in [(axes[0], a, b, COOL, "easy — a tilted blob"),
+                            (axes[1], u, v, WARM, "hard — a V")]:
     X = np.column_stack([x, y])
-    gpts = np.linspace(X.min() - 0.5, X.max() + 0.5, 160)
-    XX, YY = np.meshgrid(gpts, gpts)
-    Z = multivariate_normal(X.mean(0), np.cov(X.T)).pdf(np.dstack([XX, YY]))
-    r = pearsonr(x, y)[0]
-    R = linfoot_r(mutual_information_xy(x, y))
-    ax.scatter(x, y, s=10, c=col, alpha=0.45, edgecolors="none")
-    ax.contour(XX, YY, Z, levels=6, colors=INK, linewidths=1.1, alpha=0.65)
-    ax.set_title(f"{name}\nshadow r = {r:+.2f}   ·   information R = {R:.2f}", fontsize=13)
-    ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+    g = np.linspace(X.min() - 0.5, X.max() + 0.5, 130)
+    XX, YY = np.meshgrid(g, g)
+    Zg = multivariate_normal(X.mean(0), np.cov(X.T)).pdf(np.dstack([XX, YY]))          # parametric
+    Zk = gaussian_kde(X.T)(np.vstack([XX.ravel(), YY.ravel()])).reshape(XX.shape)      # learned
+    ax.scatter(x, y, s=8, c=col, alpha=0.32, edgecolors="none")
+    ax.contour(XX, YY, Zg, levels=5, colors=[CRASH], linewidths=1.1, linestyles="dashed")
+    ax.contour(XX, YY, Zk, levels=5, colors=[INK], linewidths=1.1)
+    ax.set_title(name, fontsize=13); ax.set_xticks([]); ax.set_yticks([]); despine(ax)
 fig.tight_layout(); plt.show()
 ```
 
-Contours: the Gaussian fitted to each pair.  When the world isn't Gaussian the shadow
-loses almost everything — to recover it you must **learn the density**.
+Dashed = a fitted **Gaussian** (whose only dependence is *correlation* — its shadow);
+solid = the **learned** density. The Gaussian misses the V; the learned one wraps it.
 
 ---
 
-## #8 Gaussianization — Watch It Work
+## Estimating $p(\mathbf{x})$ · Many Dimensions
 
 ```{python}
 #| echo: false
-uG, vG = datasets.convex_payoff(n=1200, seed=0)
-XG = np.column_stack([uG, vG])
-XG = (XG - XG.mean(0)) / XG.std(0)
-
-
-def gauss_marginals(D):
-    return np.column_stack([gaussianize_1d(D[:, 0]), gaussianize_1d(D[:, 1])])
-
-
-def rotate(D, deg):
-    th = np.deg2rad(deg)
-    Rm = np.array([[np.cos(th), -np.sin(th)], [np.sin(th), np.cos(th)]])
-    return D @ Rm.T
-
-
-rngG = np.random.default_rng(0)
-P2 = gauss_marginals(XG)
-P3 = gauss_marginals(rotate(P2, 45))
-P4 = P3
-for _ in range(25):
-    P4 = gauss_marginals(rotate(P4, rngG.uniform(20, 70)))
-mi0 = mutual_information_xy(XG[:, 0], XG[:, 1]) / np.log(2)
-mi1 = mutual_information_xy(P4[:, 0], P4[:, 1]) / np.log(2)
-fig, axes = plt.subplots(1, 4, figsize=(11.5, 3.3))
-for ax, (t, Dk) in zip(axes, [(f"the data — a V\nMI = {mi0:.2f} bits", XG),
-                              ("reshape marginals\n(still a V)", P2),
-                              ("rotate, reshape again", P3),
-                              (f"…repeat → a Gaussian ball\nMI = {mi1:.2f} bits", P4)]):
-    ax.scatter(Dk[:, 0], Dk[:, 1], s=6, c=WARM, alpha=0.4, edgecolors="none")
-    ax.set_title(t, fontsize=11); ax.set_aspect("equal")
-    ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+#| fig-width: 9.6
+#| fig-height: 2.7
+rng = np.random.default_rng(3)
+fig, axes = plt.subplots(1, 3, figsize=(9.6, 2.7))
+d1 = rng.normal(0, 1, 1200)                                   # 1-D: a histogram (as before)
+g1 = np.linspace(-3.6, 3.6, 200)
+axes[0].hist(d1, bins=28, density=True, color="#c9cdd4", alpha=0.95, edgecolor="white", lw=0.5)
+axes[0].plot(g1, gaussian_kde(d1)(g1), color=COOL, lw=2.4)
+axes[0].set_title("1-D · a histogram", fontsize=12)
+p2 = rng.multivariate_normal([0, 0], [[1, 0.6], [0.6, 1]], 500)   # 2-D: a density (as before)
+gg = np.linspace(-3.6, 3.6, 90); XX, YY = np.meshgrid(gg, gg)
+Zk = gaussian_kde(p2.T)(np.vstack([XX.ravel(), YY.ravel()])).reshape(XX.shape)
+axes[1].scatter(p2[:, 0], p2[:, 1], s=8, c=COOL, alpha=0.3, edgecolors="none")
+axes[1].contour(XX, YY, Zk, levels=5, colors=[INK], linewidths=1.0)
+axes[1].set_title("2-D · a density", fontsize=12)
+q = rng.normal(0, 1, (200, 2))                                # d-D: no picture
+axes[2].scatter(q[:, 0], q[:, 1], s=8, c=GRID, alpha=0.18, edgecolors="none")
+axes[2].text(0.5, 0.5, "?", transform=axes[2].transAxes, ha="center", va="center",
+             fontsize=60, color=CRASH, fontweight="bold")
+axes[2].set_title("d-D · no picture", fontsize=12, color=CRASH)
+for ax in axes:
+    ax.set_xticks([]); ax.set_yticks([])
+    for sp in ax.spines.values():
+        sp.set_edgecolor(GRID)
 fig.tight_layout(); plt.show()
 ```
 
-Reshape each marginal to Gaussian, **rotate, repeat** — the V melts into a round ball,
-and the bits that vanish are exactly the dependence.
+A histogram works in 1-D, a density in 2-D — but past 3-D there's no picture, and a
+histogram needs $\sim\!10^{d}$ samples. The only survivor is to **learn** the density.
 
 ---
 
-## #8 Gaussianization — Learn the Density
-
-Iteratively reshape each marginal to Gaussian, rotate to mix residual
-dependence, repeat until the joint *is* a standard Gaussian.
-
-. . .
-
-Every step is invertible → exact log-likelihoods.
-
-**The dependence it must remove IS the data's total correlation.**
-
-. . .
-
-*The same machine, run backward in Lecture 3, generates scenarios.*
-
----
-
-## The Synthesis — Two Roads
-
-**Do you need the whole distribution?**
+## Two Ways to Get $p(\mathbf{x})$: Assume It, or Learn It
 
 :::: {.columns}
+::: {.column width="50%"}
+**Assume a family** — *parametric*
 
-::: {.column width="47%"}
-**No → compare directly.**
-
-Transform each variable, then compare the transforms — never touching a density.
-
-*Pearson · Spearman · distance correlation · HSIC — they differ only in the transform.*
+- pick a shape: Gaussian, $t$, mixture
+- cheap, little data, scales to high-$d$
+- but **rigid** — a Gaussian's only dependence is **correlation**
 :::
+::: {.column width="50%"}
+**Learn the shape** — *nonparametric*
 
-::: {.column width="6%"}
+- let the data carve the density
+- flexible — Vs, fat tails, modes
+- KDE in low-$d$; high-$d$ needs an **invertible learned map**
 :::
-
-::: {.column width="47%"}
-**Yes → go through the density.**
-
-Measure how far the joint sits from independence — in **bits**.
-
-*Assume the shape — parametric: fast, wrong in the tails.*
-
-*Learn the shape — Gaussianization, flows: exact.*
-:::
-
 ::::
 
-Either way, the **transform** is the thread.
+. . .
+
+Gaussianization takes the best of both: **learn** an invertible map that turns the
+data *into* a Gaussian — flexible shape, exact likelihoods. *(Next.)*
 
 ---
 
-## Every Rung, Both Characters
+## #8 Gaussianization — Fit the V Three Ways
 
-Both roads, one verdict — the full ladder on our two characters:
+Fit a **Gaussian**, a **Student-$t$**, and **RBIG** to the V; contours are each
+model's joint density, with its score on the right.
 
 ```{python}
 #| echo: false
-a, b, _ = datasets.two_banks(n=800)
-u, v = datasets.convex_payoff(n=800)
+#| fig-width: 11
+#| fig-height: 4.1
+import warnings; warnings.filterwarnings("ignore")
+import rbig
+from matplotlib.lines import Line2D
+from scipy.stats import multivariate_t as _mvt
+u61, v61 = datasets.convex_payoff(n=1200, seed=0)
+X61 = np.column_stack([u61, v61]).astype(float)
+loc61, cov61 = X61.mean(0), np.cov(X61.T)
+gN = multivariate_normal(loc61, cov61)
+dfg = max(((d, _mvt(loc61, cov61 * (d - 2) / d, df=d).logpdf(X61).mean()) for d in (3, 4, 5, 7, 10, 15)),
+          key=lambda z: z[1])[0]
+tN = _mvt(loc61, cov61 * (dfg - 2) / dfg, df=dfg)
+mR = rbig.AnnealedRBIG(random_state=0); mR.fit(X61)
 
 
-def linf(x, y):
-    mb = mutual_information_bits(np.histogram2d(x, y, bins=20)[0])
-    return linfoot_r(mb * np.log(2))  # bits → nats → Linfoot R on [0,1]
+def _hmi(s):
+    return mutual_information_xy(s[:, 0], s[:, 1]) / np.log(2)
 
 
-methods = ["Pearson", "Spearman", "distance\ncorr", "HSIC", "MI\n(Linfoot)"]
-banks = [abs(pearsonr(a, b)[0]), abs(spearmanr(a, b)[0]),
-         distance_correlation(a, b), cka_rbf(a, b), linf(a, b)]
-convex = [abs(pearsonr(u, v)[0]), abs(spearmanr(u, v)[0]),
-          distance_correlation(u, v), cka_rbf(u, v), linf(u, v)]
-xs = np.arange(5); wbar = 0.38
-fig, ax = plt.subplots(figsize=(11, 4.7))
-ax.axvspan(-0.5, 1.5, color=CRASH, alpha=0.06)
+gsamp = gN.rvs(7000, random_state=1); tsamp = tN.rvs(7000, random_state=1)
+rsamp = np.asarray(mR.sample(7000, random_state=1))
+gll = gN.logpdf(X61).mean(); tll = tN.logpdf(X61).mean(); rll = -rbig.negative_log_likelihood(mR, X61)
+mis = [_hmi(gsamp), _hmi(tsamp), _hmi(rsamp)]
+trueMI = _hmi(X61)
+gx = np.linspace(X61[:, 0].min() - 1, X61[:, 0].max() + 1, 110)
+gy = np.linspace(X61[:, 1].min() - 1, X61[:, 1].max() + 1, 110)
+GX, GY = np.meshgrid(gx, gy)
+Zg = gN.pdf(np.dstack([GX, GY])); Zt = tN.pdf(np.dstack([GX, GY]))
+Zr = gaussian_kde(rsamp[:2500].T)(np.vstack([GX.ravel(), GY.ravel()])).reshape(GX.shape)
+fig = plt.figure(figsize=(11, 4.1))
+gsp = GridSpec(2, 3, width_ratios=[4, 1.1, 2.5], height_ratios=[1, 4], wspace=0.05, hspace=0.05)
+axT = fig.add_subplot(gsp[0, 0]); axMn = fig.add_subplot(gsp[1, 0]); axRt = fig.add_subplot(gsp[1, 1])
+axSt = fig.add_subplot(gsp[:, 2]); axSt.axis("off")
+axMn.scatter(X61[:, 0], X61[:, 1], s=7, c=GRID, alpha=0.4, edgecolors="none")
+axMn.contour(GX, GY, Zg, levels=5, colors=[CRASH], linewidths=1.2, linestyles="dashed")
+axMn.contour(GX, GY, Zt, levels=5, colors=[WARM], linewidths=1.1, linestyles="dotted")
+axMn.contour(GX, GY, Zr, levels=5, colors=[COOL], linewidths=1.5)
+axMn.set_xticks([]); axMn.set_yticks([]); despine(axMn)
+axMn.legend(handles=[Line2D([0], [0], color=COOL, lw=1.6, label="RBIG"),
+                     Line2D([0], [0], color=WARM, lw=1.1, ls=":", label="Student-t"),
+                     Line2D([0], [0], color=CRASH, lw=1.2, ls="--", label="Gaussian")],
+            fontsize=10, frameon=False, loc="upper center", ncol=3, bbox_to_anchor=(0.5, 1.02))
+axT.hist(X61[:, 0], bins=40, color="#c9cdd4", alpha=0.95, edgecolor="white", lw=0.4); axT.axis("off")
+axRt.hist(X61[:, 1], bins=40, orientation="horizontal", color="#c9cdd4", alpha=0.95, edgecolor="white", lw=0.4)
+axRt.axis("off")
+axSt.text(0.0, 0.97, f"n = {len(X61)} samples", fontsize=12, color="#666", transform=axSt.transAxes)
+for j, (nm, c, ll, mi) in enumerate([("RBIG (learned)", COOL, rll, mis[2]),
+                                     ("Student-t", WARM, tll, mis[1]),
+                                     ("Gaussian", CRASH, gll, mis[0])]):
+    yb = 0.82 - j * 0.27
+    axSt.text(0.0, yb, nm, fontsize=13, fontweight="bold", color=c, transform=axSt.transAxes)
+    axSt.text(0.06, yb - 0.085, f"log-lik  {ll:+.2f}", fontsize=12, color=INK, transform=axSt.transAxes)
+    axSt.text(0.06, yb - 0.165, f"MI  {mi:.2f} bits", fontsize=12, color=INK, transform=axSt.transAxes)
+axSt.text(0.0, 0.02, f"true MI = {trueMI:.2f} bits", fontsize=12, style="italic", color=INK, transform=axSt.transAxes)
+fig.tight_layout(); plt.show()
+```
+
+Both ellipses sit blind over the bend; only the RBIG contour **wraps** the V.
+
+---
+
+## #8 Gaussianization — RBIG vs Parametric
+
+The same three fits, scored head-to-head — RBIG wins the likelihood *and* recovers the bits:
+
+```{python}
+#| echo: false
+#| fig-width: 10
+#| fig-height: 3.4
+dll = [0.0, tll - gll, rll - gll]
+labels = ["Gaussian", "Student-t", "RBIG"]; cols = [CRASH, WARM, COOL]
+fig, (axL, axM) = plt.subplots(1, 2, figsize=(10, 3.4))
+axL.bar(labels, dll, color=cols)
+axL.set_title("log-likelihood gain over Gaussian", fontsize=12); axL.set_ylabel("nats / point")
+for i, val in enumerate(dll):
+    axL.text(i, val, f"+{val:.2f}", ha="center", va="bottom", fontsize=11, color=INK)
+axL.set_ylim(0, max(dll) * 1.25 + 0.05)
+axM.bar(labels, mis, color=cols)
+axM.axhline(trueMI, color=INK, ls="--", lw=1.3)
+axM.text(2.4, trueMI + 0.03, "true MI", color=INK, fontsize=10, ha="right")
+axM.set_title("mutual information recovered (bits)", fontsize=12)
+for i, val in enumerate(mis):
+    axM.text(i, val + 0.02, f"{val:.2f}", ha="center", va="bottom", fontsize=11, color=INK)
+axM.set_ylim(0, max(mis) * 1.3 + 0.1)
+for ax in (axL, axM):
+    ax.tick_params(labelsize=11); despine(ax)
+fig.tight_layout(); plt.show()
+```
+
+The Gaussian and Student-$t$ are elliptical — blind to the bend. RBIG fits the V, so it
+earns the **likelihood** and recovers the **bits** of dependence the others miss.
+
+---
+
+## The Synthesis — Two Roads, by Complexity
+
+```{python}
+#| echo: false
+#| fig-width: 11
+#| fig-height: 4.5
+fig, ax = plt.subplots(figsize=(11, 4.5))
+ax.set_xlim(0, 11); ax.set_ylim(0, 6.6); ax.axis("off")
+
+
+def _station(x, y, label, color, hi=False):
+    ax.add_patch(FancyBboxPatch((x - 0.78, y - 0.32), 1.56, 0.64,
+                                boxstyle="round,pad=0.02,rounding_size=0.14",
+                                fc="white", ec=color, lw=2.8 if hi else 1.8, zorder=3))
+    ax.text(x, y, label, ha="center", va="center", fontsize=12, color=color,
+            fontweight="bold" if hi else "normal", zorder=4)
+
+
+# decision node + branches
+ax.text(0.55, 3.5, "need the\ndensity?", ha="center", va="center", fontsize=13, color=INK, fontweight="bold")
+ax.annotate("", xy=(1.7, 5.0), xytext=(0.95, 3.95), arrowprops=dict(arrowstyle="-|>", color=COOL, lw=2.2))
+ax.annotate("", xy=(1.7, 2.0), xytext=(0.95, 3.05), arrowprops=dict(arrowstyle="-|>", color=WARM, lw=2.2))
+ax.text(1.05, 4.55, "no", fontsize=11, color=COOL, style="italic")
+ax.text(1.05, 2.4, "yes", fontsize=11, color=WARM, style="italic")
+# Road 1 — a score, no density
+ax.text(2.3, 5.95, "Road 1 · a score, no density", color=COOL, fontsize=13, fontweight="bold")
+r1 = [("Pearson", 2.7), ("Spearman", 4.5), ("dist corr", 6.3), ("CKA", 8.1)]
+for lab, x in r1:
+    _station(x, 5.0, lab, COOL)
+for (l1, x1), (l2, x2) in zip(r1, r1[1:]):
+    ax.annotate("", xy=(x2 - 0.82, 5.0), xytext=(x1 + 0.82, 5.0), arrowprops=dict(arrowstyle="-|>", color=GRID, lw=1.4))
+# Road 2 — model the density
+ax.text(2.3, 0.95, "Road 2 · model the density", color=WARM, fontsize=13, fontweight="bold")
+r2 = [("Gaussian", 4.7, False), ("Student-t", 6.6, False), ("RBIG", 9.3, True)]
+for lab, x, hi in r2:
+    _station(x, 2.0, lab, CRASH if hi else WARM, hi=hi)
+for (l1, x1, _a), (l2, x2, _b) in zip(r2, r2[1:]):
+    ax.annotate("", xy=(x2 - 0.82, 2.0), xytext=(x1 + 0.82, 2.0), arrowprops=dict(arrowstyle="-|>", color=GRID, lw=1.4))
+ax.text(5.65, 2.72, "assume the shape", fontsize=10.5, color="#777", style="italic", ha="center")
+ax.text(9.3, 2.72, "learn it", fontsize=10.5, color=CRASH, style="italic", ha="center")
+# complexity axis
+ax.annotate("", xy=(10.6, 0.25), xytext=(0.3, 0.25), arrowprops=dict(arrowstyle="-|>", color=INK, lw=2.2))
+ax.text(0.3, -0.05, "cheap · linear", fontsize=11, color="#555")
+ax.text(10.6, -0.05, "costly · exact", fontsize=11, color="#555", ha="right")
+ax.text(5.5, 0.42, "complexity →", fontsize=11.5, color=INK, fontweight="bold", ha="center")
+fig.tight_layout(); plt.show()
+```
+
+Detection is the easy part — most rungs past Pearson catch the V. The real trade-off is
+**complexity**: a score is cheap; the full density costs more, but only it lets you
+**sample, propagate, and price the tails**.
+
+---
+
+## Every Method, Both Characters
+
+The full ladder plus MI through three densities — all on one $[0,1]$ scale
+(MI shown as **Linfoot $R$**, so the bits sit next to the correlations):
+
+```{python}
+#| echo: false
+#| fig-width: 11.5
+#| fig-height: 4.5
+import warnings; warnings.filterwarnings("ignore")
+import rbig
+from scipy.stats import multivariate_t as _mvt63
+
+
+def char_scores(x, y):
+    x = np.asarray(x, float); y = np.asarray(y, float); X = np.column_stack([x, y])
+    loc, cov = X.mean(0), np.cov(X.T)
+    g = multivariate_normal(loc, cov)
+    df = max(((d, _mvt63(loc, cov * (d - 2) / d, df=d).logpdf(X).mean()) for d in (3, 4, 5, 7, 10, 15)),
+             key=lambda z: z[1])[0]
+    t = _mvt63(loc, cov * (df - 2) / df, df=df)
+    m = rbig.AnnealedRBIG(random_state=0); m.fit(X)
+    miR = lambda s: linfoot_r(mutual_information_xy(s[:, 0], s[:, 1]))   # nats → Linfoot R ∈ [0,1]
+    return [abs(pearsonr(x, y)[0]), abs(spearmanr(x, y)[0]), distance_correlation(x, y), cka_rbf(x, y),
+            miR(g.rvs(8000, random_state=1)), miR(t.rvs(8000, random_state=1)),
+            miR(np.asarray(m.sample(8000, random_state=1)))]
+
+
+a, b, _ = datasets.two_banks(n=1000)
+u, v = datasets.convex_payoff(n=1000)
+banks, convex = char_scores(a, b), char_scores(u, v)
+methods = ["Pearson", "Spearman", "dist\ncorr", "CKA", "MI·\nGauss", "MI·\nt", "MI·\nRBIG"]
+xs = np.arange(7); wbar = 0.4
+fig, ax = plt.subplots(figsize=(11.5, 4.5))
+ax.axvspan(-0.5, 1.5, color=CRASH, alpha=0.05)
 ax.axvline(3.5, color=GRID, lw=1.6, ls="--")
 ax.bar(xs - wbar / 2, banks, wbar, color=COOL, label="Banks (a line)")
 ax.bar(xs + wbar / 2, convex, wbar, color=WARM, label="Convex (a V)")
-ax.text(1.5, 1.07, "Road 1 · no density", ha="center", fontsize=12, color=INK, fontweight="bold")
-ax.text(4.0, 1.07, "Road 2 · information", ha="center", fontsize=12, color=INK, fontweight="bold")
-ax.text(0.5, 0.9, "blind to the V", ha="center", fontsize=12, color=CRASH,
+ax.text(1.5, 1.0, "Road 1 · a score", ha="center", fontsize=12, color=INK, fontweight="bold")
+ax.text(5.0, 1.0, "Road 2 · MI via a density", ha="center", fontsize=12, color=INK, fontweight="bold")
+ax.text(0.5, 0.14, "linear:\nblind to the V", ha="center", fontsize=10.5, color=CRASH,
         style="italic", fontweight="bold")
-ax.set_xticks(xs); ax.set_xticklabels(methods, fontsize=13)
-ax.set_ylabel("dependence detected"); ax.set_ylim(0, 1.15)
-ax.legend(fontsize=12, frameon=False, loc="center right")
+ax.set_xticks(xs); ax.set_xticklabels(methods, fontsize=12)
+ax.set_ylabel("dependence detected  (0–1)"); ax.set_ylim(0, 1.1)
+ax.legend(fontsize=12, frameon=False, ncol=2, loc="lower center", bbox_to_anchor=(0.5, 1.03))
 despine(ax); fig.tight_layout(); plt.show()
 ```
 
-Pearson & Spearman go blind on the convex V; distance correlation, HSIC, **and MI
-all catch it** — the two roads agree.
+On the **Banks** everything agrees. On the **V**, the linear rungs *and* the parametric
+MIs (Gaussian, $t$) stay flat — only **dist corr, CKA, and MI·RBIG** catch the bend.
 
 ---
 

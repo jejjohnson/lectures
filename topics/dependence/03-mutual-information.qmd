@@ -39,6 +39,52 @@ measure itself.
 
 ---
 
+## Intuition First — Surprise and Spread
+
+Before a single formula, two plain-language ideas carry the whole page.
+
+**Information is surprise.**  A rare outcome tells you a lot; a near-certain
+one tells you almost nothing.  If a coin you *know* is two-headed comes up
+heads, you learn nothing — you already knew.  If a calm market suddenly drops
+10 % in a day, that outcome is rare, and the surprise is large.  Information is
+just a number attached to *how unexpected* an outcome was.
+
+**Entropy is average surprise.**  A whole variable is a distribution of
+outcomes, so its information is the surprise you expect *on a typical day*.  A
+**peaked** density is predictable — most days land in the same narrow range, so
+the average surprise is small (low entropy).  A **spread** density keeps you
+guessing — any outcome is plausible, so the average surprise is large (high
+entropy).  Width *is* unpredictability.
+
+```{python}
+#| label: fig-intuition-spread
+#| echo: false
+#| fig-cap: "The whole page in one picture. A peaked density (left) is predictable — little surprise on a typical day, low entropy. A spread density (right) keeps you guessing — lots of surprise, high entropy. The formulas that follow only put numbers on this contrast."
+from scipy.stats import norm
+gx = np.linspace(-6, 6, 400)
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(10, 3.0), sharey=True)
+axL.fill_between(gx, norm.pdf(gx, 0, 0.5), color=COOL, alpha=0.40)
+axL.plot(gx, norm.pdf(gx, 0, 0.5), color=INK, lw=2)
+axL.set_title("peaked → predictable", fontsize=12)
+axL.text(0.5, 0.55, "little surprise\nlow entropy", transform=axL.transAxes,
+         ha="center", fontsize=11, color=CRASH, fontweight="bold")
+axR.fill_between(gx, norm.pdf(gx, 0, 2.3), color=WARM, alpha=0.40)
+axR.plot(gx, norm.pdf(gx, 0, 2.3), color=INK, lw=2)
+axR.set_title("spread → uncertain", fontsize=12)
+axR.text(0.5, 0.55, "lots of surprise\nhigh entropy", transform=axR.transAxes,
+         ha="center", fontsize=11, color=CRASH, fontweight="bold")
+for ax in (axL, axR):
+    ax.set_xticks([]); ax.set_yticks([]); ax.set_xlabel("outcome"); despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+Everything below is bookkeeping over these two ideas: first a number for one
+event's surprise, then its average (entropy), then the surprise two variables
+*share* (mutual information).
+
+---
+
 ## Rung 5 · Information — One Event at a Time
 
 Information is *surprise*.  A rare event carries more information than a
@@ -189,27 +235,183 @@ budget that mutual information will spend from — two variables can only
 
 ---
 
-## Rung 6 · Mutual Information — The Honest Measure
+## Rung 5½ · KL Divergence — The Gap Between Densities
 
-Combine the pieces.  **Mutual information** is the reduction in surprise about
-$Y$ from knowing $X$ — equivalently, the KL divergence between the true joint
-and the independent reference:
+Entropy scored *one* density: how surprising is a variable on average?  The
+next question compares *two*.  Suppose the truth is $p$ but you reason with a
+model $q$ — you fit a Gaussian, or you assume independence.  Every time you
+read off a "surprise" from $q$ where the real probability was $p$, your code is
+a little too long.  The **Kullback–Leibler divergence** is the total of that
+waste — the extra bits you spend, on average, by trusting $q$ when $p$ is true:
 
 $$
-I(X;Y) = D_{\mathrm{KL}}\!\left(p(x,y) \,\|\, p(x)p(y)\right)
-        = H(X) + H(Y) - H(X,Y) \geq 0.
+D_{\mathrm{KL}}(p \,\|\, q)
+  = \mathbb{E}_p\!\left[\log\frac{p(x)}{q(x)}\right]
+  = \int p(x)\,\log\frac{p(x)}{q(x)}\,dx \;\ge\; 0.
+$$
+
+Two properties make it the right object.  It is **never negative** (Gibbs'
+inequality: you can never do *better* than the truth), and it is **zero only
+when $q = p$ everywhere** — the model wastes nothing exactly when it matches
+reality.  It is not symmetric, $D_{\mathrm{KL}}(p\|q) \ne D_{\mathrm{KL}}(q\|p)$,
+so it is a *divergence*, not a distance; here the asymmetry is the point — the
+expectation is taken under the *truth* $p$.
+
+::: {.callout-note icon=false}
+## Background — Why It Counts "Wasted Bits"
+
+An optimal code for $q$ spends $\log_2(1/q(x))$ bits on outcome $x$ (Rung 5,
+applied to $q$).  But $x$ actually occurs with probability $p(x)$, so the
+*average* code length you pay is $\mathbb{E}_p[\log_2 1/q] = H(p) + D_{\mathrm{KL}}(p\|q)$.
+The unavoidable part is the entropy $H(p)$; the *excess* — everything above the
+best-possible $H(p)$ — is exactly $D_{\mathrm{KL}}(p\|q)$.  Use the wrong model
+and you pay that surcharge on every sample.
+:::
+
+The integral is easy to evaluate by hand on a grid: sample both densities, then
+sum $p\,\log_2(p/q)$ times the grid spacing — a plain Riemann sum.
+
+```{python}
+#| label: fig-kl-densities
+#| fig-cap: "KL by quadrature. The truth p (a standard normal) and a wrong model q (shifted and wider). Numerically integrating p·log₂(p/q) on the grid gives the bits wasted by using q — about 0.7 bits per sample here. Slide q onto p and the number falls to zero."
+from scipy.stats import norm
+
+grid = np.linspace(-6, 7, 1000)
+dx = grid[1] - grid[0]
+p_truth = norm.pdf(grid, 0.0, 1.0)            # p — the truth
+q_model = norm.pdf(grid, 1.3, 1.7)            # q — a shifted, wider model
+
+
+def kl_bits(p: Float[Array, "n_grid"], q: Float[Array, "n_grid"],
+            dx: float) -> float:
+    """D_KL(p ‖ q) = ∫ p·log₂(p/q) dx   [bits], via a Riemann sum on a grid."""
+    m = p > 0                                  # 0·log(0) = 0 by convention
+    return float(np.sum(p[m] * np.log2(p[m] / q[m])) * dx)
+
+
+kl = kl_bits(p_truth, q_model, dx)
+
+fig, ax = plt.subplots(figsize=(9.0, 3.4))
+ax.fill_between(grid, p_truth, color=COOL, alpha=0.35)
+ax.plot(grid, p_truth, color=INK, lw=2.2, label="p — the truth")
+ax.plot(grid, q_model, color=WARM, lw=2.4, label="q — the model")
+ax.set_title(f"D_KL(p ‖ q) = {kl:.2f} bits  wasted by using q instead of p",
+             fontsize=12, fontweight="bold")
+ax.set_xlabel("outcome")
+ax.set_yticks([])
+ax.legend(loc="upper right", frameon=False)
+despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+### Dependence Is KL From Independence
+
+Now the payoff.  The "independent reference" we keep invoking — *shuffle one
+column and the dependence is destroyed* — is nothing but a particular choice of
+model $q$.  Take the truth to be the **joint** $p(x,y)$, and the model to be the
+**product of marginals** $p(x)\,p(y)$, the joint you would have if $X$ and $Y$
+were independent.  The bits wasted by assuming independence *is* the mutual
+information:
+
+$$
+I(X;Y) = D_{\mathrm{KL}}\!\big(\,p(x,y) \,\big\|\, p(x)\,p(y)\,\big).
+$$
+
+Read it out loud: mutual information is *how far the real joint sits from the
+shuffled, independence-respecting version, in bits*.  Independence means
+$p(x,y) = p(x)p(y)$, which makes the ratio inside the log equal to 1, the log
+equal to 0, and the divergence equal to 0 — no dependence, nothing wasted.  Any
+$I(X;Y) > 0$ is precisely the surcharge for having pretended two coupled
+variables were independent.
+
+The same construction scales past two variables.  For a whole vector
+$\mathbf{x} = (x_1, \dots, x_d)$, the independence model is the product of *all*
+the marginals, and the KL gap is the **total correlation**:
+
+$$
+\mathrm{TC}(\mathbf{x})
+  = D_{\mathrm{KL}}\!\Big(\,p(\mathbf{x}) \,\Big\|\, \textstyle\prod_{i} p(x_i)\,\Big)
+  = \sum_i H(x_i) - H(\mathbf{x}) \;\ge\; 0.
+$$
+
+Total correlation is one number for *all* the dependence in a portfolio — every
+pair, every triple, every higher-order link — measured as the single bit-gap
+between the true joint and the fully-shuffled reference.  It is the multivariate
+mutual information, and the lens the [next page](04-windows-and-blocks.qmd) widens to
+vectors and blocks.  Mutual information is just its two-variable special case.
+
+```{python}
+#| label: fig-mi-is-kl
+#| fig-cap: "Mutual information as a KL gap, computed two ways on the same dependent pair. Left: the real 2-D joint p(x,y) (orange) against the independent reference p(x)·p(y) (blue contours) — the shuffled column. Right: the per-cell wasted bits p·log₂(p/q) that KL sums; the brightest cells are where the joint departs most from independence. The two numbers agree."
+rng = np.random.default_rng(7)
+n_kl = 4000
+xk = rng.normal(size=n_kl)
+yk = 0.85 * xk + 0.5 * rng.normal(size=n_kl)        # genuinely dependent pair
+
+edges = np.linspace(-4, 4, 26)
+joint_counts, _, _ = np.histogram2d(xk, yk, bins=edges)
+p_xy = joint_counts / joint_counts.sum()            # true joint p(x,y)
+p_x = p_xy.sum(axis=1, keepdims=True)               # marginal p(x)
+p_y = p_xy.sum(axis=0, keepdims=True)               # marginal p(y)
+q_ind = p_x * p_y                                   # independence model p(x)·p(y)
+
+mask = (p_xy > 0) & (q_ind > 0)
+per_cell = np.zeros_like(p_xy)
+per_cell[mask] = p_xy[mask] * np.log2(p_xy[mask] / q_ind[mask])   # wasted bits per cell
+mi_kl = float(per_cell.sum())                       # I(X;Y) = Σ p·log₂(p/q)   [bits]
+mi_check = mutual_information_bits(joint_counts)     # same number, library routine
+
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.2))
+ext = [edges[0], edges[-1], edges[0], edges[-1]]
+axL.imshow(p_xy.T, origin="lower", extent=ext, cmap="Oranges", aspect="auto")
+# independence reference as contours over the same axes
+gx = 0.5 * (edges[:-1] + edges[1:])
+axL.contour(gx, gx, q_ind.T, levels=6, colors=COOL, linewidths=1.2)
+axL.set_title("joint p(x,y)  vs  independent p(x)·p(y)", fontsize=12)
+axL.set_xlabel("X"); axL.set_ylabel("Y")
+im = axR.imshow(per_cell.T, origin="lower", extent=ext, cmap="magma", aspect="auto")
+axR.set_title(f"wasted bits per cell  p·log₂(p/q)\nΣ = I(X;Y) = {mi_kl:.2f} bits",
+              fontsize=12)
+axR.set_xlabel("X"); axR.set_ylabel("Y")
+fig.colorbar(im, ax=axR, fraction=0.046, pad=0.04)
+for ax in (axL, axR):
+    ax.set_xticks([]); ax.set_yticks([])
+fig.suptitle(f"I(X;Y) = D_KL(p(x,y) ‖ p(x)p(y)) = {mi_kl:.2f} bits"
+             f"   (library check: {mi_check:.2f})",
+             fontsize=12, fontweight="bold", y=1.02)
+fig.tight_layout()
+plt.show()
+```
+
+So mutual information is not a new idea — it is KL divergence pointed at one
+specific model, the independence reference.  The next section keeps the same
+number but reads it through entropies and a Venn diagram.
+
+---
+
+## Rung 6 · Mutual Information — The Honest Measure
+
+We just met mutual information as a KL gap — the bits wasted by assuming
+independence.  That same number has two more readings.  **Mutual information**
+is also the reduction in surprise about $Y$ from knowing $X$, and the overlap
+of the two entropy budgets:
+
+$$
+I(X;Y) = \underbrace{D_{\mathrm{KL}}\!\left(p(x,y) \,\|\, p(x)p(y)\right)}_{\text{KL from independence}}
+        = \underbrace{H(X) + H(Y) - H(X,Y)}_{\text{shared entropy}} \geq 0.
 $$
 
 ::: {.callout-note icon=false}
 ## Background — Three Faces of Mutual Information
 
-Plugging $q = p(x,y)$ and $r = p(x)p(y)$ into the KL divergence gives
+Starting from the KL form (the [previous section](#dependence-is-kl-from-independence)),
 
 $$
-I(X;Y) = \iint p(x,y)\log\frac{p(x,y)}{p(x)\,p(y)}\,dx\,dy.
+I(X;Y) = \iint p(x,y)\log\frac{p(x,y)}{p(x)\,p(y)}\,dx\,dy,
 $$
 
-Expanding the log and taking expectations term by term turns this into the
+expanding the log and taking expectations term by term turns this into the
 **entropy form** $H(X)+H(Y)-H(X,Y)$, and regrouping as $H(Y)-H(Y\mid X)$
 gives the **uncertainty-reduction form**: bits of uncertainty about $Y$ that
 knowing $X$ removes.  Same number, three readings.

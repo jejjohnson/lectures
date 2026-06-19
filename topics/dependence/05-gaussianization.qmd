@@ -7,14 +7,17 @@ title: "Gaussianization: Learn the Density, Then Measure"
 import sys, pathlib
 sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
 from lectures import plotting, datasets
-from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
-from lectures.measures import (hsic_rbf, distance_correlation,
-                               mutual_information_bits, mutual_information_xy)
+from lectures.plotting import INK, COOL, WARM, CRASH, GRID, despine, annotate_box
+from lectures.measures import (cka_rbf, distance_correlation, linfoot_r,
+                               mutual_information_xy)
 from lectures.gaussianization import gaussianize_1d
 plotting.set_style("notes")
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.stats import pearsonr, spearmanr
+from matplotlib.gridspec import GridSpec
+from matplotlib.lines import Line2D
+from scipy.stats import (pearsonr, spearmanr, gaussian_kde, multivariate_normal,
+                         multivariate_t, skewnorm, norm)
 import einx                      # linear algebra with the axes spelled out
 from jaxtyping import Float      # shape annotations: Float[Array, "n_days"]
 
@@ -31,6 +34,144 @@ the ladder.
 
 The trick sounds too simple to work: *transform the data until it is
 Gaussian, and keep the receipts.*
+
+---
+
+## It All Comes Back to $p(\mathbf{x})$
+
+Before the trick, the wall it climbs.  Every Road-2 measure — entropy, mutual
+information, total correlation — is the *same integral* against the density,
+and helpless without it:
+
+$$H(\mathbf{x}) = -\!\int p(\mathbf{x})\log p(\mathbf{x})\,\mathrm{d}\mathbf{x},
+\quad
+I(X;Y) = \!\int p(\mathbf{x})\log\frac{p(\mathbf{x})}{p(x)\,p(y)}\,\mathrm{d}\mathbf{x},
+\quad
+T(\mathbf{x}) = \!\int p(\mathbf{x})\log\frac{p(\mathbf{x})}{\prod_i p(x_i)}\,\mathrm{d}\mathbf{x}.$$
+
+Road 1 dodged this entirely — distances and kernels never write down a
+density.  Road 2 cannot: **the whole game is estimating $p(\mathbf{x})$.**  So
+the real question is how hard that estimation is, and the answer depends
+brutally on dimension.
+
+### One dimension — easy
+
+In 1-D you have three options and all of them work.  Bin the data into a
+**histogram**; *assume* a shape and fit a **parametric Gaussian**; or *learn*
+the shape with a **kernel density estimate**.  The only thing that separates
+them is honesty about shape — a Gaussian nails a bell and botches a skew, while
+the learned curve tracks whatever the data does:
+
+```{python}
+#| label: fig-density-1d
+#| fig-cap: "Estimating p(x) in one dimension. On a clean bell (left) the assumed Gaussian and the learned KDE agree. On a skewed return (right) the Gaussian — pinned to mean and variance — leans the wrong way, while the KDE follows the data. Histogram in grey, assumed Gaussian dashed, learned KDE solid."
+rng_1d = np.random.default_rng(3)
+easy = rng_1d.normal(0, 1, 1500)                         # a clean bell
+hard = skewnorm.rvs(6, size=1500, random_state=7)        # skewed, heavy on one side
+
+fig, axes = plt.subplots(1, 2, figsize=(10, 3.3))
+for ax, data, name in [(axes[0], easy, "easy — a bell"),
+                       (axes[1], hard, "hard — skewed")]:
+    g = np.linspace(data.min() - 0.5, data.max() + 0.5, 300)
+    ax.hist(data, bins=32, density=True, color="#c9cdd4", alpha=0.95,
+            edgecolor="white", lw=0.6, label="histogram (data)")
+    ax.plot(g, norm.pdf(g, data.mean(), data.std()), color=CRASH, lw=2.4,
+            ls="--", label="assume: Gaussian")
+    ax.plot(g, gaussian_kde(data)(g), color=COOL, lw=2.6, label="learn: KDE")
+    ax.set_title(name, fontsize=11)
+    ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+axes[0].legend(fontsize=9.5, frameon=False, loc="upper left")
+fig.tight_layout()
+plt.show()
+```
+
+### Two dimensions — still manageable
+
+Stack the two and you can still see the whole density: a scatter with its two
+marginals, an assumed Gaussian contour, a learned KDE contour.  A Gaussian's
+*only* dependence is correlation — its contour is always an ellipse, the shadow
+of its covariance — so it tilts toward the banks' blob but sits blind over the
+V.  The learned density wraps the bend:
+
+```{python}
+#| label: fig-density-2d
+#| fig-cap: "Estimating p(x,y) in two dimensions. Dashed = a fitted Gaussian (an ellipse, all it can be — its only dependence is correlation); solid = the learned KDE. On the tilted blob (left) both fit; on the V (right) the Gaussian misses the bend while the KDE wraps it."
+a2, b2, _ = datasets.two_banks(n=900)
+u2, v2 = datasets.convex_payoff(n=900)
+fig, axes = plt.subplots(1, 2, figsize=(10, 3.6))
+for ax, x, y, col, name in [(axes[0], a2, b2, COOL, "easy — a tilted blob"),
+                            (axes[1], u2, v2, WARM, "hard — a V")]:
+    X = np.column_stack([x, y])
+    g = np.linspace(X.min() - 0.5, X.max() + 0.5, 130)
+    GXg, GYg = np.meshgrid(g, g)
+    Zg = multivariate_normal(X.mean(0), np.cov(X.T)).pdf(np.dstack([GXg, GYg]))   # assume
+    Zk = gaussian_kde(X.T)(np.vstack([GXg.ravel(), GYg.ravel()])).reshape(GXg.shape)  # learn
+    ax.scatter(x, y, s=8, c=col, alpha=0.32, edgecolors="none")
+    ax.contour(GXg, GYg, Zg, levels=5, colors=[CRASH], linewidths=1.1, linestyles="dashed")
+    ax.contour(GXg, GYg, Zk, levels=5, colors=[INK], linewidths=1.1)
+    ax.set_title(name, fontsize=11)
+    ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+### Many dimensions — you go blind
+
+Past three dimensions the picture is gone and the histogram dies with it.  A
+grid of bins needs roughly $10^{d}$ samples to fill — the **curse of
+dimensionality** — so by a handful of assets a histogram of daily returns would
+ask for more days than the universe has had.  There is no plot to draw and no
+table to count:
+
+```{python}
+#| label: fig-density-manyd
+#| fig-cap: "The estimation cliff. A histogram works in 1-D and a learned density still works in 2-D; past 3-D there is no picture, and a binned estimate needs ~10^d samples to fill. The only survivor is to LEARN an invertible density."
+rng_md = np.random.default_rng(3)
+fig, axes = plt.subplots(1, 3, figsize=(9.6, 2.7))
+d1 = rng_md.normal(0, 1, 1200)                                  # 1-D: a histogram
+g1 = np.linspace(-3.6, 3.6, 200)
+axes[0].hist(d1, bins=28, density=True, color="#c9cdd4", alpha=0.95,
+             edgecolor="white", lw=0.5)
+axes[0].plot(g1, gaussian_kde(d1)(g1), color=COOL, lw=2.4)
+axes[0].set_title("1-D · a histogram", fontsize=11)
+p2 = rng_md.multivariate_normal([0, 0], [[1, 0.6], [0.6, 1]], 500)  # 2-D: a density
+gg = np.linspace(-3.6, 3.6, 90); GX2, GY2 = np.meshgrid(gg, gg)
+Zk2 = gaussian_kde(p2.T)(np.vstack([GX2.ravel(), GY2.ravel()])).reshape(GX2.shape)
+axes[1].scatter(p2[:, 0], p2[:, 1], s=8, c=COOL, alpha=0.3, edgecolors="none")
+axes[1].contour(GX2, GY2, Zk2, levels=5, colors=[INK], linewidths=1.0)
+axes[1].set_title("2-D · a density", fontsize=11)
+q = rng_md.normal(0, 1, (200, 2))                              # d-D: no picture
+axes[2].scatter(q[:, 0], q[:, 1], s=8, c=GRID, alpha=0.18, edgecolors="none")
+axes[2].text(0.5, 0.5, "?", transform=axes[2].transAxes, ha="center", va="center",
+             fontsize=60, color=CRASH, fontweight="bold")
+axes[2].set_title("d-D · no picture", fontsize=11, color=CRASH)
+for ax in axes:
+    ax.set_xticks([]); ax.set_yticks([])
+    for sp in ax.spines.values():
+        sp.set_edgecolor(GRID)
+fig.tight_layout()
+plt.show()
+```
+
+### Assume it, or learn it
+
+Two families answer the estimation question, and the fork between them is the
+fork this whole page is about.
+
+**Assume a family — *parametric*.**  Pick a shape (Gaussian, Student-$t$,
+mixture) and fit a few numbers.  Cheap, frugal with data, scales to high
+dimension — but **rigid**: a Gaussian's only dependence is correlation, so any
+bend or fat tail is structurally invisible to it, no matter how many samples
+you feed it.
+
+**Learn the shape — *nonparametric*.**  Let the data carve the density: a KDE
+in low dimension, and in high dimension an **invertible learned map**.  Flexible
+enough for Vs, fat tails, and modes — at the cost of more data and more compute.
+
+Gaussianization is how we get the second one in high dimension without a
+histogram: **learn an invertible map that turns the data into a Gaussian** —
+flexible shape on the way in, exact likelihoods on the way out.  That map is the
+trick this page promised, and the next section is its mechanism.
 
 ---
 
@@ -120,6 +261,153 @@ generate scenarios and propagate risk.
 
 ---
 
+## Fit the V Three Ways
+
+Words are cheap; let the V judge.  Here are the three density estimators of the
+fork — an *assumed* Gaussian, an *assumed* Student-$t$ (the heaviest-tailed
+ellipse), and a *learned* RBIG — fit to the same convex pair, each scored two
+ways.  The **log-likelihood** asks how well the model explains the data it saw;
+the **recovered mutual information** asks how much dependence the model's own
+samples carry.
+
+A note on the second score, because it is the one pitfall here.  RBIG's
+built-in MI routine is tuned for asymmetric dependence and reads the symmetric
+V as nearly independent — the wrong answer.  The honest move is to ask each
+fitted model what it *believes*: draw samples from it, then histogram-estimate
+the MI of those samples.  A model that captures the V will reproduce it when
+sampled, and that MI is what it has actually learned.
+
+```{python}
+#| label: fig-fit-v-three-ways
+#| fig-cap: "The V fit three ways. Scatter with marginal histograms; contours are each model's joint density (Gaussian dashed, Student-t dotted, RBIG solid via a KDE of RBIG samples). Side panel: each model's mean log-likelihood and its recovered MI in bits, against the data's true histogram MI. Both ellipses sit blind over the bend; only the RBIG contour wraps the V — and only RBIG's likelihood and recovered bits come close to the truth."
+import warnings; warnings.filterwarnings("ignore")
+import rbig
+
+u8, v8 = datasets.convex_payoff(n=1200, seed=0)
+X8 = np.column_stack([u8, v8]).astype(float)              # (n_days, 2)
+loc8, cov8 = X8.mean(0), np.cov(X8.T)                     # sample mean & covariance
+
+# --- assume: a Gaussian (its only dependence is correlation) ---
+gN = multivariate_normal(loc8, cov8)
+
+# --- assume: a Student-t; pick df by max mean log-lik, shape = cov·(df−2)/df ---
+#     so the model covariance matches the sample covariance
+dfg = max(((d, multivariate_t(loc8, cov8 * (d - 2) / d, df=d).logpdf(X8).mean())
+           for d in (3, 4, 5, 7, 10, 15)), key=lambda z: z[1])[0]
+tN = multivariate_t(loc8, cov8 * (dfg - 2) / dfg, df=dfg)
+
+# --- learn: RBIG (the production iterative Gaussianizer) ---
+mR = rbig.AnnealedRBIG(random_state=0); mR.fit(X8)
+
+
+def mi_bits(s: Float[Array, "n 2"]) -> float:
+    """Histogram-MI of a 2-column sample, in bits (helper is nats → ÷ ln 2)."""
+    return mutual_information_xy(s[:, 0], s[:, 1]) / np.log(2)
+
+
+# each model's recovered MI = MI of its OWN samples (RBIG's MI routine misreads the V)
+gsamp = gN.rvs(7000, random_state=1)
+tsamp = tN.rvs(7000, random_state=1)
+rsamp = np.asarray(mR.sample(7000, random_state=1))
+mis = [mi_bits(gsamp), mi_bits(tsamp), mi_bits(rsamp)]
+trueMI = mi_bits(X8)                                      # data's own histogram MI
+
+# mean log-likelihood per point (RBIG via change-of-variables)
+gll = gN.logpdf(X8).mean()
+tll = tN.logpdf(X8).mean()
+rll = -rbig.negative_log_likelihood(mR, X8)
+
+# density grids for the contours (RBIG via a KDE of its samples)
+gx = np.linspace(X8[:, 0].min() - 1, X8[:, 0].max() + 1, 110)
+gy = np.linspace(X8[:, 1].min() - 1, X8[:, 1].max() + 1, 110)
+GXc, GYc = np.meshgrid(gx, gy)
+Zg = gN.pdf(np.dstack([GXc, GYc]))
+Zt = tN.pdf(np.dstack([GXc, GYc]))
+Zr = gaussian_kde(rsamp[:2500].T)(np.vstack([GXc.ravel(), GYc.ravel()])).reshape(GXc.shape)
+
+fig = plt.figure(figsize=(11, 4.2))
+gsp = GridSpec(2, 3, width_ratios=[4, 1.1, 2.5], height_ratios=[1, 4],
+               wspace=0.05, hspace=0.05)
+axT = fig.add_subplot(gsp[0, 0])          # top marginal
+axMn = fig.add_subplot(gsp[1, 0])         # joint scatter + contours
+axRt = fig.add_subplot(gsp[1, 1])         # right marginal
+axSt = fig.add_subplot(gsp[:, 2]); axSt.axis("off")   # scorecard panel
+
+axMn.scatter(X8[:, 0], X8[:, 1], s=7, c=GRID, alpha=0.4, edgecolors="none")
+axMn.contour(GXc, GYc, Zg, levels=5, colors=[CRASH], linewidths=1.2, linestyles="dashed")
+axMn.contour(GXc, GYc, Zt, levels=5, colors=[WARM], linewidths=1.1, linestyles="dotted")
+axMn.contour(GXc, GYc, Zr, levels=5, colors=[COOL], linewidths=1.5)
+axMn.set_xticks([]); axMn.set_yticks([]); despine(axMn)
+axMn.legend(handles=[Line2D([0], [0], color=COOL, lw=1.6, label="RBIG (learned)"),
+                     Line2D([0], [0], color=WARM, lw=1.1, ls=":", label="Student-t"),
+                     Line2D([0], [0], color=CRASH, lw=1.2, ls="--", label="Gaussian")],
+            fontsize=9.5, frameon=False, loc="upper center", ncol=3, bbox_to_anchor=(0.5, 1.03))
+axT.hist(X8[:, 0], bins=40, color="#c9cdd4", alpha=0.95, edgecolor="white", lw=0.4)
+axT.axis("off")
+axRt.hist(X8[:, 1], bins=40, orientation="horizontal", color="#c9cdd4",
+          alpha=0.95, edgecolor="white", lw=0.4)
+axRt.axis("off")
+axSt.text(0.0, 0.97, f"n = {len(X8)} samples", fontsize=11, color="#666",
+          transform=axSt.transAxes)
+for j, (nm, c, ll, mi) in enumerate([("RBIG (learned)", COOL, rll, mis[2]),
+                                     ("Student-t", WARM, tll, mis[1]),
+                                     ("Gaussian", CRASH, gll, mis[0])]):
+    yb = 0.82 - j * 0.27
+    axSt.text(0.0, yb, nm, fontsize=12, fontweight="bold", color=c, transform=axSt.transAxes)
+    axSt.text(0.06, yb - 0.085, f"log-lik  {ll:+.2f}", fontsize=11, color=INK,
+              transform=axSt.transAxes)
+    axSt.text(0.06, yb - 0.165, f"MI  {mi:.2f} bits", fontsize=11, color=INK,
+              transform=axSt.transAxes)
+axSt.text(0.0, 0.02, f"true MI = {trueMI:.2f} bits", fontsize=11, style="italic",
+          color=INK, transform=axSt.transAxes)
+fig.tight_layout()
+plt.show()
+```
+
+The two ellipses are interchangeable here — the Student-$t$ buys fatter tails
+but stays an ellipse, so it gains almost nothing on a V.  Only the learned map
+bends.
+
+### Scored Head-to-Head
+
+The same three fits, stripped to two bars.  On the left, log-likelihood as a
+*gain over the Gaussian baseline* — the bits-per-point the model buys by
+explaining the data better.  On the right, the recovered MI against the dashed
+true value.  RBIG wins both:
+
+```{python}
+#| label: fig-rbig-vs-parametric
+#| fig-cap: "RBIG vs the parametric pair, scored. Left: mean log-likelihood gain over the Gaussian baseline (nats/point) — the Student-t barely moves; RBIG jumps. Right: mutual information recovered (bits) against the data's true MI (dashed). The ellipses recover almost none of the V's dependence; RBIG recovers most of it."
+dll = [0.0, tll - gll, rll - gll]                  # log-lik gain over Gaussian
+labels = ["Gaussian", "Student-t", "RBIG"]
+cols = [CRASH, WARM, COOL]
+fig, (axL, axM) = plt.subplots(1, 2, figsize=(10, 3.4))
+axL.bar(labels, dll, color=cols)
+axL.set_title("log-likelihood gain over Gaussian", fontsize=11)
+axL.set_ylabel("nats / point")
+for i, val in enumerate(dll):
+    axL.text(i, val, f"+{val:.2f}", ha="center", va="bottom", fontsize=10, color=INK)
+axL.set_ylim(0, max(dll) * 1.25 + 0.05)
+axM.bar(labels, mis, color=cols)
+axM.axhline(trueMI, color=INK, ls="--", lw=1.3)
+axM.text(2.4, trueMI + 0.03, "true MI", color=INK, fontsize=9.5, ha="right")
+axM.set_title("mutual information recovered (bits)", fontsize=11)
+for i, val in enumerate(mis):
+    axM.text(i, val + 0.02, f"{val:.2f}", ha="center", va="bottom", fontsize=10, color=INK)
+axM.set_ylim(0, max(mis) * 1.3 + 0.1)
+for ax in (axL, axM):
+    ax.tick_params(labelsize=10); despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+The lesson is sharp.  An assumed shape is cheap and scales, but it can only
+report the dependence its *form* allows — and an ellipse's form is correlation.
+The learned map pays in compute and earns the rest: the likelihood the others
+leave on the table *and* the bits of dependence the bend actually carries.
+
+---
+
 ## Synthesis — The Two Roads, Grown
 
 Look back at the ladder.  Every tool was one of two roads:
@@ -143,83 +431,150 @@ The *transform* is the thread: a fixed, hand-picked map on Road 1; a learned,
 invertible map on the generative branch of Road 2.  An invertible transform
 that simplifies the data hands you the density for free.
 
+**The axis that actually orders the ladder is complexity, not detection.**  By
+now almost every rung past Pearson *detects* the V — distance correlation, CKA,
+and the learned MI all catch the bend.  What separates the tools is what they
+cost and what they hand back.  Road 1 is a single branching path of *scores*,
+each rung buying reach with compute: Pearson → Spearman → dCor → CKA.  Road 2 is
+a path of *densities*, and it splits once more — *assume* the shape (Gaussian,
+Student-$t$ — cheap, rigid) before you *learn* it (RBIG — costly, exact).  Read
+the picture left to right as rising complexity:
+
 ```{python}
 #| label: fig-two-roads
-#| fig-cap: "The two-roads decision tree. Both branches end at a measure; only the right branch needs a density."
-fig, ax = plt.subplots(figsize=(11, 5))
-ax.axis("off")
+#| fig-cap: "The two roads laid along a complexity axis — a subway map. The decision (need the density?) splits the line: the upper track is Road 1, a sequence of scores (no density); the lower track is Road 2, a sequence of densities that itself splits 'assume' (Gaussian, Student-t) from 'learn' (RBIG, highlighted). Left to right is rising complexity: cheap and linear on the left, costly and exact on the right."
+from matplotlib.patches import FancyBboxPatch
+fig, ax = plt.subplots(figsize=(11, 4.6))
+ax.set_xlim(0, 11); ax.set_ylim(0, 6.6); ax.axis("off")
 
-nodes = {
-    "q":   (0.50, 0.90, "How much do these move together?",  14, INK),
-    "q1":  (0.50, 0.68, "Do you need the distribution?",     12, INK),
-    "r1a": (0.18, 0.46, "NO → compare directly\n"
-                        "compare(T(x), T(y))",                11, COOL),
-    "r1b": (0.82, 0.46, "YES → go through p(x,y)\n"
-                        "= KL-divergence",                     11, WARM),
-    "r2a": (0.18, 0.20, "Pearson   Spearman\n"
-                        "dist corr   HSIC / CKA\n"
-                        "(differ only in T and metric)",       10, COOL),
-    "r2b": (0.58, 0.20, "Assume shape\n(parametric, fast,\n"
-                        "wrong in tails)",                     10, WARM),
-    "r2c": (0.90, 0.20, "Learn shape\n(Gaussianization,\n"
-                        "flows — exact)",                      10, CRASH),
-}
 
-for key, (x, y, text, fs, col) in nodes.items():
-    ax.text(x, y, text, ha="center", va="center", fontsize=fs, color=col,
-            fontweight="bold" if key in ("q", "q1") else "normal",
-            bbox=dict(boxstyle="round,pad=0.4", fc="white", ec=col, lw=1.4))
+def _station(x, y, label, color, hi=False):
+    ax.add_patch(FancyBboxPatch((x - 0.78, y - 0.32), 1.56, 0.64,
+                                boxstyle="round,pad=0.02,rounding_size=0.14",
+                                fc="white", ec=color, lw=2.8 if hi else 1.8, zorder=3))
+    ax.text(x, y, label, ha="center", va="center", fontsize=11, color=color,
+            fontweight="bold" if hi else "normal", zorder=4)
 
-arrow_kw = dict(arrowstyle="->", lw=1.4, color=INK)
-for (x0, y0), (x1, y1) in [
-    ((0.50, 0.85), (0.50, 0.74)),
-    ((0.50, 0.63), (0.22, 0.52)),
-    ((0.50, 0.63), (0.78, 0.52)),
-    ((0.18, 0.40), (0.18, 0.26)),
-    ((0.82, 0.40), (0.62, 0.26)),
-    ((0.82, 0.40), (0.88, 0.26)),
-]:
-    ax.annotate("", xy=(x1, y1), xytext=(x0, y0),
-                xycoords="axes fraction", textcoords="axes fraction",
-                arrowprops=arrow_kw)
 
+# decision node + the two branches
+ax.text(0.55, 3.5, "need the\ndensity?", ha="center", va="center", fontsize=12,
+        color=INK, fontweight="bold")
+ax.annotate("", xy=(1.7, 5.0), xytext=(0.95, 3.95),
+            arrowprops=dict(arrowstyle="-|>", color=COOL, lw=2.2))
+ax.annotate("", xy=(1.7, 2.0), xytext=(0.95, 3.05),
+            arrowprops=dict(arrowstyle="-|>", color=WARM, lw=2.2))
+ax.text(1.05, 4.55, "no", fontsize=10.5, color=COOL, style="italic")
+ax.text(1.05, 2.4, "yes", fontsize=10.5, color=WARM, style="italic")
+
+# Road 1 — a score, no density
+ax.text(2.3, 5.95, "Road 1 · a score, no density", color=COOL, fontsize=12,
+        fontweight="bold")
+r1 = [("Pearson", 2.7), ("Spearman", 4.5), ("dist corr", 6.3), ("CKA", 8.1)]
+for lab, x in r1:
+    _station(x, 5.0, lab, COOL)
+for (_l1, x1), (_l2, x2) in zip(r1, r1[1:]):
+    ax.annotate("", xy=(x2 - 0.82, 5.0), xytext=(x1 + 0.82, 5.0),
+                arrowprops=dict(arrowstyle="-|>", color=GRID, lw=1.4))
+
+# Road 2 — model the density, itself splitting assume → learn
+ax.text(2.3, 0.95, "Road 2 · model the density", color=WARM, fontsize=12,
+        fontweight="bold")
+r2 = [("Gaussian", 4.7, False), ("Student-t", 6.6, False), ("RBIG", 9.3, True)]
+for lab, x, hi in r2:
+    _station(x, 2.0, lab, CRASH if hi else WARM, hi=hi)
+for (_l1, x1, _a), (_l2, x2, _b) in zip(r2, r2[1:]):
+    ax.annotate("", xy=(x2 - 0.82, 2.0), xytext=(x1 + 0.82, 2.0),
+                arrowprops=dict(arrowstyle="-|>", color=GRID, lw=1.4))
+ax.text(5.65, 2.72, "assume the shape", fontsize=10, color="#777", style="italic", ha="center")
+ax.text(9.3, 2.72, "learn it", fontsize=10, color=CRASH, style="italic", ha="center")
+
+# complexity axis
+ax.annotate("", xy=(10.6, 0.25), xytext=(0.3, 0.25),
+            arrowprops=dict(arrowstyle="-|>", color=INK, lw=2.2))
+ax.text(0.3, -0.05, "cheap · linear", fontsize=10.5, color="#555")
+ax.text(10.6, -0.05, "costly · exact", fontsize=10.5, color="#555", ha="right")
+ax.text(5.5, 0.42, "complexity →", fontsize=11, color=INK, fontweight="bold", ha="center")
 fig.tight_layout()
 plt.show()
 ```
 
+Detection is the easy part — most rungs past Pearson catch the V.  The real
+trade-off is **complexity**: a score is cheap and one-shot; the full density
+costs more and is data-hungry, but it is the only branch that is *invertible* —
+and so the only branch that lets you **sample, propagate, and price the tails**,
+not merely detect them.
+
 ---
 
-## Final Scorecard — All Measures on Both Characters
+## Every Method, Both Characters
+
+The whole ladder on one chart, and both characters scored down it: the four
+Road-1 rungs (Pearson, Spearman, distance correlation, CKA), then mutual
+information read through each of the three densities (Gaussian, Student-$t$,
+RBIG).  To put the bits on the same $[0,1]$ axis as the correlations, each MI is
+mapped to its **Linfoot $R = \sqrt{1 - e^{-2I}}$** — the rescaling that returns
+exactly $|\rho|$ for a Gaussian pair, so a parametric MI and a correlation sit
+naturally side by side.
 
 ```{python}
-#| label: tbl-final-scorecard
-#| tbl-cap: "Every measure we met, applied to both running characters."
-a, b, crash = datasets.two_banks(n=1000)
+#| label: fig-every-method
+#| fig-cap: "Every measure on one [0,1] scale. Four Road-1 scores, then MI through three densities (each shown as Linfoot R so bits sit next to correlations). On the Banks (a line) everything agrees. On the V, the linear rungs AND the parametric MIs (Gaussian, t) stay flat — only distance corr, CKA, and MI·RBIG catch the bend."
+import warnings; warnings.filterwarnings("ignore")
+import rbig
+
+
+def char_scores(x: Float[Array, "n_days"], y: Float[Array, "n_days"]) -> list[float]:
+    """The full ladder for one pair, every entry on [0, 1]."""
+    x = np.asarray(x, float); y = np.asarray(y, float)
+    X = np.column_stack([x, y])
+    loc, cov = X.mean(0), np.cov(X.T)
+    g = multivariate_normal(loc, cov)
+    df = max(((d, multivariate_t(loc, cov * (d - 2) / d, df=d).logpdf(X).mean())
+              for d in (3, 4, 5, 7, 10, 15)), key=lambda z: z[1])[0]
+    t = multivariate_t(loc, cov * (df - 2) / df, df=df)
+    m = rbig.AnnealedRBIG(random_state=0); m.fit(X)
+
+    def mi_R(s: Float[Array, "n 2"]) -> float:
+        # MI of the model's OWN samples (nats), mapped to Linfoot R ∈ [0, 1]
+        return linfoot_r(mutual_information_xy(s[:, 0], s[:, 1]))
+
+    return [abs(pearsonr(x, y)[0]), abs(spearmanr(x, y)[0]),
+            distance_correlation(x, y), cka_rbf(x, y),
+            mi_R(g.rvs(8000, random_state=1)),
+            mi_R(t.rvs(8000, random_state=1)),
+            mi_R(np.asarray(m.sample(8000, random_state=1)))]
+
+
+a, b, _ = datasets.two_banks(n=1000)
 u, v = datasets.convex_payoff(n=1000)
-
-def full_score(x: Float[Array, "n_days"], y: Float[Array, "n_days"], label: str):
-    """Print the whole ladder for one pair."""
-    p = pearsonr(x, y)[0]                       # r ∈ [−1, 1] — linear only
-    s = spearmanr(x, y)[0]                      # ρₛ ∈ [−1, 1] — monotone
-    dc = distance_correlation(x, y)             # dCor ∈ [0, 1] — any shape
-    joint_counts = np.histogram2d(x, y, bins=25)[0]
-    mi = mutual_information_bits(joint_counts)  # I(X;Y) [bits] — any shape
-    h = hsic_rbf(x[:300], y[:300])              # HSIC — kernel test (subsampled)
-    print(f"\n{label}")
-    print(f"  Pearson          {p:+.3f}")
-    print(f"  Spearman         {s:+.3f}")
-    print(f"  distance corr    {dc:.3f}")
-    print(f"  MI (bits, hist)  {mi:.3f}")
-    print(f"  HSIC (RBF)       {h:.4f}")
-
-full_score(a, b, "Banks")
-full_score(u, v, "Convex payoff")
+banks, convex = char_scores(a, b), char_scores(u, v)
+methods = ["Pearson", "Spearman", "dist\ncorr", "CKA",
+           "MI·\nGauss", "MI·\nt", "MI·\nRBIG"]
+xs = np.arange(7); wbar = 0.4
+fig, ax = plt.subplots(figsize=(11.5, 4.5))
+ax.axvspan(-0.5, 1.5, color=CRASH, alpha=0.05)        # the linear-only rungs
+ax.axvline(3.5, color=GRID, lw=1.6, ls="--")          # Road 1 | Road 2 divide
+ax.bar(xs - wbar / 2, banks, wbar, color=COOL, label="Banks (a line)")
+ax.bar(xs + wbar / 2, convex, wbar, color=WARM, label="Convex (a V)")
+ax.text(1.5, 1.0, "Road 1 · a score", ha="center", fontsize=12, color=INK, fontweight="bold")
+ax.text(5.0, 1.0, "Road 2 · MI via a density", ha="center", fontsize=12, color=INK, fontweight="bold")
+ax.text(0.5, 0.14, "linear:\nblind to the V", ha="center", fontsize=10.5,
+        color=CRASH, style="italic", fontweight="bold")
+ax.set_xticks(xs); ax.set_xticklabels(methods, fontsize=12)
+ax.set_ylabel("dependence detected  (0–1)"); ax.set_ylim(0, 1.1)
+ax.legend(fontsize=12, frameon=False, ncol=2, loc="lower center", bbox_to_anchor=(0.5, 1.03))
+despine(ax); fig.tight_layout()
+plt.show()
 ```
 
-**Opposite blind spots, made concrete.**  The banks score high on every
-measure; the convex pair is invisible to Pearson yet obvious once we leave the
-no-distribution road.  No single number is the whole truth — the right tool
-depends on the relationship you fear.
+**Opposite blind spots, made concrete.**  On the **Banks** every column is tall:
+a near-Gaussian line is exactly what correlation, ranks, kernels, *and* a fitted
+Gaussian all see, so they agree.  On the **V** the chart splits cleanly — the
+linear rungs (Pearson, Spearman) *and* the parametric MIs (Gaussian, Student-$t$)
+all collapse, because each is, at heart, an ellipse; only **distance corr, CKA,
+and MI·RBIG** rise to meet the bend.  No single number is the whole truth, and
+the chart shows exactly which numbers fail and why: anything that can only draw
+an ellipse is blind to a V.
 
 ---
 

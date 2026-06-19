@@ -14,6 +14,37 @@ from lectures.measures import cocrash_fraction
 plotting.set_style("notes")
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+
+
+def jointplot(fig, spec, data, color, title="", s=6, lim=None, equal=False, overlay=None):
+    """Scatter with top/right marginal histograms, drawn inside one GridSpec cell.
+
+    Showing the marginals beside the joint is the whole point: it lets the reader
+    see Gaussian marginals sitting on top of a non-Gaussian joint, marginals
+    skewing after a rotation, and marginals re-flattening after Gaussianization.
+    """
+    sub = spec.subgridspec(2, 2, width_ratios=[5, 1.2], height_ratios=[1.2, 5],
+                           wspace=0.05, hspace=0.05)
+    axm = fig.add_subplot(sub[1, 0])
+    axt = fig.add_subplot(sub[0, 0], sharex=axm)
+    axr = fig.add_subplot(sub[1, 1], sharey=axm)
+    axm.scatter(data[:, 0], data[:, 1], s=s, c=color, alpha=0.4, edgecolors="none")
+    if overlay is not None:
+        overlay(axm)
+    axt.hist(data[:, 0], bins=42, color=color, alpha=0.8)
+    axr.hist(data[:, 1], bins=42, orientation="horizontal", color=color, alpha=0.8)
+    if lim is not None:
+        axm.set_xlim(*lim); axm.set_ylim(*lim)
+    if equal:
+        axm.set_aspect("equal")
+    axm.set_xticks([]); axm.set_yticks([]); despine(axm)
+    for a in (axt, axr):
+        a.set_xticks([]); a.set_yticks([])
+        for sp in a.spines.values():
+            sp.set_visible(False)
+    axt.set_title(title, fontsize=11)
+    return axm
 ```
 
 The 1-D [rank → Gaussian](01-change-of-variables.qmd) trick fixes one marginal at
@@ -37,11 +68,112 @@ Both steps are invertible, so the whole stack is.  Each layer's Jacobian is chea
 (a diagonal marginal map times an orthogonal rotation), which is why RBIG scales.
 :::
 
+## Why Gaussian Marginals Aren't Enough
+
+It is tempting to think we are done after the [1-D move](01-change-of-variables.qmd):
+push every coordinate through $\Phi^{-1}(\hat F_j)$ and each axis becomes a textbook
+standard normal.  But a per-axis map is a *monotone reshuffling of one coordinate
+at a time* — it slides points along their own axis without ever asking where they
+sit on the other.  It **cannot change which** $x_1$ **goes with which** $x_2$.  All
+the dependence — the joint geometry — survives untouched.
+
+The cleanest way to see it is a **V**: a curved relationship where $y$ is small at
+both extremes of $x$ and large in the middle (a long–straddle payoff is exactly
+this shape).  Gaussianize both axes and watch the marginals *vs.* the joint.
+
+```{python}
+#| label: fig-rbig-marginals-not-enough
+#| fig-cap: "Both marginals are forced to standard normals (the side histograms are textbook bells), yet the joint is still a V. Dependence lives *between* the axes, where a per-coordinate map cannot reach."
+u, v = datasets.convex_payoff(n=1500, seed=0)
+XV = np.column_stack([u, v])
+XV = (XV - XV.mean(0)) / XV.std(0)          # standardize so the "before" is fair
+GV = np.column_stack([gaussianize_1d(XV[:, 0]), gaussianize_1d(XV[:, 1])])
+
+fig = plt.figure(figsize=(9.6, 4.4))
+gs = GridSpec(1, 2, figure=fig, wspace=0.3)
+jointplot(fig, gs[0, 0], XV, COOL, "data: a V", s=7)
+jointplot(fig, gs[0, 1], GV, COOL, "both marginals → Gaussian", s=7)
+fig.tight_layout()
+plt.show()
+```
+
+Read the right panel carefully.  The **top and right histograms are perfect bells**
+— each marginal is now exactly $\mathcal N(0,1)$.  And yet the **scatter is still a
+V**.  A test that only looks at one variable at a time would declare victory; the
+joint says the variables are as dependent as ever.  Gaussian marginals are
+*necessary* for a standard-normal joint, but nowhere near *sufficient*.
+
+This is the gap RBIG closes.  Marginals alone are a dead end — we need a move that
+reaches *between* the axes.  That move is a **rotation**.
+
+## Rotate, Re-Gaussianize, Repeat
+
+Here is the trick.  A rotation **mixes the coordinates**: each new axis is a blend
+of the old ones.  Leftover dependence that was hiding *between* the axes is dragged
+back *onto* the axes, where it resurfaces as **non-Gaussian marginals** — which the
+1-D move can then flatten again.  Alternate the two steps and each round scrapes off
+a little more dependence:
+
+$$
+\underbrace{x \;\xrightarrow{\;\Phi^{-1}(\hat F)\;}\; g}_{\text{marginals} \to \text{Gaussian}}
+\;\xrightarrow{\;\text{rotate } R\;}\;
+\underbrace{x' \;\xrightarrow{\;\Phi^{-1}(\hat F)\;}\; \cdots}_{\text{repeat}}
+$$
+
+Watch one full turn of the loop on the same V.  The marginal histograms are the tell
+at every stage:
+
+```{python}
+#| label: fig-rbig-loop
+#| fig-cap: "One turn of the RBIG loop. (1) Marginals Gaussian but joint still a V. (2) Rotate 45° — the V tips, and the marginals *skew* (the rotation has exposed dependence onto the axes). (3) Re-Gaussianize — marginals flat again, joint a little rounder. (4) Many such turns drive the cloud to a sphere."
+def gm(D):
+    return np.column_stack([gaussianize_1d(D[:, 0]), gaussianize_1d(D[:, 1])])
+
+def rot(D, deg):
+    th = np.deg2rad(deg)
+    R = np.array([[np.cos(th), -np.sin(th)], [np.sin(th), np.cos(th)]])
+    return D @ R.T
+
+R1 = rot(GV, 45)        # one rotation
+G2 = gm(R1)             # re-gaussianize the rotated marginals
+ZV = AnnealedRBIG(n_layers=30, random_state=0).fit(XV).transform(XV)
+
+seq = [("marginals Gaussian\n(still a V)", GV),
+       ("rotate 45°\n→ marginals skew", R1),
+       ("re-Gaussianize\nmarginals", G2),
+       ("…repeat → spherical", ZV)]
+fig = plt.figure(figsize=(13, 3.6))
+gs = GridSpec(1, 4, figure=fig, wspace=0.4)
+for i, (t, D) in enumerate(seq):
+    jointplot(fig, gs[0, i], D, COOL, t, s=5)
+fig.tight_layout()
+plt.show()
+```
+
+Trace the marginals across the panels: flat → **skewed** → flat again.  The skew in
+panel 2 is dependence that the rotation *uncovered*; panel 3 flattens it; the joint
+is rounder than where we started.  Run enough turns and the cloud becomes a featureless
+sphere — **that alternation, not the marginal step alone, is RBIG.**
+
+::: {.callout-note icon=false}
+## Why Aim at a Gaussian (and Not Some Other Target)?
+
+The rotation step is the reason the target *must* be a Gaussian.  A rotation of
+**independent Gaussians is still independent Gaussians** — the standard normal is the
+only product distribution a rotation leaves alone.  So once the cloud is spherical,
+rotating it cannot manufacture new dependence, and the loop has a fixed point to
+converge to.  Aim at a uniform or a Laplace and a rotation would re-introduce
+dependence on every turn; the loop would never settle.
+:::
+
 ## One Layer, in Pictures
+
+The two halves of a single layer, shown on a correlated, fat-tailed pair so you can
+see the marginals being flattened *and* the joint being decorrelated:
 
 ```{python}
 #| label: fig-rbig-step
-#| fig-cap: "One RBIG layer on a correlated, fat-tailed pair: Gaussianize each marginal, then rotate to decorrelate."
+#| fig-cap: "One RBIG layer on a correlated, fat-tailed pair: Gaussianize each marginal (the side histograms become bells), then rotate to decorrelate (the cloud straightens up)."
 a, b = datasets.tail_dependent_pair(n=1500, seed=1)
 X = np.column_stack([a, b])
 
@@ -50,16 +182,13 @@ cov = np.cov(G, rowvar=False)
 _, vecs = np.linalg.eigh(cov)        # PCA rotation
 Xr = G @ vecs
 
-fig, axes = plt.subplots(1, 3, figsize=(13, 4.0))
-for ax, (data, title) in zip(
-    axes,
-    [(X, "data (correlated, fat tails)"),
-     (G, "after marginal Gaussianize"),
-     (Xr, "after rotation (decorrelated)")],
-):
-    ax.scatter(data[:, 0], data[:, 1], s=8, c=COOL, alpha=0.35, edgecolors="none")
-    ax.set_title(title, fontsize=11)
-    ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+fig = plt.figure(figsize=(13, 4.2))
+gs = GridSpec(1, 3, figure=fig, wspace=0.3)
+panels = [(X, "data (correlated, fat tails)"),
+          (G, "after marginal Gaussianize"),
+          (Xr, "after rotation (decorrelated)")]
+for i, (data, title) in enumerate(panels):
+    jointplot(fig, gs[0, i], data, COOL, title, s=7)
 fig.tight_layout()
 plt.show()
 ```
@@ -80,16 +209,15 @@ gen = rbig.sample(len(X))
 cc_data = cocrash_fraction(X[:, 0], X[:, 1])
 cc_gen = cocrash_fraction(gen[:, 0], gen[:, 1])
 
-fig, axes = plt.subplots(1, 3, figsize=(13, 4.2))
+fig = plt.figure(figsize=(13, 4.4))
+gs = GridSpec(1, 3, figure=fig, wspace=0.32)
 panels = [
     (X, COOL, f"data · co-crash {cc_data:.0%}"),
     (Z, plotting.PALETTE["green"], f"RBIG forward · |corr|={abs(np.corrcoef(Z[:,0],Z[:,1])[0,1]):.2f}"),
     (gen, WARM, f"RBIG sample · co-crash {cc_gen:.0%}"),
 ]
-for ax, (data, col, title) in zip(axes, panels):
-    ax.scatter(data[:, 0], data[:, 1], s=8, c=col, alpha=0.35, edgecolors="none")
-    ax.set_title(title, fontsize=11)
-    ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+for i, (data, col, title) in enumerate(panels):
+    jointplot(fig, gs[0, i], data, col, title, s=7)
 fig.tight_layout()
 plt.show()
 ```
