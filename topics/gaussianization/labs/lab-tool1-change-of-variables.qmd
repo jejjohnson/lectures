@@ -1,6 +1,6 @@
 ---
 title: "Tool 1 — The 1-D Transform"
-subtitle: "rank → Gaussian · invertibility by hand"
+subtitle: "rank → Gaussian · the change-of-variables round-trip"
 ---
 
 ```{python}
@@ -12,80 +12,287 @@ from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
 from lectures.gaussianization import gaussianize_1d
 plotting.set_style("notes")
 import numpy as np, matplotlib.pyplot as plt
-from scipy.stats import norm, rankdata
+from scipy.stats import norm
+import einx                      # linear algebra with the axes spelled out
+from jaxtyping import Float      # shape annotations: Float[Array, "n"]
+
+Array = np.ndarray
 ```
 
 *Learn-the-tool track · Lab 1 of 3.*
 
-The atom of Gaussianization: map one variable to a standard normal, and be able
-to map back.  You will build the transform by hand and confirm it is invertible.
+This lab walks the **single-variable building block** of Gaussianization — the map
+that turns one messy distribution (a *marginal*, the distribution of a single
+variable on its own) into a clean standard normal — up one ladder.  The *idea* —
+one transform, $z = \Phi^{-1}(F_X(x))$, and its exact inverse — stays fixed while
+the **data grows up under it**, from a toy whose density you know on paper to a real
+bank's nineteen-year return series.  At every rung we keep checking the one property
+the rest of the course is built on: the map **round-trips** — data → Gaussian →
+data — to machine precision (it returns the exact numbers you started with).
+
+**What you will produce:** a verified, exactly-invertible 1-D Gaussianizer, and the
+round-trip error on a real return marginal that proves a Gaussian scenario draw can
+be mapped *back* to a realistic return.
 
 ---
 
-## 1 · Build It from the Definition
+## 🧪 Rung 1 · Toy — Known Answer
 
-$T(x) = \Phi^{-1}(\hat F(x))$ — empirical CDF, then inverse Gaussian CDF.
+Start where the shape of the data is not in doubt.  Draw from an **exponential** —
+$x \sim \text{Exp}(\text{scale}=2)$, a sharply right-skewed distribution (a long
+tail on the right) whose CDF $F_X(x) = 1 - e^{-x/2}$ we know on paper — so every
+step of the transform has an answer we can check.
 
 ```{python}
 rng = np.random.default_rng(0)
-x = rng.exponential(scale=2.0, size=3000)
+x_toy: Float[Array, "n"] = rng.exponential(scale=2.0, size=3000)
+skew = ((x_toy - x_toy.mean()) ** 3).mean() / x_toy.std() ** 3   # γ₁ = E[(x−μ)³]/σ³
+print(f"x: {x_toy.shape}   exponential(scale=2)   skew ≈ {skew:+.2f}  (right-skewed)")
+```
 
-def my_gaussianize(v):
-    ranks = rankdata(v)
-    u = (ranks - 0.5) / len(v)      # empirical CDF (Blom offset)
-    return norm.ppf(u)
+**The algorithm — one transform, two named steps.**  Gaussianizing a marginal
+means first flattening the data to a uniform spread (the *probability integral
+transform*), then bending that uniform spread into a bell with an inverse Gaussian
+CDF.  Here $F_X$ is the cumulative distribution function — for a value $x$ it
+returns the fraction of the data at or below $x$:
 
-z = my_gaussianize(x)
-print(f"input  : mean={x.mean():.2f}  std={x.std():.2f}  skew≈{((x-x.mean())**3).mean()/x.std()**3:+.2f}")
-print(f"output : mean={z.mean():.2f}  std={z.std():.2f}  skew≈{((z-z.mean())**3).mean()/z.std()**3:+.2f}")
-print(f"matches lectures.gaussianize_1d? {np.allclose(z, gaussianize_1d(x))}")
+```
+u = F_X(x)        # data  → Uniform[0,1]   (probability integral transform)
+z = Φ⁻¹(u)        # Uniform → standard Gaussian
+```
+
+We do not know the true $F_X$ on real data, so we use the **empirical** CDF — just
+the rank of each point (its position in sorted order), with the small Blom offset
+$(\text{rank} - \tfrac12)/n$ so $u$ never lands exactly on $0$ or $1$.  That is
+exactly `gaussianize_1d`, the one function this whole lab reuses unchanged:
+
+```{python}
+z_toy: Float[Array, "n"] = gaussianize_1d(x_toy)   # z = Φ⁻¹( (rank(x) − ½)/n )
+print(f"input  : mean={x_toy.mean():+.2f}  std={x_toy.std():.2f}  "
+      f"skew={skew:+.2f}")
+print(f"output : mean={z_toy.mean():+.2f}  std={z_toy.std():.2f}  "
+      f"skew={((z_toy-z_toy.mean())**3).mean()/z_toy.std()**3:+.2f}  ← a clean 𝒩(0,1)")
+```
+
+Because the map is **monotone** (it preserves order — it never reshuffles the
+points), it is exactly invertible: send a Gaussian value back through $\Phi$ to
+recover $u$, then read off the data value that sits at that $u$ position in the
+sorted data (its empirical quantile).  This is the change-of-variables inverse, and
+it is the half of the tool the course actually puts to use later.
+
+```{python}
+def inverse_gaussianize(z: Float[Array, "n"], data: Float[Array, "n"]) -> Float[Array, "n"]:
+    """Map standard-Gaussian values back to data space — the inverse of gaussianize_1d.
+
+    u  = Φ(z)                                 [Gaussian CDF → Uniform[0,1]]
+    x  = Q̂_data(u)                            [empirical quantile of `data` at u]
+    Monotone ⇒ this undoes the forward rank→Gaussian map exactly.
+    """
+    s: Float[Array, "n"] = np.sort(data)                       # empirical quantile grid
+    grid: Float[Array, "n"] = (np.arange(len(s)) + 0.5) / len(s)   # Blom plotting positions
+    return np.interp(norm.cdf(z), grid, s)                     # Q̂_data(Φ(z))
+
+
+x_recon: Float[Array, "n"] = inverse_gaussianize(z_toy, x_toy)
+roundtrip_err = np.abs(x_recon - x_toy).max()
+print(f"max round-trip error  |x − inverse(forward(x))|  = {roundtrip_err:.2e}")
+print("→ recovered to machine precision: the transform loses no information")
+```
+
+```{python}
+#| label: fig-toy-roundtrip
+#| fig-cap: "The change-of-variables, one variable, three states. Left: the raw exponential — a sharp right-skewed pile. Middle: after u = F_X(x), the probability integral transform flattens it to a uniform slab. Right: after z = Φ⁻¹(u), the slab becomes a standard bell. The forward map is these two arrows; the inverse runs them backward and recovers the original sample to ~10⁻¹⁵, so no picture of the reconstruction is needed — it is the left panel exactly."
+from scipy.stats import rankdata
+u_toy: Float[Array, "n"] = (rankdata(x_toy) - 0.5) / x_toy.size   # u = F̂_X(x) ∈ (0,1)
+
+fig, (ax0, ax1, ax2) = plt.subplots(1, 3, figsize=(12.5, 3.8))
+ax0.hist(x_toy, bins=60, color=WARM, alpha=0.85, edgecolor="none")
+ax0.set_title("data  x ~ Exp(2)", fontsize=11); ax0.set_xlabel("x")
+ax1.hist(u_toy, bins=60, color=INK, alpha=0.7, edgecolor="none")
+ax1.set_title("u = F_X(x)   → Uniform", fontsize=11); ax1.set_xlabel("u")
+ax2.hist(z_toy, bins=60, color=COOL, alpha=0.85, edgecolor="none")
+ax2.set_title("z = Φ⁻¹(u)   → Gaussian", fontsize=11); ax2.set_xlabel("z")
+for ax in (ax0, ax1, ax2):
+    ax.set_yticks([]); despine(ax)
+fig.tight_layout(); plt.show()
+```
+
+The known answer holds on every count: the empirical CDF flattens the skew to a
+uniform, $\Phi^{-1}$ bends it into a bell, and running the two arrows backward
+returns the original numbers to $\sim 10^{-15}$.  **That round-trip is the whole
+contract** — everything above this rung only changes the data going in.
+
+---
+
+## 🎭 Rung 2 · Toy-Real — A Stylized Market
+
+The exponential never happens in markets; **fat tails** do — extreme moves show up
+far more often than a bell curve would predict.  `tail_dependent_pair()` is a
+simplified stand-in for that: a shared Student-$t$ shock drives two return series,
+giving each a heavy tail and making them crash together on the same bad days.  Take
+*one* of the two series — a single fat-tailed marginal — and run the **same**
+`gaussianize_1d` on it.  No new code: the tool that flattened a skew flattens a heavy
+tail just as cleanly, because it only ever cares about *ranks* (the order of the
+points), not their raw size.
+
+```{python}
+a, b = datasets.tail_dependent_pair(n=2000, seed=0)   # two fat-tailed, co-crashing legs
+x_fat: Float[Array, "n"] = a                          # one heavy-tailed marginal
+fat_kurt = ((x_fat - x_fat.mean()) ** 4).mean() / x_fat.std() ** 4 - 3.0   # γ₂ = E[(x−μ)⁴]/σ⁴ − 3
+print(f"fat marginal:  n={x_fat.size}   excess kurtosis ≈ {fat_kurt:+.1f}  "
+      f"(0 = Gaussian; large ⇒ heavy tails)")
+
+z_fat: Float[Array, "n"] = gaussianize_1d(x_fat)      # same transform, heavier input
+z_kurt = ((z_fat - z_fat.mean()) ** 4).mean() / z_fat.std() ** 4 - 3.0     # γ₂ after the transform
+print(f"after gaussianize_1d:  excess kurtosis ≈ {z_kurt:+.2f}  ← tail flattened to a bell")
+```
+
+```{python}
+#| label: fig-fat-gaussianize
+#| fig-cap: "A fat-tailed market marginal, before and after the same 1-D transform. Left: the raw heavy tail — a tall narrow peak with extreme values stranded far out (the co-crash days). Right: gaussianize_1d has pulled those extremes into a textbook 𝒩(0,1); the dashed curve is the standard normal density it now matches. The transform did not clip or winsorize anything — every point kept its rank — yet the heavy tail is gone."
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.0))
+axL.hist(x_fat, bins=80, density=True, color=CRASH, alpha=0.8, edgecolor="none")
+axL.set_title(f"raw fat-tailed marginal (excess kurt ≈ {fat_kurt:.0f})", fontsize=11)
+axL.set_xlabel("standardized return"); axL.set_ylabel("density"); despine(axL)
+
+grid: Float[Array, "n_grid"] = np.linspace(-4, 4, 400)
+axR.hist(z_fat, bins=60, density=True, color=COOL, alpha=0.8, edgecolor="none",
+         label="gaussianized")
+axR.plot(grid, norm.pdf(grid), color=INK, lw=2, ls="--", label="𝒩(0,1)")   # target density
+axR.set_title("after gaussianize_1d — a clean bell", fontsize=11)
+axR.set_xlabel("z"); axR.legend(fontsize=9, frameon=False); despine(axR)
+fig.tight_layout(); plt.show()
+```
+
+Same one-liner, heavier input, identical result: a standard normal.  And the round
+trip survives the fat tail untouched — running the transform forward and then back
+recovers every extreme day exactly, which is precisely what a scenario generator
+that respects tail risk will need.
+
+```{python}
+x_fat_recon: Float[Array, "n"] = inverse_gaussianize(z_fat, x_fat)
+print(f"fat-marginal round-trip error = {np.abs(x_fat_recon - x_fat).max():.2e}  "
+      f"(the extremes come back too)")
 ```
 
 ---
 
-## 2 · Invert It
+## 📈 Rung 3 · Real — The Full Basket
 
-Because the map is monotone, the inverse is the quantile function: send a Gaussian
-value through $\Phi$, then through the empirical quantile of the data.
+Now a real marginal.  Here is what we are checking: does the exact same transform
+flatten a genuine bank's return distribution into a standard normal, the way it did
+for the toy and the stylized market?  The key number to watch is the *excess
+kurtosis* — a measure of how heavy the tails are, where $0$ is a perfect bell and
+large positive values mean fat tails.  We want it to start large for raw JPM and
+drop to near $0$ afterward.
+
+We **reload** the prepared returns panel — there is no cleaning here; the prices →
+log-returns pipeline and the fat-tail story live in the data primer — display a
+corner of it, and run the *same* `gaussianize_1d` on JPM, whose heavy tail that
+primer documents in detail.
 
 ```{python}
-def my_inverse(zq, data):
-    s = np.sort(data)
-    grid = (np.arange(len(s)) + 0.5) / len(s)
-    return np.interp(norm.cdf(zq), grid, s)
-
-x_recon = my_inverse(z, x)
-print(f"max round-trip error: {np.abs(x_recon - x).max():.3e}")
+R = datasets.load_returns()                        # prepared 14-name daily panel
+print(f"{len(R)} trading days × {R.shape[1]} stocks   "
+      f"({R.index.min().date()} → {R.index.max().date()})")
+R.iloc[:3, :6].round(4)
 ```
 
 ```{python}
-#| label: fig-tool1-roundtrip
-#| fig-cap: "Forward then inverse returns the original values (points on the diagonal)."
-fig, ax = plt.subplots(figsize=(5.5, 5))
-ax.scatter(x, x_recon, s=8, c=COOL, alpha=0.4, edgecolors="none")
-lims = [x.min(), x.max()]
-ax.plot(lims, lims, c=INK, lw=1.5, ls="--")
-ax.set_xlabel("original x"); ax.set_ylabel("reconstructed x")
-ax.set_title("Round-trip is exact", fontsize=12)
-despine(ax)
-fig.tight_layout()
-plt.show()
+jpm: Float[Array, "n_days"] = R["JPM"].to_numpy()              # one real marginal
+jpm_kurt = ((jpm - jpm.mean()) ** 4).mean() / jpm.std() ** 4 - 3.0   # γ₂ = E[(x−μ)⁴]/σ⁴ − 3
+z_jpm: Float[Array, "n_days"] = gaussianize_1d(jpm)            # the exact same transform
+z_jpm_kurt = ((z_jpm - z_jpm.mean()) ** 4).mean() / z_jpm.std() ** 4 - 3.0   # γ₂ after the transform
+print(f"JPM daily returns:  excess kurtosis ≈ {jpm_kurt:+.1f}  (a fat real tail)")
+print(f"after gaussianize_1d:  excess kurtosis ≈ {z_jpm_kurt:+.2f}  ← flattened to 𝒩(0,1)")
 ```
 
-::: {.callout-tip}
-## What to Look for
-The reconstruction error is at the interpolation-grid level, not structural: the
-transform loses *no* information because it never changes the order of points.
+::: {.callout-note icon=false}
+## The Tail This Flattens
+JPM's return distribution is the canonical fat tail of this course: a peak twice as
+tall as a fitted bell and extremes out past $\pm 9$ standard deviations — its worst
+day a $-9.9\sigma$ move a Gaussian calls a once-in-$10^{22}$-days event.  That tail
+is built and counted in
+[Returns, Volatility & Fat Tails](../../data/02-returns-and-volatility.qmd); this
+lab reloads the prepared panel and never re-derives it.  Gaussianizing the marginal
+is exactly the operation that primer points forward to.
 :::
 
+```{python}
+#| label: fig-jpm-qq
+#| fig-cap: "JPM before and after, read through a quantile–quantile plot against the standard normal — the same diagnostic the fat-tails primer uses. Left (raw): the dots peel violently off the diagonal at both ends, the signature of the heavy tail; the worst day sits near −10 std. Right (gaussianized): after gaussianize_1d the dots lie on the diagonal — the marginal is now exactly normal by construction. The transform did not delete the crash days; it re-ranked them onto a Gaussian quantile grid, reversibly."
+n_days = jpm.size
+theo: Float[Array, "n_days"] = norm.ppf((np.arange(1, n_days + 1) - 0.5) / n_days)   # Φ⁻¹ at plotting positions
+z_raw: Float[Array, "n_days"] = (jpm - jpm.mean()) / jpm.std()                       # z-score of raw returns
+
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.2))
+axL.scatter(theo, np.sort(z_raw), s=6, c=CRASH, alpha=0.5, edgecolors="none")
+axL.plot([-4, 4], [-4, 4], color=INK, lw=1.2, ls="--")
+axL.set_xlim(-4, 4); axL.set_title("raw JPM — tails peel away", fontsize=11)
+axL.set_xlabel("standard-normal quantile"); axL.set_ylabel("return (std devs)"); despine(axL)
+
+axR.scatter(theo, np.sort(z_jpm), s=6, c=COOL, alpha=0.5, edgecolors="none")
+axR.plot([-4, 4], [-4, 4], color=INK, lw=1.2, ls="--")
+axR.set_xlim(-4, 4); axR.set_title("gaussianized JPM — on the line", fontsize=11)
+axR.set_xlabel("standard-normal quantile"); axR.set_ylabel("z"); despine(axR)
+fig.tight_layout(); plt.show()
+```
+
+The real marginal behaves exactly like the stylized one: a tail the primer measures
+at excess kurtosis $\approx 17$ collapses onto the Gaussian diagonal under the same
+unchanged transform.  Only the data escalated — the tool did not.
+
 ---
 
-## 3 · Your Turn
+## 💰 Rung 4 · Application — Why Exact Invertibility Matters
 
-- Gaussianize a real return series: `datasets.load_returns()["JPM"]`.  Does the
-  transform tame its fat tails?  Plot a histogram before and after.
-- A monotone map preserves *rank* correlation but not *Pearson* correlation.
-  Verify: Gaussianize both legs of a pair and compare Spearman (unchanged) to
-  Pearson (changed).
+The deliverable is the number the rest of the course leans on: the **round-trip
+error on the real marginal**.  We run JPM forward to Gaussian and then back again,
+and measure how far the reconstructed returns stray from the originals.  We want
+that largest gap to be essentially zero — proof that nothing was lost on the way
+out and back.
 
-Next: stack this with rotations — [Tool 2, RBIG](lab-tool2-rbig.qmd).
+```{python}
+z_jpm = gaussianize_1d(jpm)                          # data  → Gaussian
+jpm_recon: Float[Array, "n_days"] = inverse_gaussianize(z_jpm, jpm)   # Gaussian → data
+real_err = np.abs(jpm_recon - jpm).max()   # ‖x − x̂‖∞ = maxₜ |xₜ − x̂ₜ|   [return units]
+worst_day_idx = int(np.argmin(jpm))
+print(f"JPM round-trip max error          = {real_err:.2e}   (≈ 0 — machine precision)")
+print(f"worst real day  {jpm[worst_day_idx]:+.4f}  →  recovered  "
+      f"{jpm_recon[worst_day_idx]:+.4f}   (the crash comes back exactly)")
+```
+
+```{python}
+#| label: fig-roundtrip-real
+#| fig-cap: "The application deliverable: every real JPM return (x-axis) against its forward-then-inverse reconstruction (y-axis). All 4778 days sit on the diagonal — including the deep-crash days in the lower-left corner. This exact invertibility is the contract: a scenario generator can draw in the clean Gaussian space and the inverse map carries each draw back to a realistic return, crash days included, with no distortion."
+fig, ax = plt.subplots(figsize=(5.6, 5.2))
+ax.scatter(jpm, jpm_recon, s=8, c=COOL, alpha=0.4, edgecolors="none")
+lims = [jpm.min(), jpm.max()]
+ax.plot(lims, lims, c=INK, lw=1.5, ls="--")
+ax.scatter(jpm[worst_day_idx], jpm_recon[worst_day_idx], s=60, c=CRASH,
+           edgecolors="none", zorder=5, label="worst day")
+ax.set_xlabel("original JPM return"); ax.set_ylabel("reconstructed return")
+ax.set_title(f"Round-trip is exact  (max err {real_err:.0e})", fontsize=12)
+ax.legend(fontsize=9, frameon=False, loc="upper left"); despine(ax)
+annotate_box(ax, 0.04, 0.92, "data → Gaussian → data\nrecovers every day", ha="left")
+fig.tight_layout(); plt.show()
+```
+
+Why this matters, stated plainly.  Gaussianization is only useful if it runs
+**both ways**.  The forward map is for *measuring* — pull a messy marginal onto a
+standard normal so the clean Gaussian toolbox (correlations, random-draw simulation,
+the information measures of Tool 3) applies.  The **inverse** map is for
+*generating* — the later scenario engine draws fresh values in the tidy Gaussian
+space, where sampling is easy and the way the variables move together is just a plain
+covariance, then pushes each draw **back through $F_X^{-1}$** to land on a return
+with the real, fat-tailed shape.  A round-trip error of $\approx 0$ on a real
+marginal — crash day and all — is the proof that this backward step loses nothing: a
+Gaussian draw of $-3$ becomes a genuine JPM crash, not an impossible one.  That is
+what a single rank-Gaussian map buys you, and the whole reason it is the building
+block of everything above it.
+
+The single marginal is solved.  What it does **not** yet touch is the *dependence
+between* names — gaussianizing JPM and BAC one at a time still leaves them crashing
+together on the same days — and removing that is the job of the rotation step in
+[Tool 2 · RBIG](lab-tool2-rbig.qmd), which repeats this exact transform until the
+*whole vector* of stocks is jointly Gaussian.

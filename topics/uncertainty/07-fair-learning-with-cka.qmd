@@ -1,0 +1,528 @@
+---
+title: "Fair Learning with CKA"
+subtitle: "Same probabilistic net, one new term — make the prediction independent of a protected attribute"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, BAND, despine, annotate_box  # noqa: F401
+from lectures.measures import cka_linear, cka_rbf
+plotting.set_style("notes")
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import einx                      # linear algebra with the axes spelled out
+from jaxtyping import Float      # shape annotations: Float[Array, "n_obs"]
+
+Array = np.ndarray
+GREEN = plotting.PALETTE["green"]
+```
+
+```{python}
+#| echo: false
+import os
+os.environ["KERAS_BACKEND"] = "jax"          # set BEFORE importing keras — Keras 3 on the CPU JAX backend
+import keras
+from keras import layers
+import keras.ops as ops
+```
+
+The [previous note](06-probabilistic-nn-recipe.qmd) turned a network's one number
+into a **predictive band**: a Gaussian head $[\mu(x),\ \log\sigma^2(x)]$ trained by
+the negative log-likelihood, so the net reports a center $\mu(x)$ *and* the noise it
+predicts $\sigma(x)$, with a deep ensemble on top for the ignorance a single net
+cannot see.  That recipe is the whole starting point here — we change *nothing* about
+it.
+
+This note adds a **new requirement** to that same net.  Sometimes the prediction must
+**not depend on a protected attribute** $S$ — sex, race, age — no matter what proxies
+the features hide.  State it as a dependence-zero goal:
+
+$$
+\operatorname{Dep}\!\big(\mu(x),\ S\big) = 0 .
+$$
+
+We already own a bounded dependence measure built for exactly this — **CKA**, the
+centered kernel alignment from the [dependence chapter](../dependence/index.qmd), the
+same double-centering the distance-correlation ladder used.  There it *measured*
+dependence between two return series.  Here it does one new job: turned into a
+differentiable penalty, it **constrains** the probabilistic net so its center is
+independent of $S$.  The entire recipe is
+
+$$
+\underbrace{\operatorname{NLL}\big(y;\ \mu(x),\ \sigma(x)\big)}_{\text{the Note-06 net's loss — head }[\mu,\ \log\sigma^2]}
+\;+\;\underbrace{\lambda\cdot\operatorname{CKA}\!\big(\mu(x),\ S\big)}_{\text{one new term}} .
+$$
+
+**What this gives you:** a single extra loss term that makes any probabilistic net's
+prediction independent of $S$ — and, because the net is *probabilistic*, the price of
+that fairness shows up honestly as a **wider but still-calibrated band**.  When you
+forbid the model from using the $S$-signal, accuracy falls; a point net would just be
+quietly more wrong, but a net that predicts its own $\sigma(x)$ responds by **widening
+the band**, keeping coverage near its nominal $95\%$.  Fairness costs accuracy, and the
+probabilistic recipe makes that cost *visible*.
+
+## The Dependence-Zero Goal
+
+A prediction is **fair toward $S$** (in the demographic-parity sense) when knowing
+$\mu(x)$ tells you nothing about $S$ — the two are statistically independent.  Dropping
+$S$ from the inputs does **not** achieve this: a feature correlated with $S$ — a
+**proxy** — lets the network reconstruct it, so the prediction still leans on $S$
+through the back door.  We need to *measure* that residual dependence, and to catch the
+**nonlinear** part, because a linear check (Pearson) is fooled by a curved leak.
+
+So the new constraint sits entirely on the center $\mu(x)$: we want $\mu(x)$
+independent of $S$.  The width $\sigma(x)$ is left free — and that freedom is the
+point.  Forced to give up the $S$-signal, the net has two honest moves: shift $\mu$ off
+the part of the proxy that carries $S$, and **grow $\sigma$** to admit that it is now
+less sure.  The band absorbs the cost.
+
+## Measure the Dependence
+
+CKA is the right instrument because it is **bounded**: $\operatorname{CKA}\in[0,1]$,
+reading $0$ when $\mu(x)$ and $S$ are independent and $1$ when one determines the other.
+A bounded measure makes the penalty weight $\lambda$ interpretable.  And it is **not a
+new measure** — it is the distance-correlation transform with a kernel gram in place of
+the distance matrix.  The double-centering is *verbatim* the `centered_distances` step
+of the [distance-correlation lab](../dependence/labs/lab-tool1-ladder.qmd): same
+$\tilde M_{ij} = M_{ij} - \bar M_{i\cdot} - \bar M_{\cdot j} + \bar M_{\cdot\cdot}$,
+only a kernel similarity matrix going in instead of pairwise distances.  Spelled out
+with the axes visible, so the shared step is undeniable:
+
+```{python}
+#| label: cka-derivation
+def double_center(M: Float[Array, "n n"]) -> Float[Array, "n n"]:
+    """The dCor transform, verbatim: M̃ᵢⱼ = Mᵢⱼ − M̄ᵢ. − M̄.ⱼ + M̄..
+
+    Identical to `centered_distances` in the distance-correlation lab — only the
+    matrix going in differs (a kernel gram here, pairwise distances there).
+    """
+    row_mean = einx.mean("i j -> i", M)              # M̄ᵢ. — row means
+    col_mean = einx.mean("i j -> j", M)              # M̄.ⱼ — column means
+
+    A = einx.subtract("i j, i -> i j", M, row_mean)
+    A = einx.subtract("i j, j -> i j", A, col_mean)
+
+    return A + M.mean()                              # add back the grand mean M̄..
+
+
+def cka_demo(x: Float[Array, "n"], y: Float[Array, "n"]) -> float:
+    """CKA = ⟨K̃ₓ, K̃ᵧ⟩ / √(⟨K̃ₓ,K̃ₓ⟩⟨K̃ᵧ,K̃ᵧ⟩) — normalised, double-centred gram alignment."""
+    Kx: Float[Array, "n n"] = einx.dot("i, j -> i j", x, x)   # linear gram ⟨xᵢ, xⱼ⟩
+    Ky: Float[Array, "n n"] = einx.dot("i, j -> i j", y, y)   # linear gram ⟨yᵢ, yⱼ⟩
+
+    Kxc, Kyc = double_center(Kx), double_center(Ky)  # the SAME centering as dCor
+    hsic = lambda A, B: float((A * B).mean())         # ⟨Ã, B̃⟩ — the dependence inner product
+
+    return hsic(Kxc, Kyc) / np.sqrt(hsic(Kxc, Kxc) * hsic(Kyc, Kyc))
+```
+
+That is the *linear* CKA.  The penalty we train with uses an **RBF** kernel — the same
+kernel the distance ladder used to see curves — so it catches a nonlinear leak a linear
+check misses.  The library's `cka_rbf` is that version; it reads $0$ under independence
+and $1$ under a deterministic link, and our hand-rolled linear `cka_demo` matches the
+library's `cka_linear` exactly:
+
+```{python}
+#| label: cka-check
+rng = np.random.default_rng(0)
+u: Float[Array, "n"] = rng.standard_normal(400)
+v: Float[Array, "n"] = 0.8 * u + 0.4 * rng.standard_normal(400)   # depends on u
+w: Float[Array, "n"] = rng.standard_normal(400)                   # independent of u
+
+print(f"hand-rolled cka_demo(u, v) = {cka_demo(u, v):.4f}   (double-centred gram alignment)")
+print(f"library  cka_linear(u, v)  = {cka_linear(u, v):.4f}   (identical)")
+print(f"library  cka_rbf(u, v)     = {cka_rbf(u, v):.4f}   (dependent → away from 0)")
+print(f"library  cka_rbf(u, w)     = {cka_rbf(u, w):.4f}   (independent → near 0)")
+```
+
+## The Extended Loss — A Fair Probabilistic Net
+
+Now layer the constraint onto the Note-06 net.  Keep the Gaussian head and its NLL
+exactly as they were; add the dependence penalty to the loss:
+
+$$
+\mathcal L(\theta)
+= \underbrace{-\tfrac1n\sum_i \log\mathcal N\!\big(y_i;\ \mu(x_i),\ \sigma^2(x_i)\big)}_{\text{Note-06 Gaussian NLL — the predictive band}}
+\;+\;\lambda\cdot\underbrace{\operatorname{CKA}\!\big(\mu(x),\ S\big)}_{\text{the new fairness term}} .
+$$
+
+Fair learning has one rule it never breaks, and it is the whole reason this is honest:
+**the sensitive variable $S$ never enters the model — it shapes only the loss.**  The
+deployed network takes features alone; $S$ reaches the optimiser through the penalty but
+never the inputs.  Three pieces build it:
+
+1. the **Note-06 net** — `Dense(48, tanh) → Dense(48, tanh) → Dense(2)`, the head
+   $[\mu,\ \log\sigma^2]$, trained by `gaussian_nll`;
+2. the **penalty** $\operatorname{CKA}(\mu, S)$ computed *in-graph* (RBF kernel) so it is
+   differentiable — the same `cka_in_graph` the [fairness lab](../fairness/labs/lab-tool2-cka-penalty.qmd) uses;
+3. the **total loss** $= \text{Gaussian NLL} + \lambda\cdot\operatorname{CKA}(\mu, S)$,
+   added with `add_loss` during training, $S$ arriving as `q` in a `{"x", "q"}` dict.
+
+```{python}
+#| label: fair-prob-net
+def gaussian_nll(y_true, y_pred):
+    """−log 𝒩(y; μ, σ²) up to a constant,  head = [μ, log σ²]  (verbatim from Note 06).
+
+    L = ½·(log σ² + (y−μ)²/σ²) — the predictive-band loss; nothing about it changes.
+    """
+    mu = y_pred[:, :1]                           # μ(x)        [y units]
+    log_var = y_pred[:, 1:2]                      # log σ²(x)   [log y² units]
+
+    return ops.mean(0.5 * (log_var + (y_true - mu) ** 2 / ops.exp(log_var)))
+
+
+def cka_in_graph(pred: Float[Array, "n 1"], s: Float[Array, "n 1"]):
+    """RBF CKA(μ, S) in keras.ops so gradients flow — the SAME kernel the fairness lab
+    and `keras-fairkl` use, so the penalty here closes the same nonlinear leak."""
+    def rbf(z: Float[Array, "n 1"]) -> Float[Array, "n n"]:
+        z = ops.reshape(z, (-1, 1))
+        d2 = (z - ops.transpose(z)) ** 2                       # (zᵢ − zⱼ)²   pairwise
+        return ops.exp(-d2 / (2.0 * (ops.median(d2) + 1e-12)))  # Kᵢⱼ = exp(−(zᵢ−zⱼ)² / 2σ²)
+
+    def dc(M: Float[Array, "n n"]) -> Float[Array, "n n"]:      # double-centre, in-graph
+        return (M - ops.mean(M, 0, keepdims=True)
+                  - ops.mean(M, 1, keepdims=True) + ops.mean(M))
+
+    A, B = dc(rbf(pred)), dc(rbf(s))                           # centred RBF grams
+    h = lambda P, Q: ops.mean(P * Q)                            # ⟨P̃, Q̃⟩
+
+    return h(A, B) / ops.sqrt(h(A, A) * h(B, B) + 1e-12)
+
+
+class FairProbNet(keras.Model):
+    """The Note-06 probabilistic net + one CKA penalty on its center μ.
+
+    The body is the recipe's MLP with a Gaussian head [μ, log σ²]; the only addition
+    is `add_loss(λ·CKA(μ, S))`.  S arrives as `q` and touches the loss alone — never
+    the inputs, so the deployed net predicts from features only.
+    """
+    def __init__(self, lam: float, seed: int = 0):
+        super().__init__()
+        keras.utils.set_random_seed(seed)                      # reproducible init
+        self.h1 = layers.Dense(48, activation="tanh")
+        self.h2 = layers.Dense(48, activation="tanh")
+        self.head = layers.Dense(2)                            # head = [μ, log σ²]
+        self.lam = lam                                         # λ — the fairness weight
+
+    def call(self, inputs, training=False):
+        x, s = inputs["x"], inputs["q"]                        # x = features (+proxy);  q = S
+        pred = self.head(self.h2(self.h1(x)))                  # the model sees FEATURES ONLY
+        if training and self.lam > 0:
+            self.add_loss(self.lam * cka_in_graph(pred[:, :1], s))   # λ·CKA(μ, S) — S in the loss only
+        return pred
+```
+
+The class is the Note-06 network move for move; the three new lines are the `lam`
+field, the `cka_in_graph` penalty, and the `add_loss` call.  Everything that made the
+band breathe — the two-output head, the Gaussian NLL, the predicted $\sigma(x)$ — is
+untouched.
+
+## Toy — The Price of Fairness, Made Visible
+
+Build the leak the same way the fairness lab does.  `datasets.fair_regression` gives a
+target that bends with $S$ both linearly and through a curve; we hand the model a clean
+feature `x` plus a **proxy** $\text{proxy} = S + 0.3\,\varepsilon$ — correlated with $S$
+the way `occupation` carries `sex` — and **drop $S$ itself**.  A plain net leans on the
+proxy, so its $\mu$ tracks $S$.
+
+```{python}
+#| label: toy-data
+d = datasets.fair_regression(n=600, seed=0)
+x: Float[Array, "n"] = d["x"]                       # legitimate feature (clean of S)
+S: Float[Array, "n"] = d["s"]                       # protected attribute — NEVER an input
+y: Float[Array, "n"] = d["y"]                       # target (bends with S, linearly + curvily)
+
+rng = np.random.default_rng(1)
+proxy: Float[Array, "n"] = S + 0.3 * rng.standard_normal(len(S))   # corr(proxy, S) ≈ 0.96
+
+Xf: Float[Array, "n 2"] = np.column_stack([x, proxy]).astype("float32")   # features: x + proxy. NO S.
+Sc: Float[Array, "n 1"] = S[:, None].astype("float32")                     # S — handed to the loss as q
+Y: Float[Array, "n 1"] = y[:, None].astype("float32")
+
+print(f"n={len(S)}   corr(proxy, S) = {np.corrcoef(proxy, S)[0, 1]:.2f}   (the leak channel)")
+```
+
+Train the **same** `FairProbNet` across a sweep of $\lambda$ — off, mild, strong — on the
+identical leaking features.  At each setting read four numbers: the dependence
+$\operatorname{CKA}(\mu, S)$, the accuracy (RMSE of $\mu$ against the target), the
+predicted width $\hat\sigma$, and the $95\%$ coverage the band actually delivers.
+
+```{python}
+#| label: toy-sweep-compute
+# μ depends on x AND the proxy — to draw a clean μ(S) band, sweep S through the proxy
+# channel with the legitimate feature x held at its mean.
+s_grid: Float[Array, "g"] = np.linspace(S.min(), S.max(), 200)
+X_grid: Float[Array, "g 2"] = np.column_stack(
+    [np.full_like(s_grid, x.mean()), s_grid]).astype("float32")   # x = mean, proxy = S-grid
+q_grid: Float[Array, "g 1"] = s_grid[:, None].astype("float32")
+
+
+def fit_fair_prob(lam: float) -> dict:
+    """Train the Note-06 net + λ·CKA(μ, S); return diagnostics + a clean μ(S) curve."""
+    model = FairProbNet(lam, seed=0)
+    model.compile(optimizer=keras.optimizers.Adam(0.01), loss=gaussian_nll)
+    model.fit({"x": Xf, "q": Sc}, Y, epochs=150, batch_size=128, verbose=0)
+
+    pred: Float[Array, "n 2"] = np.asarray(model.predict({"x": Xf, "q": Sc}, verbose=0))
+    mu: Float[Array, "n"] = pred[:, 0]                          # μ(x) — the center
+    sigma: Float[Array, "n"] = np.exp(0.5 * pred[:, 1])         # σ(x) = exp(½·log σ²)
+
+    grid: Float[Array, "g 2"] = np.asarray(model.predict({"x": X_grid, "q": q_grid}, verbose=0))
+    return {
+        "mu": mu,
+        "sigma": sigma,
+        "grid_mu": grid[:, 0],                                  # smooth μ over the S-grid
+        "grid_sig": np.exp(0.5 * grid[:, 1]),                   # smooth σ over the S-grid
+        "cka": cka_rbf(mu, S),                                  # dependence on S
+        "rmse": float(np.sqrt(np.mean((mu - y) ** 2))),         # accuracy cost
+        "sigma_hat": float(sigma.mean()),                      # mean predicted width
+        "cov95": float(np.mean(np.abs(y - mu) <= 1.96 * sigma)),  # 95% band coverage
+    }
+
+
+sweep = [0.0, 2.0, 8.0]
+runs = {lam: fit_fair_prob(lam) for lam in sweep}
+
+print(f"{'λ':>5}  {'CKA(μ,S)':>9}  {'RMSE':>6}  {'σ̂':>6}  {'95% cov':>8}")
+print("-" * 42)
+for lam in sweep:
+    r = runs[lam]
+    note = "  ← unfair, tight band" if lam == 0 else ("  ← fair, band widened" if lam == sweep[-1] else "")
+    print(f"{lam:>5g}  {r['cka']:>9.3f}  {r['rmse']:>6.2f}  {r['sigma_hat']:>6.2f}  {r['cov95']:>8.2f}{note}")
+```
+
+Read the table top to bottom and the whole note is in it.  As $\lambda$ rises,
+$\operatorname{CKA}(\mu, S)$ collapses toward zero — the prediction becomes
+**independent of $S$**.  RMSE rises — that is the **accuracy cost** of giving up the
+$S$-signal.  And $\hat\sigma$ **grows** in step, so the $95\%$ coverage stays put: the
+probabilistic net, denied the signal, does not pretend — it **widens its band** and
+stays honest.
+
+```{python}
+#| label: fig-toy-bands
+#| fig-cap: "The price of fairness, drawn as a band. Both panels are the same probabilistic net on the same leaking data, plotted against the protected attribute S. Left (λ=0): the net leans on the proxy, so μ bends with S in a clear U-shape — the prediction depends on S (CKA high) — and the band is tight. Right (λ=8): the CKA penalty severs μ from S — the center is flat in S, the dependence near zero — but the net has lost the S-signal, so it honestly widens σ̂ to stay calibrated. Narrower-but-unfair becomes wider-but-fair-and-still-covered; the extra width is exactly the cost of neutrality, and the band makes it visible."
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11.5, 4.2), sharey=True)
+for ax, lam, col in [(axL, 0.0, COOL), (axR, 8.0, GREEN)]:
+    r = runs[lam]
+    ax.fill_between(s_grid, r["grid_mu"] - 1.96 * r["grid_sig"], r["grid_mu"] + 1.96 * r["grid_sig"],
+                    color=col, alpha=0.30, label="μ ± 2σ̂(x)")
+    ax.scatter(S, y, s=10, c=INK, alpha=0.30, edgecolors="none", label="data")
+    ax.plot(s_grid, r["grid_mu"], c=INK, lw=2, label="μ(x)")
+    tag = "plain (λ=0)" if lam == 0 else "CKA penalty (λ=8)"
+    ax.set_title(f"{tag} · CKA(μ,S)={r['cka']:.2f} · σ̂={r['sigma_hat']:.2f} · cov={r['cov95']:.0%}",
+                 fontsize=10.5)
+    ax.set_xlabel("protected attribute  S")
+    despine(ax)
+
+axL.set_ylabel("prediction  μ ± band")
+axL.legend(fontsize=9, frameon=False, loc="upper center")
+fig.tight_layout()
+plt.show()
+```
+
+The left band tracks $S$ — accurate but unfair.  The right band is **flat in $S$** —
+fair — and *wider*, the net admitting through $\sigma(x)$ that it is now less certain.
+Coverage stays near $95\%$ in both panels.  A point net forced to be fair would simply
+be more wrong, silently; the probabilistic recipe converts that silence into an honest,
+calibrated width.  **That is the deliverable: fairness has a price, and the band quotes
+it.**
+
+## The Recipe Carries Over
+
+Nothing above was special to the Gaussian head.  The CKA penalty constrains $\mu(x)$;
+*which* uncertainty recipe produces $\mu$ — the Gaussian head, the Student-t head, or a
+deep ensemble of either — is orthogonal.  Swap the likelihood and the penalty rides
+along unchanged.  The Student-t head from Note 06 takes it verbatim:
+
+```{python}
+#| label: student-carryover-compute
+NU = 4.0                                          # ν = degrees of freedom (heavy tails)
+
+
+def student_t_nll(y_true, y_pred):
+    """−log t_ν(y; μ, σ) up to a constant,  ν=4,  head = [μ, log σ²]  (verbatim from Note 06)."""
+    mu = y_pred[:, :1]                            # μ(x)
+    log_sig = 0.5 * y_pred[:, 1:2]                # log σ(x) = ½·log σ²
+
+    z = (y_true - mu) / ops.exp(log_sig)          # standardized residual z = (y−μ)/σ
+
+    return ops.mean(log_sig + 0.5 * (NU + 1.0) * ops.log(1.0 + z ** 2 / NU))
+
+
+stud = FairProbNet(8.0, seed=0)                   # the SAME class — only the loss differs
+stud.compile(optimizer=keras.optimizers.Adam(0.01), loss=student_t_nll)
+stud.fit({"x": Xf, "q": Sc}, Y, epochs=150, batch_size=128, verbose=0)
+
+pred_t: Float[Array, "n 2"] = np.asarray(stud.predict({"x": Xf, "q": Sc}, verbose=0))
+mu_t: Float[Array, "n"] = pred_t[:, 0]
+
+print(f"Student-t head + λ·CKA(μ, S):  CKA(μ,S) = {cka_rbf(mu_t, S):.3f}   ← penalty fair on the t head too")
+print(f"(compare Gaussian head, λ=8:   CKA(μ,S) = {runs[8.0]['cka']:.3f})")
+```
+
+The penalty drives the t-head's $\operatorname{CKA}(\mu, S)$ to zero just as it did the
+Gaussian head's — same one new term, a different likelihood underneath.  The deep
+**ensemble** is the same story one level up: train $M$ fair members, each a
+`FairProbNet` with the penalty, and the committee's spread still reports epistemic
+doubt — fairness and the uncertainty recipe compose freely.  We use exactly that
+ensemble on the real data next.
+
+## Real Example — Income Predictions That Leak Sex
+
+Now the real panel, with the full recipe: a **deep ensemble of probabilistic
+classifiers**, each carrying the CKA penalty.  We **reload** the prepared US-Census
+income data — the ACS decode, the `income_high` target, and the protected `sex` are
+built once in [The Income & Fairness Dataset](../data/06-the-credit-dataset.qmd) — split
+it into $(X, y, s)$ with `sex` **dropped**.  Even gone, `occupation` leaks it.  The one
+local step is one-hot encoding the categoricals, since the model needs numbers:
+
+```{python}
+#| label: real-load
+credit = datasets.load_credit()
+y_r: Float[Array, "n"] = credit["income_high"].to_numpy().astype(float)   # target: 1 if income > $50k
+s_r: Float[Array, "n"] = credit["sex"].to_numpy().astype(float)           # protected: 1 = male
+X_r = credit.drop(columns=["income_high", "sex"])      # proxies — sex DROPPED
+
+# the only local step: one-hot the categoricals, then standardize for the fit
+X_enc = pd.get_dummies(X_r, columns=["occupation", "marital"], drop_first=True).to_numpy().astype(float)
+X_z: Float[Array, "n d"] = ((X_enc - X_enc.mean(0)) / (X_enc.std(0) + 1e-9)).astype("float32")   # z-score
+s_col: Float[Array, "n 1"] = s_r[:, None].astype("float32")
+y_col: Float[Array, "n 1"] = y_r[:, None].astype("float32")
+
+print(f"{len(credit):,} rows · X columns (sex dropped): {list(X_r.columns)}")
+print(f"encoded proxy matrix: {X_z.shape}")
+```
+
+::: {.callout-note icon=false}
+## Where This Data Comes From
+The ACS decode, the `income_high` target, the protected `sex` attribute, and the proxy
+leak through `occupation` are built and owned **once** in
+[The Income & Fairness Dataset](../data/06-the-credit-dataset.qmd).  This note reloads
+that prepared `(X, y, s)` and never re-derives it; the only local step is one-hot
+encoding the categoricals, as that page's contract allows.
+:::
+
+The members are probabilistic classifiers — each outputs $P(\text{high income})$, and
+the **spread across the committee is the epistemic uncertainty**, exactly the Note-06
+ensemble move.  The penalty acts on each member's probability, so the committee's center
+is driven independent of `sex`.  CKA builds an $n\times n$ gram, so we read dependence on
+a ~2000-row subsample; the group gap is read on the full panel:
+
+```{python}
+#| label: real-ensemble-compute
+class FairProbClf(keras.Model):
+    """One probabilistic classifier member: P(high income) + λ·CKA(P, sex).
+
+    Same shape as `FairProbNet` — a body, a head, and the one CKA penalty — only the
+    head is a sigmoid P(·) and the loss is cross-entropy.  `cka_in_graph` is reused
+    unchanged: gradients flow through the probability output just as through μ.
+    """
+    def __init__(self, lam: float, seed: int):
+        super().__init__()
+        keras.utils.set_random_seed(seed)
+        self.h1 = layers.Dense(32, activation="tanh")
+        self.h2 = layers.Dense(16, activation="tanh")
+        self.out = layers.Dense(1, activation="sigmoid")        # P(high income | proxies)
+        self.lam = lam
+
+    def call(self, inputs, training=False):
+        x, s = inputs["x"], inputs["q"]                         # x = proxies;  q = sex
+        p = self.out(self.h2(self.h1(x)))                       # the model sees PROXIES ONLY
+        if training and self.lam > 0:
+            self.add_loss(self.lam * cka_in_graph(p, s))        # λ·CKA(P, sex) — sex in the loss only
+        return p
+
+
+M = 3                                                          # committee size (deep ensemble)
+N_FIT = 2000                                                   # rows each member trains on (modest, for speed)
+rng_e = np.random.default_rng(0)
+idx: Float[Array, "k"] = rng_e.choice(len(y_r), 2000, replace=False)   # subsample for the O(n²) CKA
+
+
+def train_ensemble(lam: float) -> Float[Array, "m n"]:
+    """M fair probabilistic classifiers on bootstrap resamples; stack their P(·) on the full panel."""
+    preds = []
+    for seed in range(M):
+        boot: Float[Array, "f"] = rng_e.integers(0, len(y_r), N_FIT)   # bootstrap resample (subset, for speed)
+        clf = FairProbClf(lam, seed=seed)
+        clf.compile(optimizer=keras.optimizers.Adam(0.005), loss="binary_crossentropy")
+        clf.fit({"x": X_z[boot], "q": s_col[boot]}, y_col[boot],
+                epochs=30, batch_size=256, verbose=0)            # minibatch SGD — CKA gram is batch², not n²
+        preds.append(np.asarray(clf.predict({"x": X_z, "q": s_col}, verbose=0))[:, 0])   # predict on ALL rows
+    return np.stack(preds)
+
+
+def group_gap(p: Float[Array, "n"]) -> float:
+    """Demographic-parity gap: mean prediction for men − for women."""
+    return float(p[s_r == 1].mean() - p[s_r == 0].mean())     # P̄(male) − P̄(female)
+
+
+ens = {lam: train_ensemble(lam) for lam in (0.0, 8.0)}
+
+print(f"{'':18}{'accuracy':>9}  {'group gap':>10}  {'CKA(P,sex)':>11}  {'epistemic σ':>12}")
+print("-" * 66)
+results = {}
+for lam in (0.0, 8.0):
+    P: Float[Array, "m n"] = ens[lam]
+    p_bar: Float[Array, "n"] = einx.mean("m n -> n", P)        # committee center = mean_m P_m
+    sigma_epi: Float[Array, "n"] = np.sqrt(einx.var("m n -> n", P))   # epistemic σ = spread of members
+    acc = float(((p_bar > 0.5).astype(int) == y_r).mean())
+    results[lam] = (p_bar, sigma_epi, acc)
+    tag = "plain (λ=0)" if lam == 0 else "CKA penalty (λ=8)"
+    print(f"{tag:18}{acc:>9.3f}  {group_gap(p_bar):>+10.3f}  {cka_rbf(p_bar[idx], s_r[idx]):>11.3f}  {sigma_epi.mean():>12.3f}")
+```
+
+```{python}
+#| label: fig-real-gap
+#| fig-cap: "The group gap in real income predictions, before and after the penalty. Each panel shows the committee-mean predicted high-income probability for women (warm) and men (cool). Left: the plain ensemble — even with sex dropped, the male distribution sits visibly to the right, the proxy leak (chiefly through occupation) reproducing the real group gap, and CKA(P, sex) reads high. Right: the penalised ensemble — the two distributions align, the gap closed, the prediction no longer a proxy for sex — and the committee still reports honest epistemic spread (printed above), so neutrality did not cost the uncertainty estimate."
+p_plain, _, acc_plain = results[0.0]
+p_fair, _, acc_fair = results[8.0]
+
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.0), sharex=True, sharey=True)
+bins: Float[Array, "b"] = np.linspace(0, 1, 31)
+for ax, p, ttl, acc in [(axL, p_plain, "plain ensemble", acc_plain),
+                        (axR, p_fair, "CKA penalty (λ=8)", acc_fair)]:
+    ax.hist(p[s_r == 0], bins=bins, color=WARM, alpha=0.55, density=True, label="women")
+    ax.hist(p[s_r == 1], bins=bins, color=COOL, alpha=0.55, density=True, label="men")
+    ax.axvline(p[s_r == 0].mean(), color=WARM, lw=2)
+    ax.axvline(p[s_r == 1].mean(), color=COOL, lw=2)
+    ax.set_title(f"{ttl} · gap={group_gap(p):+.2f} · acc={acc:.2f}", fontsize=11)
+    ax.set_xlabel("committee-mean  P(high income)")
+    despine(ax)
+
+axL.set_ylabel("density")
+axL.legend(fontsize=9, frameon=False, loc="upper right")
+fig.tight_layout()
+plt.show()
+```
+
+The same one new term that erased a toy curve now shrinks a **real** group gap.  The
+plain ensemble carries a sizeable parity gap — the very gap the
+[primer documents](../data/06-the-credit-dataset.qmd), surviving even with `sex` dropped
+because `occupation` leaks it — and CKA detects that the committee center depends on sex.
+Add $\lambda\cdot\operatorname{CKA}(P, \text{sex})$ and the dependence falls toward zero,
+the two group distributions align, the gap closes — at a few points of accuracy — and the
+ensemble still reports its honest epistemic spread.  The probabilistic recipe survived
+the constraint intact.
+
+## Close
+
+The dependence machinery never changed.  CKA — built on the double-centering of the
+distance-correlation ladder — *measured* dependence between return series in the
+[dependence chapter](../dependence/index.qmd); here the same bounded measure
+**constrained the probabilistic network**, forcing its prediction independent of a
+protected attribute with one extra loss term.  And because the net was the Note-06
+probabilistic recipe, the price of that fairness did not vanish into a quietly-wronger
+point estimate — it surfaced as a **wider, still-calibrated band**.  Measure and
+constrain are one operation read in two directions.
+
+The finance twin is immediate: a prediction forced **independent of a protected
+attribute** is the same construction as a portfolio forced **market-neutral** or
+**beta-neutral** — strip out the factor you are not allowed to bet on, and price what the
+neutrality costs.  For the full treatment — the drop-and-leak failure, the end-to-end
+neutralisation, and the accuracy–fairness frontier — see the
+[fair learning chapter](../fairness/index.qmd).

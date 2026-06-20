@@ -12,6 +12,10 @@ from lectures.plotting import INK, COOL, WARM, CRASH, BAND, GRID, PANEL, despine
 plotting.set_style("notes")
 import numpy as np, matplotlib.pyplot as plt
 from matplotlib.patches import FancyBboxPatch
+import einx                      # linear algebra with the axes spelled out
+from jaxtyping import Float      # shape annotations: Float[Array, "n_days"]
+
+Array = np.ndarray
 R = datasets.load_returns()
 ```
 
@@ -35,15 +39,19 @@ at a time down a series and you get a *matrix*: each row is a window, each colum
 position **within** the window.  One sample is now a `w`-vector.
 
 ```{python}
-def windows(series, w):
-    """Sliding w-day patches of a 1-D series -> (n - w + 1, w) matrix."""
-    s = np.asarray(series, dtype=float)
+def windows(series: Float[Array, "n_days"], w: int) -> Float[Array, "n_windows w"]:
+    """Sliding w-day patches of a 1-D series → (n − w + 1, w) matrix.
+
+    patch:  Pᵢ = (sᵢ, sᵢ₊₁, …, sᵢ₊w₋₁)   — row i is the window starting on day i.
+    """
+    s: Float[Array, "n_days"] = np.asarray(series, dtype=float)
     if w <= 1:
         return s.reshape(-1, 1)
+    # sliding_window_view is a no-copy view of shape (n − w + 1, w)
     return np.lib.stride_tricks.sliding_window_view(s, w)
 
-jpm = R["JPM"].to_numpy()
-P = windows(jpm, 3)
+jpm: Float[Array, "n_days"] = R["JPM"].to_numpy()
+P: Float[Array, "n_windows w"] = windows(jpm, 3)
 print(f"JPM returns: {jpm.shape[0]} days")
 print(f"windows(JPM, w=3): shape {P.shape}   (each row is a 3-day vector)")
 print("first three patches:")
@@ -60,6 +68,51 @@ That overlap is not a bug: it is exactly the *redundancy across time* a window i
 meant to expose.  We return to it in §4 and §6.
 :::
 
+### 1.1 · Two Ways to Place the Window: Causal vs Symmetric
+
+A window of a *single* series turns the question "how does today relate to its own
+recent past?" into a measurable block.  But *which* days you put in the window is a
+modelling choice with a direction.  A **causal** (past-only) window ends on day `t`
+and looks backward — `[s_{t-2}, s_{t-1}, s_t]` — so every feature is known *before*
+the present.  A **symmetric** window centres on day `t` and peeks both ways —
+`[s_{t-1}, s_t, s_{t+1}]` — which uses the future and is therefore off-limits for
+forecasting, but fine for *describing* structure after the fact.
+
+Both fall straight out of the same `windows()` helper: a `w=3` patch matrix already
+*is* the causal block (row `i` ends on day `i+2`); shifting the index two days to the
+left re-centres the very same rows into the symmetric block.
+
+```{python}
+s: Float[Array, "n_days"] = R["JPM"].to_numpy()    # one stationary-ish series: JPM returns
+W: Float[Array, "n_windows w"] = windows(s, 3)     # every 3-day patch, row i = days (i, i+1, i+2)
+
+# Causal:    a row ending on day t  -> [s_{t-2}, s_{t-1}, s_t]
+# Symmetric: a row centred on day t -> [s_{t-1}, s_t, s_{t+1}]
+# These are the SAME rows of W, just labelled by a different anchor day t.
+causal:    Float[Array, "n_windows w"] = W         # row i is causal for t = i + 2
+symmetric: Float[Array, "n_windows w"] = W         # row i is symmetric for t = i + 1
+
+print("causal block  [s_{t-2}, s_{t-1}, s_t]   (past-only, ends on t):")
+print(np.round(causal[:4], 4))
+print("\nsymmetric block [s_{t-1}, s_t, s_{t+1}]  (centred, peeks ahead):")
+print(np.round(symmetric[:4], 4))
+print(f"\nboth blocks: shape {W.shape}   columns = window positions, rows = anchor days")
+```
+
+The two blocks hold identical numbers; only the *anchor day* `t` each row stands for
+moves.  That is the whole point — and the raw material the labs reuse to ask whether
+a measure of within-window structure even *notices* the difference.
+
+::: {.callout-note icon=false}
+## Why Both, Side by Side
+A causal window is what a forecaster is *allowed* to see; a symmetric window is what
+a describer *would* see with hindsight.  Some statistics on these blocks care which
+one you used (a forecast's error, a directional/Granger test); others — like
+**total correlation**, which is a function of the *set* of positions and blind to
+their order — do not.  This chapter only *builds* the two blocks; the labs run the
+order-invariant measure on them.
+:::
+
 ## 2 · Seeing the Window Slide
 
 The clearest way to understand patching is to watch the window move.  Here is a
@@ -69,7 +122,7 @@ shifted one day from the last.
 ```{python}
 #| label: fig-patch-slide
 #| fig-cap: "Three consecutive 10-day windows on the JPM return series, each one day to the right of the last. Patching slides this box down the whole series, stacking every position into a row of the patch matrix."
-seg = jpm[60:120]
+seg: Float[Array, "n_seg"] = jpm[60:120]
 t = np.arange(seg.size)
 fig, ax = plt.subplots(figsize=(9.5, 4.0))
 ax.plot(t, seg, color=COOL, lw=1.4, marker="o", ms=3)
@@ -99,9 +152,9 @@ many large days bunch together — volatility clusters.
 ```{python}
 #| label: fig-patch-matrix
 #| fig-cap: "The |returns| patch matrix for JPM (w=21), 250 windows spanning the 2008–09 financial crisis. Each row is a 21-day window. A single turbulent day appears in 21 successive windows at a sliding position, so it draws a diagonal streak — the signature of the overlap between neighbouring windows. Where streaks bunch into bright regions, volatility is clustering (here, the crisis itself); dark stretches are calm."
-A = np.abs(jpm)
+A: Float[Array, "n_days"] = np.abs(jpm)
 start = R.index.searchsorted("2008-09-01")     # anchor on the 2008 crisis
-M = windows(A, 21)[start:start + 250]
+M: Float[Array, "n_windows w"] = windows(A, 21)[start:start + 250]   # 250 patches × 21 positions
 fig, ax = plt.subplots(figsize=(9, 4.6))
 im = ax.imshow(M, aspect="auto", cmap="magma", interpolation="nearest")
 ax.set_xlabel("position within window  (day 0 … 20)")
@@ -150,8 +203,9 @@ two aligned matrices — a window of X against the contemporaneous window of Y.
 #| fig-cap: "JPM and BAC patched on the same days (w=10), 120 windows from the 2008 crisis as aligned images (red = up day, blue = down). Both share the diagonal-streak texture of overlap; the point here is the *alignment* — row i is the same 10 calendar days for each bank. The two panels light up in step — a between-block measure compares these aligned rows and finds the banks move together (cross-correlation ≈ 0.83 at matching positions)."
 w = 10
 b_start = R.index.searchsorted("2008-09-01")    # the same crisis window
-Pj = windows(jpm, w)[b_start:b_start + 120]
-Pb = windows(R["BAC"].to_numpy(), w)[b_start:b_start + 120]
+# two aligned blocks: row i is the SAME 10 calendar days for each bank
+Pj: Float[Array, "n_windows w"] = windows(jpm, w)[b_start:b_start + 120]
+Pb: Float[Array, "n_windows w"] = windows(R["BAC"].to_numpy(), w)[b_start:b_start + 120]
 vmax = np.abs(np.concatenate([Pj, Pb])).max()
 fig, (axL, axR) = plt.subplots(1, 2, figsize=(10, 4.6), sharey=True)
 for ax, Pm, name, cmap in [(axL, Pj, "JPM", "RdBu_r"), (axR, Pb, "BAC", "RdBu_r")]:
@@ -167,10 +221,14 @@ patch — say a stock's return *and* its volatility — so a window becomes a sm
 table of (days × features):
 
 ```{python}
-ret = jpm
-vol = np.abs(jpm)
+ret: Float[Array, "n_days"] = jpm
+vol: Float[Array, "n_days"] = np.abs(jpm)
 w = 5
-multi = np.stack([windows(ret, w), windows(vol, w)], axis=-1)
+# stack two windowed series along a new feature axis:
+#   (n_windows, w) ⊕ (n_windows, w)  →  (n_windows, w, n_features)
+multi: Float[Array, "n_windows w n_features"] = np.stack(
+    [windows(ret, w), windows(vol, w)], axis=-1
+)
 print(f"multivariate patch tensor: {multi.shape}   (windows, days_in_window, features)")
 print("one window — columns are [return, |return|]:")
 print(np.round(multi[100], 4))
@@ -201,14 +259,21 @@ The within-window contrast, shown directly:
 ```{python}
 #| label: fig-within-structure
 #| fig-cap: "Correlation between window positions (w=8) for raw returns vs |returns|. Raw returns are near-zero off the diagonal — the days in a window barely relate (signs don't repeat). |returns| shows positive off-diagonal structure — volatility persists across the window. That off-diagonal mass is the redundancy a within-block measure adds up."
-def position_corr(series, w):
-    Pw = windows(series, w)
-    Pw = (Pw - Pw.mean(0)) / (Pw.std(0) + 1e-9)
-    return np.corrcoef(Pw.T)
+def position_corr(series: Float[Array, "n_days"], w: int) -> Float[Array, "w w"]:
+    """Correlation between the w window positions:  Corr = (1/n)·ZᵀZ.
+
+    Standardize each column (a window position) to mean 0, std 1, then the
+    Gram of the standardized patch matrix Z IS the correlation matrix.
+    """
+    Pw: Float[Array, "n_windows w"] = windows(series, w)
+    Z: Float[Array, "n_windows w"] = (Pw - Pw.mean(0)) / (Pw.std(0) + 1e-9)
+    n = Z.shape[0]
+    # Corr = (1/n)·ZᵀZ  — contract the window axis, leaving a w×w position gram
+    return einx.dot("n i, n j -> i j", Z, Z) / n
 
 fig, (axL, axR) = plt.subplots(1, 2, figsize=(9.5, 4.3))
 for ax, data, name in [(axL, jpm, "raw returns r"), (axR, np.abs(jpm), "|returns|")]:
-    C = position_corr(data, 8)
+    C: Float[Array, "w w"] = position_corr(data, 8)
     im = ax.imshow(C, cmap="RdBu_r", vmin=-1, vmax=1)
     ax.set_title(f"{name}\nmean off-diag = {C[np.triu_indices(8, 1)].mean():+.2f}",
                  fontsize=11)
@@ -233,6 +298,72 @@ in [Tool 3 · Windows](../dependence/labs/lab-tool3-windows.qmd) and the
 :::
 
 ---
+
+## What the Labs Reload From Here
+
+The **windows** and **mutual-information** labs do not re-derive any of the above:
+they reload this one recipe — the `windows()` helper, a lagged block of a single
+asset, and the sector-block windowing — then choose a window length and a stride and
+run their measure.  The cell below is the complete, copy-pasteable handoff; it prints
+the shapes and a few rows so a lab can confirm it loaded exactly what this chapter
+built.
+
+```{python}
+#| label: lab-recipe
+import numpy as np
+from lectures import datasets
+from jaxtyping import Float          # shape annotations: Float[Array, "n_days"]
+
+Array = np.ndarray
+
+# --- the reusable helper (identical to §1) -------------------------------------
+def windows(series: Float[Array, "n_days"], w: int) -> Float[Array, "n_windows w"]:
+    """Sliding w-day patches of a 1-D series → (n − w + 1, w) matrix.
+
+    patch:  Pᵢ = (sᵢ, sᵢ₊₁, …, sᵢ₊w₋₁)   — row i is the window starting on day i.
+    """
+    s: Float[Array, "n_days"] = np.asarray(series, dtype=float)
+    if w <= 1:
+        return s.reshape(-1, 1)
+    # sliding_window_view is a no-copy view of shape (n − w + 1, w)
+    return np.lib.stride_tricks.sliding_window_view(s, w)
+
+R = datasets.load_returns()           # prepared 14-stock panel (date × ticker)
+meta = datasets.load_basket_meta()    # ticker → label, sector
+
+# --- (a) lagged block of ONE asset: a causal w-day window of JPM --------------
+w = 3
+asset_block: Float[Array, "n_windows w"] = windows(R["JPM"].to_numpy(), w)   # row i = [r_{i}, r_{i+1}, r_{i+2}]
+print(f"(a) lagged asset block  JPM, w={w}:  shape {asset_block.shape}")
+print(np.round(asset_block[:3], 4))
+
+# --- (b) sector block: patch two members of one sector on the SAME days -------
+#     Banks = JPM,BAC,C,WFC,GS — take two members, window each, keep them aligned.
+banks = meta.loc[meta["sector"] == "Banks", "ticker"].tolist()
+a, b = banks[0], banks[1]                         # JPM, BAC
+Pa: Float[Array, "n_windows w"] = windows(R[a].to_numpy(), w)   # aligned: row i is the same
+Pb: Float[Array, "n_windows w"] = windows(R[b].to_numpy(), w)   #          3 calendar days for both
+# stack the two aligned blocks along a new member axis:
+#   (n_windows, w) ⊕ (n_windows, w)  →  (n_windows, n_members, w)
+sector_block: Float[Array, "n_windows n_members w"] = np.stack([Pa, Pb], axis=1)
+print(f"\n(b) sector block  {a}+{b} (Banks), w={w}:  shape {sector_block.shape}"
+      "   (windows, members, positions)")
+print("one aligned window — rows are members, columns are days:")
+print(np.round(sector_block[100], 4))
+```
+
+::: {.callout-note icon=false}
+## The Lab Contract
+[Tool 3 · Windows](../dependence/labs/lab-tool3-windows.qmd) and
+[Tool 3 · Mutual Information](../gaussianization/labs/lab-tool3-mutual-information.qmd)
+**reload this windowing recipe and do not re-derive it.**  The `windows()` helper, the
+lagged single-asset block, and the aligned sector block are defined *here*, once; a lab
+imports the prepared panel, rebuilds these blocks with this exact recipe, and shows one
+row before measuring.  The **only** lab-specific step those labs add is a choice of
+**window length `w`** and **overlapping vs non-overlapping stride** (§4) — the modelling
+knobs the measure is sensitive to.  Everything else — the data, the alignment, the block
+shapes — comes from this chapter.
+:::
 
 ## Your Turn
 

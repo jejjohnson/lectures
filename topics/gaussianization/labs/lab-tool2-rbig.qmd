@@ -1,6 +1,6 @@
 ---
-title: "Tool 2 — RBIG Forward & Backward"
-subtitle: "marginal + rotation, iterated · sampling"
+title: "Tool 2 — RBIG, Forward & Backward"
+subtitle: "marginal + rotation, iterated · the inverse map samples"
 ---
 
 ```{python}
@@ -9,85 +9,312 @@ import sys, pathlib
 sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
 from lectures import plotting, datasets
 from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
-from rbig import AnnealedRBIG
+from lectures.gaussianization import gaussianize_1d
 from lectures.measures import cocrash_fraction
 plotting.set_style("notes")
 import numpy as np, matplotlib.pyplot as plt
+import einx                      # linear algebra with the axes spelled out
+from jaxtyping import Float      # shape annotations: Float[Array, "n d"]
+
+Array = np.ndarray
 ```
 
 *Learn-the-tool track · Lab 2 of 3.*
 
-Run the full machine: forward to a spherical Gaussian, backward to new samples.
-You will check both directions on a controlled co-crashing pair.
+Tool 1 Gaussianized **one axis at a time** — the rank → Gaussian map straightens a
+single marginal (the spread of one asset's returns on its own) but cannot touch the
+way two assets move *together*.  This lab adds the missing half: a **rotation** that
+mixes the axes between marginal passes.  Marginal-then-rotate, *iterated*, is
+**RBIG** (Rotation-Based Iterative Gaussianization), and the same fixed loop climbs
+the ladder from a toy whose dependence we know from a formula to a real basket —
+where running the loop **backward** turns it into a scenario generator.
+
+**What you will produce:** an RBIG model of a real return block whose backward pass
+draws fresh days that match the basket's joint distribution — fat tail and all — the
+sampler the uncertainty module will lean on.
 
 ---
 
-## 1 · Forward — Does It Gaussianize?
+## 🧪 Rung 1 · Toy — Known Answer
+
+Start where the answer is a formula.  `datasets.correlated_returns(rho=0.7)` is a
+two-asset Gaussian with a known linear correlation, so its **total correlation** —
+a single number that measures *all* the dependence between the two axes — has an
+exact formula:
+
+$$
+T(X) \;=\; -\tfrac{1}{2}\,\ln\!\bigl(1-\rho^{2}\bigr)\ \text{nats}.
+$$
+
+When RBIG has finished, that number must be **zero**: the joint distribution is a
+round standard Gaussian and the two axes are independent.  This lets us check the
+tool against the formula — if RBIG removed the right amount of dependence, the total
+correlation it reports should match $T(X)$ above.
 
 ```{python}
-a, b = datasets.tail_dependent_pair(n=2000, seed=1)
-X = np.column_stack([a, b])
-rbig = AnnealedRBIG(n_layers=30, random_state=0).fit(X)
-Z = rbig.transform(X)
-
-print(f"data  |corr| = {abs(np.corrcoef(a, b)[0,1]):.3f}   co-crash = {cocrash_fraction(a,b):.0%}")
-print(f"RBIG  |corr| = {abs(np.corrcoef(Z[:,0], Z[:,1])[0,1]):.3f}   "
-      f"marginal std = {Z.std(0).round(2)}")
+rho = 0.70
+a, b = datasets.correlated_returns(n=4000, rho=rho, seed=0)
+X: Float[Array, "n 2"] = np.column_stack([a, b])
+tc_true = -0.5 * np.log(1.0 - rho**2)                 # T(X) = -½ ln(1-ρ²)  [nats]
+print(f"known total correlation  T(X) = {tc_true:.4f} nats   (ρ = {rho})")
 ```
+
+**The algorithm — marginal Gaussianize, rotate, repeat.**  One RBIG *layer* is two
+steps; a model stacks `n_layers` of them and iterates to a spherical Gaussian:
+
+```
+layer:  Z ← gaussianize_1d(each column of X)   # rank → Gaussian, per axis (Tool 1)
+        X ← rotate(Z)                          # mix the axes (PCA), expose new structure
+repeat until the joint is standard Gaussian — total correlation T → 0
+```
+
+The marginal step alone never removes dependence *between* axes (Tool 1 showed
+this).  The rotation is what unlocks it: by mixing the axes, it turns the leftover
+dependence back into per-axis non-Gaussian shape, which the *next* marginal step can
+then straighten.  One hand-rolled layer makes the loop concrete:
+
+```{python}
+def one_layer(Z: Float[Array, "n d"], rng) -> Float[Array, "n d"]:
+    """A single RBIG layer: Gaussianize each margin, then a random rotation.
+
+    G·ⱼ = Φ⁻¹( rank(Z·ⱼ) / n )            marginal Gaussianization, per column j
+    Zᵢ. = Q · Gᵢ.                          rotate by an orthogonal Q  (mixes the axes)
+    """
+    # marginal step: rank → Gaussian, one column at a time
+    G: Float[Array, "n d"] = np.column_stack([gaussianize_1d(Z[:, j]) for j in range(Z.shape[1])])
+
+    # rotation step: a random orthogonal Q from a QR factorization
+    Q: Float[Array, "d d"]
+    Q, _ = np.linalg.qr(rng.standard_normal((Z.shape[1], Z.shape[1])))
+
+    return einx.dot("n d, e d -> n e", G, Q)   # Zᵢ. = Q·Gᵢ.   (mixes the axes)
+
+
+rng = np.random.default_rng(0)
+Zk: Float[Array, "n d"] = X.copy()
+
+print("residual |corr| after each hand-rolled layer:")
+for k in range(1, 6):
+    Zk = one_layer(Zk, rng)
+    print(f"  layer {k}:  |corr| = {abs(np.corrcoef(Zk.T)[0, 1]):.4f}")   # |ρ(Z₁,Z₂)|
+```
+
+That is the idea in five lines.  The packaged `AnnealedRBIG` does the same thing with
+a principal-component (PCA) rotation and a built-in rule for when to stop, and it
+reports **how much total correlation each layer removed** — which is exactly the
+number to test against the formula:
+
+```{python}
+from rbig import AnnealedRBIG
+
+rbig = AnnealedRBIG(n_layers=20, rotation="pca", random_state=0).fit(X)
+tc_per_layer: Float[Array, "n_layers"] = np.asarray(rbig.tc_per_layer_)   # TC removed per layer  [nats]
+Z: Float[Array, "n 2"] = rbig.transform(X)            # forward: ~ standard Gaussian
+
+print(f"RBIG removed   T = {tc_per_layer.sum():.4f} nats   "   # ΣₖTₖ should match the formula
+      f"(known {tc_true:.4f})")
+print(f"forward marginals std = {Z.std(0).round(2)}   "
+      f"residual |corr| = {abs(np.corrcoef(Z.T)[0, 1]):.4f}")   # |ρ(Z₁,Z₂)| → 0
+```
+
+The tool matches the formula to three decimals — and the per-layer trace shows *how*:
+
+```{python}
+#| label: fig-rung1-tc
+#| fig-cap: "RBIG on a known Gaussian pair. Left: total correlation removed per layer — the first layer takes almost all of it (0.34 of the 0.337 nats the formula predicts, dashed line), and every later layer removes ≈0, the signature of having reached a Gaussian. Right: the forward map turns the tilted correlated cloud (blue) into a round standard-Gaussian blob (green) with no residual tilt."
+fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(11.5, 4.4))
+
+tc_removed: Float[Array, "n_layers"] = np.clip(tc_per_layer, 0, None)   # Tₖ ≥ 0  [nats]
+ax0.bar(np.arange(1, len(tc_per_layer) + 1), tc_removed, color=COOL, alpha=0.85)
+ax0.axhline(tc_true, ls="--", c=INK, lw=1.2)
+ax0.annotate(f"known T(X) = {tc_true:.3f} nats", xy=(8, tc_true),
+             xytext=(8, tc_true * 0.62), fontsize=9, color=INK)
+ax0.set_xlabel("RBIG layer"); ax0.set_ylabel("total correlation removed (nats)")
+ax0.set_title("each layer removes less — TC → 0", fontsize=11); despine(ax0)
+
+ax1.scatter(X[:, 0], X[:, 1], s=6, c=COOL, alpha=0.30, edgecolors="none", label="data")
+ax1.scatter(Z[:, 0], Z[:, 1], s=6, c=plotting.PALETTE["green"], alpha=0.30,
+            edgecolors="none", label="RBIG forward")
+ax1.set_title("correlated cloud → round Gaussian blob", fontsize=11)
+ax1.set_xticks([]); ax1.set_yticks([])
+ax1.legend(fontsize=9, frameon=False, loc="upper left"); despine(ax1)
+fig.tight_layout(); plt.show()
+```
+
+The known answer holds: RBIG strips exactly $-\tfrac12\ln(1-\rho^2)$ nats of total
+correlation, the first layer does nearly all of it, and the forward image is a round
+blob with no leftover correlation.  That `fit → transform` pair is the whole tool;
+from here on, only the **data** changes — the code stays the same.
 
 ---
 
-## 2 · Backward — Does It Generate?
+## 🎭 Rung 2 · Toy-Real — A Stylized Market
+
+A round-blob Gaussian never crashes.  `datasets.tail_dependent_pair()` does what a
+market does — a shared heavy-tailed (Student-*t*) factor gives two fat-tailed names
+that **plunge together**, a co-crash a Gaussian cannot express.  Just removing the
+linear correlation would call the two names independent the moment that correlation
+hits zero — but that misses the crashes.  **What we are looking for** is whether the
+*tail* link between the two names also dissolves, not just the correlation.  We fit
+the **same** model, add no new code, and measure it with `cocrash_fraction` — the
+share of one name's worst days on which the other name is also having a terrible day.
 
 ```{python}
-gen = rbig.sample(2000)
-print(f"real co-crash      = {cocrash_fraction(a, b):.0%}")
-print(f"generated co-crash = {cocrash_fraction(gen[:,0], gen[:,1]):.0%}   ← tail dependence regenerated")
+a2, b2 = datasets.tail_dependent_pair(n=2000, seed=1)
+X2: Float[Array, "n 2"] = np.column_stack([a2, b2])
+
+rbig2 = AnnealedRBIG(n_layers=30, rotation="pca", random_state=0).fit(X2)   # same fit
+Z2: Float[Array, "n 2"] = rbig2.transform(X2)         # forward: ~ standard Gaussian
+
+print(f"data   |corr| = {abs(np.corrcoef(a2, b2)[0, 1]):.3f}   "   # |ρ| before
+      f"co-crash = {cocrash_fraction(a2, b2):.0%}")
+print(f"RBIG   |corr| = {abs(np.corrcoef(Z2.T)[0, 1]):.3f}   "     # |ρ| after → 0
+      f"co-crash = {cocrash_fraction(Z2[:, 0], Z2[:, 1]):.0%}"
+      f"   ← tail dependence removed, not just correlation")
 ```
 
 ```{python}
-#| label: fig-tool2-rbig
-#| fig-cap: "Data → spherical Gaussian (forward) → fresh samples with the same joint tail (backward)."
-fig, axes = plt.subplots(1, 3, figsize=(13, 4.2))
-for ax, data, col, title in [
-    (axes[0], X, COOL, "data"),
-    (axes[1], Z, plotting.PALETTE["green"], "RBIG forward"),
-    (axes[2], gen, WARM, "RBIG sample"),
-]:
-    ax.scatter(data[:, 0], data[:, 1], s=7, c=col, alpha=0.35, edgecolors="none")
-    ax.set_title(title, fontsize=11)
-    ax.set_xticks([]); ax.set_yticks([]); despine(ax)
-fig.tight_layout()
-plt.show()
+#| label: fig-rung2-tail
+#| fig-cap: "RBIG on the fat-tailed co-crashing pair. The data (left) has a heavy lower-left arm where both names crater together — a co-crash a Gaussian cannot hold. After the forward map (right) the arm is gone: the joint is a round Gaussian and the worst days of one name no longer line up with the worst of the other. Linear correlation was near zero on both; the co-crash fraction is the honest probe that the tail dependence — not just the correlation — has been removed."
+q: Float[Array, "2"] = np.quantile(X2, 0.05, axis=0)      # worst-5% thresholds per axis
+crash: Float[Array, "n"] = (X2[:, 0] <= q[0]) & (X2[:, 1] <= q[1])   # jointly-bad days: both ≤ q₅%
+
+fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(11, 4.6))
+for ax, data, title in [(ax0, X2, "data — fat tails co-crash"),
+                        (ax1, Z2, "RBIG forward — round Gaussian")]:
+    ax.scatter(data[~crash, 0], data[~crash, 1], s=7, c=COOL, alpha=0.30, edgecolors="none")
+    ax.scatter(data[crash, 0], data[crash, 1], s=18, c=CRASH, alpha=0.85,
+               edgecolors="none", label="joint-tail days")
+    ax.set_title(title, fontsize=11); ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+ax0.legend(fontsize=9, frameon=False, loc="upper left")
+fig.tight_layout(); plt.show()
 ```
+
+The same loop that erased a Gaussian's correlation also takes apart a *non-Gaussian*
+joint tail: the co-crash fraction falls toward the level you would see if the two
+names were independent, even though linear correlation was near zero the whole time.
+That is the point of iterating — being uncorrelated is not the same as being
+independent, and only the marginal-plus-rotation cycle reaches true independence.
 
 ---
 
-## 3 · How Many Layers?
+## 📈 Rung 3 · Real — The Full Basket
+
+Now a real block.  We **reload** the prepared returns — no cleaning here; the work of
+turning prices into log-returns lives in [the data
+primer](../../data/01-downloading-and-parsing.qmd) — take a small slice (two banks and
+an energy name, so a real cross-sector co-crash is in play), peek at the first few
+rows, and run the *same* `fit → transform`.  **What we are looking for:** can the one
+loop that passed the formula check on a toy also drive every real asset pair's
+correlation to zero, with no special-casing for the messy, fat-tailed real data?
 
 ```{python}
-print("layers   |corr| after forward")
-for L in [1, 2, 5, 15, 30]:
-    Zl = AnnealedRBIG(n_layers=L, random_state=0).fit_transform(X)
-    print(f"  {L:>3d}      {abs(np.corrcoef(Zl[:,0], Zl[:,1])[0,1]):.3f}")
+R = datasets.load_returns()                              # prepared 14-name daily panel
+META = datasets.load_basket_meta()
+label = dict(zip(META["ticker"], META["label"]))
+
+names = ["JPM", "BAC", "XOM"]                            # 2 banks + 1 energy — cross-sector tail
+block: Float[Array, "n_days 3"] = R[names].to_numpy()
+print(f"{len(R)} trading days × {len(names)} names   "
+      f"({R.index.min().date()} → {R.index.max().date()})")
+R[names].iloc[:3].round(4)
 ```
 
-::: {.callout-tip}
-## What to Look for
-For a 2-D pair, PCA rotation decorrelates fast — but *decorrelated is not
-independent*.  The co-crash check (a tail-dependence probe) is the honest test of
-whether the joint is truly Gaussian, and it is what the backward pass must
-reproduce.
+::: {.callout-note icon=false}
+## Where This Data Comes From
+The panel, its sectors, and the co-crash structure this block rides on are laid bare
+in the data primer —
+[From Raw Prices to a Clean Panel](../../data/01-downloading-and-parsing.qmd) and
+[Co-Movement & Co-Crashes](../../data/04-co-movement-and-co-crashes.qmd).  This lab
+reloads that panel and never re-derives it.
 :::
 
+```{python}
+rbig_real = AnnealedRBIG(n_layers=30, rotation="pca", random_state=0).fit(block)  # same fit
+Zr: Float[Array, "n_days 3"] = rbig_real.transform(block)   # forward: ~ standard Gaussian
+
+print(f"{'pair':<9s}{'data |corr|':>12s}{'RBIG |corr|':>13s}")
+print("-" * 34)
+for i, j in [(0, 1), (0, 2), (1, 2)]:                    # all three asset pairs
+    cd = abs(np.corrcoef(block[:, i], block[:, j])[0, 1])   # |ρ| in the data
+    cz = abs(np.corrcoef(Zr[:, i], Zr[:, j])[0, 1])         # |ρ| after RBIG → 0
+    print(f"{names[i]}/{names[j]:<5s}{cd:>12.3f}{cz:>13.3f}")
+print(f"\nforward marginals std = {Zr.std(0).round(2)}   "
+      f"(each axis ~ standard Gaussian)")
+```
+
+The same machine that passed the formula check on Rung 1 drives every real pair's
+correlation to zero (the `RBIG |corr|` column) and rescales all three axes to a
+standard Gaussian spread — including the strongly linked `JPM/BAC` bank pair and the
+looser cross-sector `JPM/XOM` pair.  The forward map has flattened a real, messy,
+fat-tailed joint distribution into a round Gaussian.
+
 ---
 
-## 4 · Your Turn
+## 💰 Rung 4 · Application — The Inverse Map Is a Scenario Generator
 
-- Switch `rotation="random"` in `AnnealedRBIG`.  How many more layers do you need to
-  reach the same decorrelation?
-- Run RBIG on a *3-asset* slice of `datasets.load_returns()` and sample — the same
-  code scales past two dimensions.
+RBIG is **invertible**: every step (rank → Gaussian, rotation) can be run backward.
+So the inverse map is a generative model — draw a point from a standard Gaussian,
+push it *backward* through the fitted layers, and out comes a **new return day**
+distributed like the real block.  `model.sample(n)` does exactly this, and it is the
+deliverable: a scenario generator that inherits the basket's correlations *and* its
+joint tail, with no Gaussian assumption anywhere.  **What we are looking for:** do
+the generated days match the real ones on the numbers that matter for risk — the
+pairwise correlations, the co-crash rate, and the depth of a 1%-worst day?
 
-Next: turn the forward pass into a number — [Tool 3,
-mutual information](lab-tool3-mutual-information.qmd).
+```{python}
+gen: Float[Array, "n_days 3"] = rbig_real.sample(len(block))   # backward: 𝒩(0,I) → fresh return days
+
+print(f"{'check':<22s}{'real':>9s}{'generated':>11s}")
+print("-" * 42)
+print(f"{'corr JPM/BAC':<22s}"
+      f"{np.corrcoef(block[:, 0], block[:, 1])[0, 1]:>9.3f}"
+      f"{np.corrcoef(gen[:, 0], gen[:, 1])[0, 1]:>11.3f}")
+print(f"{'corr JPM/XOM':<22s}"
+      f"{np.corrcoef(block[:, 0], block[:, 2])[0, 1]:>9.3f}"
+      f"{np.corrcoef(gen[:, 0], gen[:, 2])[0, 1]:>11.3f}")
+print(f"{'co-crash JPM/XOM':<22s}"
+      f"{cocrash_fraction(block[:, 0], block[:, 2]):>9.2f}"
+      f"{cocrash_fraction(gen[:, 0], gen[:, 2]):>11.2f}")
+print(f"{'JPM 1% worst day':<22s}"
+      f"{np.quantile(block[:, 0], 0.01):>9.3f}"
+      f"{np.quantile(gen[:, 0], 0.01):>11.3f}")
+```
+
+```{python}
+#| label: fig-rung4-scenarios
+#| fig-cap: "The backward pass as a scenario generator. Top: real JPM/XOM days (blue) vs RBIG-generated days (orange) — the generated cloud reproduces the cross-sector shape, including the heavy lower-left co-crash corner a Gaussian sampler would miss. Bottom: per-name return histograms, real vs generated — the fat-tailed marginals line up. This is a sampler trained only to make the data Gaussian, yet it regenerates the basket's tail because RBIG is exactly invertible."
+fig = plt.figure(figsize=(12, 7.2))
+gs = fig.add_gridspec(2, 3, height_ratios=[1.35, 1.0])
+
+ax = fig.add_subplot(gs[0, :])                           # JPM vs XOM scatter, real vs gen
+ax.scatter(block[:, 0], block[:, 2], s=9, c=COOL, alpha=0.35, edgecolors="none", label="real")
+ax.scatter(gen[:, 0], gen[:, 2], s=9, c=WARM, alpha=0.35, edgecolors="none", label="RBIG sample")
+ax.set_xlabel(f"{label['JPM']} return"); ax.set_ylabel(f"{label['XOM']} return")
+ax.set_title("Generated days match the real cross-sector cloud — tail included", fontsize=11.5)
+ax.legend(fontsize=9, frameon=False, loc="upper left"); despine(ax)
+
+for col, name in enumerate(names):                       # per-name marginal histograms
+    axh = fig.add_subplot(gs[1, col])
+    lo, hi = np.quantile(block[:, col], [0.002, 0.998])
+    bins = np.linspace(lo, hi, 45)
+    axh.hist(block[:, col], bins=bins, density=True, color=COOL, alpha=0.55, label="real")
+    axh.hist(gen[:, col], bins=bins, density=True, histtype="step", color=WARM, lw=1.8,
+             label="generated")
+    axh.set_title(label[name], fontsize=10); axh.set_yticks([]); despine(axh)
+    if col == 0:
+        axh.legend(fontsize=8, frameon=False)
+fig.tight_layout(); plt.show()
+```
+
+The synthesis: RBIG was fit with a single goal — make the data look Gaussian — and
+nothing in that goal mentions tails or correlations.  Yet because the map is
+**invertible**, running it backward rebuilds both.  The generated days carry the real
+`JPM/BAC` correlation, the real `JPM/XOM` cross-sector link, the matching 1%
+worst-day depth, and the co-crash corner that a plain Gaussian sampler would flatten
+out.  One fitted model does two jobs: used forward, it *measures* dependence (the
+total correlation it removed); used backward, it *generates* scenarios.  That backward
+pass — a tail-aware sampler with no Gaussian assumption — is the engine the
+[uncertainty module](../../uncertainty/index.qmd) loads its portfolio risk onto.  The
+next lab, [Tool 3 · Mutual Information](lab-tool3-mutual-information.qmd), instead
+reads the *forward* pass as a single number, counting dependence in bits.

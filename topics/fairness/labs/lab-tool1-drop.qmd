@@ -1,6 +1,6 @@
 ---
-title: "Tool 1 — Drop & Orthogonalize"
-subtitle: "Why dropping S leaks · linear neutrality and its hole"
+title: "Tool 1 — Drop & Measure the Leak"
+subtitle: "Why dropping the protected attribute does not remove it"
 ---
 
 ```{python}
@@ -9,100 +9,337 @@ import sys, pathlib
 sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
 from lectures import plotting, datasets
 from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
-from lectures.measures import cka_rbf, cka_linear
 plotting.set_style("notes")
 import numpy as np, matplotlib.pyplot as plt
-from scipy.stats import pearsonr
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import cross_val_score
+import einx                      # linear algebra with the axes spelled out
+from jaxtyping import Float      # shape annotations: Float[Array, "n_rows"]
+
+Array = np.ndarray
 ```
 
 *Learn-the-tool track · Lab 1 of 3.*
 
-The two failure modes you must feel before you trust a fix: **dropping** the
-sensitive feature (proxies leak it back) and **linear** neutrality (the curve
-survives).  By the end you will have measured both with CKA.
+This lab walks the **first fairness reflex** — *just delete the protected column* —
+up one ladder, and watches it fail at every rung.  The protected column here is
+`sex`; the worry is that a model still treats people differently by it even after
+we delete it.  The *idea* (one **probe**: try to recover the protected attribute
+from whatever is left) stays fixed while the **data grows up under it**, from a toy
+whose answer you set by hand to the real Census panel.  The gap the probe opens —
+how far its accuracy rises above the base-rate floor, the score you would get by
+always guessing the larger group — is the leak a fairness method must close.
+
+**What you will produce:** a single **leakage number** for the real income
+dataset — how much of `sex` a model can still recover after `sex` is dropped —
+the target the next tool must drive to zero.
 
 ---
 
-## 1 · Drop the Feature — Measure the Leak
+## 🧪 Rung 1 · Toy — Known Answer
 
-Build a model that never sees $S$, only a proxy correlated with it, and check
-whether the predictions are actually independent of $S$.
+Start where you set the truth yourself.  `datasets.credit_scores_by_group()`
+builds a toy scorecard whose hidden score is shifted by a sensitive `group`
+(`latent = noise + gap·group`, where `latent` is that hidden score):
+**the score carries the group on purpose.**  Drop `group` and you are left with
+`score` and the `repaid` label — neither of which is the protected column.  The
+naive claim is that the data is now blind to the group.  It is not, and here we
+can prove it because we *built in* the link between score and group ourselves.
 
 ```{python}
-rng = np.random.default_rng(1)
-n = 600
-S = rng.normal(0, 1, n)
-proxy = S + 0.4 * rng.normal(0, 1, n)
-x_legit = rng.normal(0, 1, n)
-y = 0.7 * x_legit + 0.8 * S + 0.3 * rng.normal(0, 1, n)
+toy = datasets.credit_scores_by_group(n=600, gap=0.8, seed=0)
+group: Float[Array, "n"] = toy["group"]                        # the protected attribute
 
-X = np.column_stack([x_legit, proxy, np.ones(n)])      # S deliberately excluded
-beta, *_ = np.linalg.lstsq(X, y, rcond=None)
-y_hat = X @ beta
+feats_toy: Float[Array, "n d"] = np.column_stack([toy["score"], toy["repaid"]])   # everything EXCEPT group
 
-print(f"corr(proxy, S)      = {pearsonr(proxy, S)[0]:+.2f}")
-print(f"Pearson(y_hat, S)   = {pearsonr(y_hat, S)[0]:+.2f}   (the standard check)")
-print(f"CKA(y_hat, S)       = {cka_rbf(y_hat, S):.2f}   (the honest audit)")
+print(f"features after dropping group: score, repaid   ({feats_toy.shape[0]} rows)")
+print(f"group balance: {group.mean():.0%} in group 1")
 ```
 
-The model dropped $S$, yet the dependence is plainly there.  **You cannot remove
-a dependence you refuse to look at.**
+**The algorithm — the leakage probe.**  Dropping the protected attribute removes
+the *column*, not the *information*.  To measure what survives, turn the question
+around: hand a small classifier the surviving features and ask it to **predict the
+attribute we just dropped**.  If it beats the base-rate floor, the attribute leaked.
 
----
+```
+leakage = probe_accuracy − base_rate_floor
 
-## 2 · Linear Neutrality — And the Hole
+  probe_accuracy  = cross-validated accuracy of  features → protected attribute
+  base_rate_floor = accuracy of always guessing the majority group
+```
 
-Now give the model a target that bends with $S$, fit it, and orthogonalize the
-predictions against $S$.  Measure CKA before and after.
+The floor is the honest baseline: with no real information a probe can do no better
+than always guessing the larger group.  Spelled out as one reusable function:
 
 ```{python}
-d = datasets.fair_regression(n=1000, seed=0)
-x, S2, yt = d["x"], d["s"], d["y"]
+def leak_probe(features: Float[Array, "n d"], protected: Float[Array, "n"]) -> dict:
+    """Measure how much of `protected` survives in `features`.
 
-# Plain least-squares model that can see the curve.
-Phi = np.column_stack([np.ones(len(x)), x, S2, S2**2 - 1])
-theta, *_ = np.linalg.lstsq(Phi, yt, rcond=None)
-yh = Phi @ theta
+    base = max(p, 1−p)                          majority-guess floor, p = P(protected = 1)
+    acc  = 5-fold CV accuracy of  features → protected
+    leak = acc − base                           the recoverable signal above chance
+    """
+    p = protected.mean()                                   # p = P(protected = 1)
+    base = max(p, 1.0 - p)                                 # base = max(p, 1−p)   majority-guess floor
 
-# Linear removal: subtract the S-projection.
-b = np.cov(yh, S2)[0, 1] / np.var(S2)
-resid = yh - b * S2
+    clf = LogisticRegression(max_iter=2000)
+    acc = cross_val_score(clf, features, protected, cv=5).mean()   # 5-fold CV: features → attribute
 
-print(f"            Pearson(·,S)   CKA(·,S)")
-print(f"plain        {pearsonr(yh, S2)[0]:+.3f}        {cka_rbf(yh, S2):.3f}")
-print(f"linear-rm    {pearsonr(resid, S2)[0]:+.3f}        {cka_rbf(resid, S2):.3f}")
+    return {"base": base, "acc": acc, "leak": acc - base}   # leak = acc − base
+
+
+r_toy = leak_probe(feats_toy, group)
+print(f"base-rate floor    = {r_toy['base']:.0%}   (always guess the majority group)")
+print(f"probe accuracy     = {r_toy['acc']:.0%}   (recovers group from score + repaid)")
+print(f"leak = acc − base  = {r_toy['leak']:+.0%}   ← group survived the drop")
 ```
 
 ```{python}
-#| label: fig-tool1-hole
-#| fig-cap: "Linear removal zeroes the correlation but the curve — and the CKA — survives."
+#| label: fig-toy-leak
+#| fig-cap: "The toy scorecard with the protected column dropped. Left: the score distribution splits by the dropped group — group 1's latent score is shifted up by the gap, so the two histograms barely overlap. The probe simply reads this split back off the score axis. Right: the probe clears the base-rate floor by a wide margin, the height of the bar marked 'leak' — that gap is the dependence we deliberately built in, recovered from features that no longer contain the group column."
 fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.2))
-axL.scatter(S2, yh, s=10, c=COOL, alpha=0.5, edgecolors="none")
-axL.set_title(f"plain · CKA={cka_rbf(yh, S2):.2f}", fontsize=11)
+
+for g, c, lbl in [(0, COOL, "group 0"), (1, WARM, "group 1")]:
+    axL.hist(toy["score"][group == g], bins=24, color=c, alpha=0.6, label=lbl)
+axL.set_xlabel("score (group dropped)")
+axL.set_ylabel("count")
+axL.set_title("The dropped group still splits the score", fontsize=11)
+axL.legend(frameon=False, fontsize=9)
 despine(axL)
-axR.scatter(S2, resid, s=10, c=CRASH, alpha=0.5, edgecolors="none")
-axR.set_title(f"after linear removal · CKA={cka_rbf(resid, S2):.2f}", fontsize=11)
+
+axR.bar(["base-rate\nfloor", "probe\naccuracy"], [r_toy["base"], r_toy["acc"]],
+        color=[INK, CRASH])
+axR.set_ylim(0, 1)
+axR.set_ylabel("accuracy at recovering group")
+axR.annotate("", xy=(1, r_toy["acc"]), xytext=(1, r_toy["base"]),
+             arrowprops=dict(arrowstyle="<->", color=INK, lw=1.4))
+axR.text(1.08, (r_toy["acc"] + r_toy["base"]) / 2, "leak", fontsize=10, va="center")
+axR.set_title(f"leak = {r_toy['leak']:+.0%}", fontsize=11)
 despine(axR)
-for ax in (axL, axR):
-    ax.set_xlabel("S"); ax.set_ylabel("prediction")
+
 fig.tight_layout()
 plt.show()
 ```
 
-::: {.callout-tip}
-## What to Look for
-Pearson drops to ~0 after linear removal, but CKA barely moves.  The gap between
-them *is* the nonlinear dependence — exactly what Tool 2's kernel penalty
-removes.
-:::
+The known answer holds: drop the protected column and the probe still recovers the
+group well above its floor.  **You cannot delete a dependence by deleting the name
+of it** — that is, removing the label does not remove the link in the data.  The
+`acc − base` leak is the one number this lab tracks all the way up.
 
 ---
 
-## 3 · Your Turn
+## 🎭 Rung 2 · Toy-Real — A Stylized Market
 
-- Increase the noise on `proxy`.  How weak must the proxy be before dropping $S$
-  is "good enough" by CKA?
-- Replace the quadratic term with $\sin(2S)$.  Does linear removal do any better?
-  (It should not.)  Compare `cka_linear` vs `cka_rbf` on the residual.
+A score shifted by a group is honest but blunt — in real data the leak rarely sits
+in the target itself.  Instead it hides in a **proxy**: a feature that is not the
+protected attribute but moves together with it closely enough to stand in for it.
+`datasets.fair_regression()` is that stylization: a sensitive `s` and a legitimate
+feature `x` drive a target that bends with `s` (`y = 0.6x + 0.7s + 0.7(s²−1) +
+noise`), and we never let the model see `s` — only proxies correlated with it.
+Drop `s`, keep the proxies, and run the *same* probe.  This is the leak one step
+closer to reality: the attribute is gone from the table, yet a stand-in carries it
+back in.
 
-Next: [Tool 2 — the CKA penalty](lab-tool2-cka-penalty.qmd) closes the hole.
+```{python}
+d = datasets.fair_regression(n=600, seed=0)
+x: Float[Array, "n"] = d["x"]
+s: Float[Array, "n"] = d["s"]
+y: Float[Array, "n"] = d["y"]
+
+noise: Float[Array, "n"] = np.random.default_rng(7).standard_normal(len(s))   # independent of s (separate stream)
+proxy: Float[Array, "n"] = s + 0.6 * noise                 # a noisy stand-in for s, corr ≈ 0.86
+
+s_bin: Float[Array, "n"] = (s > np.median(s)).astype(int)  # binarize s into the attribute to recover
+feats_sr: Float[Array, "n d"] = np.column_stack([x, proxy, y])   # legit feature, proxy, target — NO s
+
+# ρ(proxy, s) = Cov(proxy, s) / (σ_proxy · σ_s)  — centre, then contract the n axis
+p_c: Float[Array, "n"] = proxy - proxy.mean()      # centred proxy:  proxyᵢ − proxȳ
+s_c: Float[Array, "n"] = s - s.mean()              # centred s:      sᵢ − s̄
+cov_ps = float(einx.dot("n, n ->", p_c, s_c)) / len(s)             # Cov(proxy, s) = (1/n)·Σᵢ p̃ᵢ·s̃ᵢ
+rho_ps = cov_ps / float(np.sqrt(p_c.var() * s_c.var()))           # ρ = Cov / (σ_proxy·σ_s)
+
+r_sr = leak_probe(feats_sr, s_bin)                 # the SAME probe as Rung 1
+
+print(f"corr(proxy, s)     = {rho_ps:+.2f}   (the stand-in)")
+print(f"base-rate floor    = {r_sr['base']:.0%}")
+print(f"probe accuracy     = {r_sr['acc']:.0%}   (recovers s from the proxy + target)")
+print(f"leak = acc − base  = {r_sr['leak']:+.0%}   ← s survived via the proxy")
+```
+
+```{python}
+#| label: fig-proxy-leak
+#| fig-cap: "The stylized leak. Left: the proxy is strongly correlated with the dropped s, so the colour (high vs low s) separates cleanly along the proxy axis — the probe reads s off the stand-in. Right: probe accuracy clears the floor by the height marked 'leak'. The attribute was deleted from the feature table, but a correlated stand-in walked it straight back in — exactly the failure mode dropping is blind to."
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.2))
+
+axL.scatter(proxy[s_bin == 0], y[s_bin == 0], s=10, c=COOL, alpha=0.5,
+            edgecolors="none", label="low s")
+axL.scatter(proxy[s_bin == 1], y[s_bin == 1], s=10, c=WARM, alpha=0.5,
+            edgecolors="none", label="high s")
+axL.set_xlabel("proxy (s dropped)")
+axL.set_ylabel("target y")
+axL.set_title("The proxy carries the dropped s", fontsize=11)
+axL.legend(frameon=False, fontsize=9)
+despine(axL)
+
+axR.bar(["base-rate\nfloor", "probe\naccuracy"], [r_sr["base"], r_sr["acc"]],
+        color=[INK, CRASH])
+axR.set_ylim(0, 1)
+axR.set_ylabel("accuracy at recovering s")
+axR.annotate("", xy=(1, r_sr["acc"]), xytext=(1, r_sr["base"]),
+             arrowprops=dict(arrowstyle="<->", color=INK, lw=1.4))
+axR.text(1.08, (r_sr["acc"] + r_sr["base"]) / 2, "leak", fontsize=10, va="center")
+axR.set_title(f"leak = {r_sr['leak']:+.0%}", fontsize=11)
+despine(axR)
+
+fig.tight_layout()
+plt.show()
+```
+
+Same probe, same verdict, one rung more realistic.  Dropping `s` empties the column
+but the proxy puts it back, and the leak the probe reports is essentially the
+proxy's correlation with `s` turned into a single number.  This is the shape of
+every real leak: not the attribute itself, but a stand-in for it.  Now we go find
+the real stand-in.
+
+---
+
+## 📈 Rung 3 · Real — The Full Basket
+
+Now the real Census panel (a large public survey of US households).  We **reload**
+the prepared income data — there is no cleaning here; the Census decode, the
+ACSIncome filter, and the `(X, y, s)` handoff all live in
+[the data primer](../../data/06-the-credit-dataset.qmd) — show a corner, and run the
+*same* probe on the proxies with `sex` dropped.  What we are looking for: with `sex`
+gone from the table, can the probe still recover it from the remaining columns?  If
+its accuracy clears the floor, dropping `sex` did not make the data blind to it.
+
+```{python}
+import pandas as pd
+
+credit = datasets.load_credit()                       # prepared ACS income panel
+y = credit["income_high"]                             # target: 1 if income > $50k
+s: Float[Array, "n"] = credit["sex"].to_numpy()       # protected: 1 = male
+X = credit.drop(columns=["income_high", "sex"])       # proxies — sex DROPPED
+print(f"{len(credit):,} rows × {X.shape[1]} proxy columns   "
+      f"(sex dropped; {s.mean():.0%} male)")
+print(X.head(3).to_string(index=False))
+```
+
+::: {.callout-note icon=false}
+## Where This Data Comes From
+The Census decode (`SEX`/`PINCP`/`OCCP` → readable columns), the ACSIncome row
+filter, and the prepared `(X, y, s)` split — including the proof that `occupation`
+recovers `sex` on its own — are laid bare in the data primer,
+[The Income & Fairness Dataset](../../data/06-the-credit-dataset.qmd).  This lab
+reloads that prepared `(X, y, s)` and never re-derives it.
+:::
+
+The proxies include categoricals (`occupation`, `marital`), so the one allowed
+lab-local step is **encoding them** — a one-hot, the modelling choice the primer
+hands to each lab — before the *same* `leak_probe` runs unchanged:
+
+```{python}
+Xenc: Float[Array, "n d"] = pd.get_dummies(
+    X, columns=["occupation", "marital"]
+).to_numpy(dtype=float)
+r_full = leak_probe(Xenc, s)                          # the SAME probe, all proxies
+print(f"base-rate floor    = {r_full['base']:.0%}   (always guess 'male')")
+print(f"probe accuracy     = {r_full['acc']:.0%}   (recovers sex from the proxies)")
+print(f"leak = acc − base  = {r_full['leak']:+.0%}   ← sex survived the drop")
+```
+
+To see *where* the leak lives, run the probe on each proxy alone and rank them —
+the same number, one feature at a time:
+
+```{python}
+#| label: fig-which-proxy-compute
+# Run the SAME probe on each proxy alone:  leakⱼ = acc(featureⱼ → sex) − base.
+single = []
+for col in X.columns:
+    enc = pd.get_dummies(X[[col]])                     # one-hots col iff it is categorical
+    feat_j: Float[Array, "n d"] = enc.to_numpy(dtype=float)
+    single.append((col, leak_probe(feat_j, s)["leak"]))
+
+single.sort(key=lambda t: t[1])                        # weakest leak first
+```
+
+```{python}
+#| label: fig-which-proxy
+#| fig-cap: "The probe run on each proxy in isolation, ranked by leak. occupation is the dominant channel — on its own it recovers sex far above the base-rate floor, because the job families are heavily sex-segregated — while age is essentially neutral. Dropping sex leaves all of these in place, so the leak (red, full proxy set) clears the floor by a wide margin. This is the real version of Rung 2's stand-in, now a column in genuine Census data."
+names = [c for c, _ in single]
+leaks = [v for _, v in single]
+colors = [COOL if v < 0.02 else WARM for v in leaks]
+
+fig, ax = plt.subplots(figsize=(8.4, 3.4))
+ax.barh(names, leaks, color=colors)
+ax.axvline(r_full["leak"], color=CRASH, lw=1.6, ls="--",
+           label=f"all proxies together = {r_full['leak']:+.0%}")
+ax.set_xlabel("leak  (probe accuracy − base rate)")
+ax.set_title("Which dropped-but-leaking proxy carries sex", fontsize=12)
+ax.legend(frameon=False, fontsize=9, loc="lower right")
+despine(ax)
+
+fig.tight_layout()
+plt.show()
+```
+
+Read the bars: `occupation` is the main channel, exactly as the data primer warned.
+Job families are heavily split by sex and *also* predict income, so a model that
+relies on occupation is, in effect, relying on `sex`.  Dropping the protected
+column did nothing to the proxies, and the probe reads the attribute straight back
+out.
+
+---
+
+## 💰 Rung 4 · Application — The Leakage Measurement
+
+The deliverable is **one number**: the leak that survives dropping `sex` —
+`probe_accuracy − base_rate`.  Read it plainly: it is how many extra percentage
+points of `sex` the probe can still recover beyond pure guessing, and the amount a
+fairness method must drive to zero.  Stated as a deliverable, with the floor it must
+fall back to:
+
+```{python}
+leak_pts = 100 * r_full["leak"]
+print("LEAKAGE MEASUREMENT — real ACS income panel, sex dropped")
+print("-" * 56)
+print(f"  base-rate floor (no information)   {r_full['base']:6.1%}")
+print(f"  probe recovers sex from proxies    {r_full['acc']:6.1%}")
+print(f"  leak that survives the drop        {r_full['leak']:+6.1%}")
+print("-" * 56)
+print(f"  → a fairness method must close {leak_pts:.0f} accuracy points of leak,")
+print(f"    driving the probe back down to its {r_full['base']:.0%} floor.")
+```
+
+```{python}
+#| label: fig-deliverable
+#| fig-cap: "The leakage measurement as the climb that produced it. The probe — one fixed tool — reports the same leak number at every rung, escalating from the toy we built (group shifts the score) through the stylized proxy to the real Census panel (occupation leaks sex). The red span on the right bar is the deliverable: the accuracy points above the floor that dropping leaves untouched, and that Tool 2's penalty is built to remove."
+rungs = [("🧪 toy\n(group)", r_toy), ("🎭 stylized\n(proxy)", r_sr),
+         ("📈 real\n(occupation)", r_full)]
+xpos = np.arange(len(rungs))
+
+fig, ax = plt.subplots(figsize=(8.0, 4.2))
+ax.bar(xpos, [r["base"] for _, r in rungs], color=INK, label="base-rate floor")
+ax.bar(xpos, [r["leak"] for _, r in rungs], bottom=[r["base"] for _, r in rungs],
+       color=CRASH, label="leak (must remove)")
+for i, (_, r) in enumerate(rungs):
+    ax.text(i, r["acc"] + 0.015, f"{r['leak']:+.0%}", ha="center", fontsize=10)
+ax.set_xticks(xpos)
+ax.set_xticklabels([n for n, _ in rungs])
+ax.set_ylim(0, 1)
+ax.set_ylabel("probe accuracy at recovering the attribute")
+ax.set_title("The same probe, the same leak, three rungs up", fontsize=12)
+ax.legend(frameon=False, fontsize=9, loc="upper left")
+despine(ax)
+
+fig.tight_layout()
+plt.show()
+```
+
+Read the deliverable as a contract: dropping the protected attribute leaves a
+measurable leak — a probe recovers `sex` from the proxies well above its floor, and
+`occupation` is where it hides.  That leftover signal is precisely what a fairness
+method must remove, and the number to watch shrink.  How to actually close it — a
+penalty that pushes the statistical link between the model's score and `sex` toward
+zero, instead of pretending it is already gone — is the job
+[Tool 2 · The CKA Penalty](lab-tool2-cka-penalty.qmd) takes up next.

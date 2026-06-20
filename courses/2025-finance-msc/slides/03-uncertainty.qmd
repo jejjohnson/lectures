@@ -410,17 +410,17 @@ xs_grid = np.linspace(-4.0, 4.0, 400)
 # aleatoric: one net, two outputs (μ, log σ), trained with the Gaussian NLL
 char_net = make_mlp(n_out=2, seed=0)
 char_net.compile(optimizer=keras.optimizers.Adam(0.01), loss=gaussian_nll)
-char_net.fit(xg[:, None], yg[:, None], epochs=800, batch_size=xg.size, verbose=0)
+char_net.fit(xg[:, None], yg[:, None], epochs=200, batch_size=xg.size, verbose=0)
 pred_char = char_net.predict(xs_grid[:, None], verbose=0)
 mu_fit, sig_alea = pred_char[:, 0], np.exp(pred_char[:, 1])
 # epistemic: a deep ensemble — retrain the same net on bootstrap resamples
 members = []
-for k in range(15):
+for k in range(8):
     rng_k = np.random.default_rng(k)
     idx = rng_k.integers(0, xg.size, xg.size)
     net_k = make_mlp(n_out=1, seed=k)
     net_k.compile(optimizer=keras.optimizers.Adam(0.01), loss="mse")
-    net_k.fit(xg[idx][:, None], yg[idx][:, None], epochs=600, batch_size=xg.size, verbose=0)
+    net_k.fit(xg[idx][:, None], yg[idx][:, None], epochs=150, batch_size=xg.size, verbose=0)
     members.append(net_k.predict(xs_grid[:, None], verbose=0)[:, 0])
 ens = np.stack(members)
 sig_epi = ens.std(0)
@@ -472,13 +472,13 @@ x2, y2 = x2[order2], y2[order2]
 # the alternative: an MSE net wearing one constant bar
 mean_net = make_mlp(n_out=1, seed=1)
 mean_net.compile(optimizer=keras.optimizers.Adam(0.01), loss="mse")
-mean_net.fit(x2[:, None], y2[:, None], epochs=500, batch_size=64, verbose=0)
+mean_net.fit(x2[:, None], y2[:, None], epochs=150, batch_size=64, verbose=0)
 mu2 = mean_net.predict(x2[:, None], verbose=0)[:, 0]
 const = (y2 - mu2).std()
 # the tool: one net, two outputs, NLL loss
 noise_net = make_mlp(n_out=2, seed=2)
 noise_net.compile(optimizer=keras.optimizers.Adam(0.01), loss=gaussian_nll)
-noise_net.fit(x2[:, None], y2[:, None], epochs=800, batch_size=64, verbose=0)
+noise_net.fit(x2[:, None], y2[:, None], epochs=200, batch_size=64, verbose=0)
 pred2 = noise_net.predict(x2[:, None], verbose=0)
 mu2b, sig2 = pred2[:, 0], np.exp(pred2[:, 1])
 fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 3.0), sharey=True)
@@ -497,6 +497,66 @@ fig.tight_layout(); plt.show()
 
 Same coverage — but the constant bar cries wolf in the calm zone.  $\sigma(x)$
 puts the doubt where the world is actually noisy.
+
+## Tool A, Robust — When One Crash Wrecks the Band
+
+The Gaussian NLL pays $\dfrac{(y-\mu)^2}{2\sigma^2}$ for **every** point — so a
+single crash *drags* $\mu$ and *inflates* $\sigma$ everywhere to cover it.
+
+. . .
+
+Keep the recipe, swap the likelihood: a **Student-t** with $\nu$ degrees of
+freedom.  Same two heads $[\mu,\log\sigma]$, a loss with **fatter tails** that
+treats the odd shock as the rare event it is.
+
+$$L_t \;=\; \log\sigma \;+\; \frac{\nu+1}{2}\,\log\!\left(1 + \frac{1}{\nu}\Big(\tfrac{y-\mu}{\sigma}\Big)^2\right)$$
+
+**The question:** which head keeps an *honest* band when the noise has fat tails?
+
+## Tool A, Robust — In Pictures
+
+```{python}
+#| echo: false
+#| fig-width: 11
+#| fig-height: 3.1
+xt, yt = datasets.heteroscedastic_noise(n=240, seed=0)
+ot = np.argsort(xt); xt, yt = xt[ot], yt[ot]
+rngo = np.random.default_rng(3)
+hit = rngo.choice(len(xt), 8, replace=False)
+yt2 = yt.copy()
+yt2[hit] += rngo.choice([-1, 1], 8) * rngo.uniform(3, 5, 8)   # 8 injected shocks
+
+
+def student_t_nll(y_true, y_pred, nu=4.0):                    # −log t_ν(y; μ, σ)
+    mu = y_pred[:, :1]
+    log_sig = y_pred[:, 1:2]                                  # head outputs log σ (same as gaussian_nll)
+    z = (y_true - mu) / keras.ops.exp(log_sig)
+    return keras.ops.mean(log_sig + 0.5 * (nu + 1.0) * keras.ops.log(1.0 + z ** 2 / nu))
+
+
+bands = []
+for loss, ttl in [(gaussian_nll, "Gaussian head"), (student_t_nll, "Student-t head (ν=4)")]:
+    net = make_mlp(n_out=2, seed=2)
+    net.compile(optimizer=keras.optimizers.Adam(0.01), loss=loss)
+    net.fit(xt[:, None], yt2[:, None], epochs=150, batch_size=64, verbose=0)
+    p = net.predict(xt[:, None], verbose=0)
+    bands.append((p[:, 0], np.exp(p[:, 1]), ttl))               # σ = exp(log σ)
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 3.1), sharey=True)
+for ax, (mu, sig, ttl) in zip(axes, bands):
+    ax.fill_between(xt, mu - 2 * sig, mu + 2 * sig, color=COOL, alpha=0.28)
+    ax.scatter(xt, yt2, s=10, c=INK, alpha=0.5)
+    ax.scatter(xt[hit], yt2[hit], s=34, c=CRASH, zorder=5, label="injected shocks")
+    ax.plot(xt, mu, c=INK, lw=2)
+    ax.set_title(f"{ttl}  ·  mean σ̂ = {sig.mean():.2f}", fontsize=11)
+    ax.set_ylim(-6, 6); ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+axes[0].legend(fontsize=10, frameon=False, loc="lower left")
+fig.tight_layout(); plt.show()
+```
+
+Eight shocks (red).  The Gaussian head **balloons everywhere** to cover them; the
+Student-t band stays **tight and honest** and lets the shocks be outliers.
+*Default Gaussian; reach for the t when the tails are fat.*
 
 ## Aleatoric Is Volatility
 
@@ -635,6 +695,184 @@ takes over.  **One band, two honest ingredients.**
 
 More data shrinks only the **right-hand column** — confusing the two
 is how 95% promises get broken.
+
+## A Third Doubt — The Inputs Aren't Exact
+
+Both bands assumed the input $x$ was **known**.  Real inputs are *estimates* with
+error — a rolling vol, a noisy sensor, last step's own forecast — and they **drift**.
+
+. . .
+
+Treat the input as a distribution, $x \sim \mathcal N(\mu,\sigma_x^2)$, and push it
+through the model.  The tool is the **Jacobian** — the same object from *change of
+variables* (Module 2):
+
+$$\log p_y \;=\; \log p_x - \log|\det J| \qquad\text{(Module 2 — a density)}$$
+$$\sigma_y^2 \;\approx\; J\,\sigma_x^2\,J^\top \qquad\text{(here — the uncertainty)}$$
+
+**Same $J$, two jobs.**  Propagate it by **sampling** (Monte-Carlo) or by
+**linearizing** (one Jacobian, cheap).
+
+## Propagate It — Monte-Carlo vs the Jacobian
+
+```{python}
+#| echo: false
+#| fig-width: 11
+#| fig-height: 3.2
+fx, fy = datasets.heteroscedastic_noise(n=600, seed=0)
+fnet = make_mlp(n_out=1, seed=1)
+fnet.compile(optimizer=keras.optimizers.Adam(0.01), loss="mse")
+fnet.fit(fx[:, None], fy[:, None], epochs=150, batch_size=64, verbose=0)
+
+
+def f_mean(xx):                                              # the trained mean f(x)
+    return fnet.predict(np.asarray(xx).reshape(-1, 1).astype("float32"), verbose=0)[:, 0]
+
+
+xt = np.linspace(-3, 3, 30)
+rngp = np.random.default_rng(0)
+sx, S = 0.4, 300
+
+# Monte-Carlo: sample x ~ 𝒩(μ, σ_x²), push through, take the output spread
+mc = f_mean((xt[:, None] + sx * rngp.standard_normal((30, S))).ravel()).reshape(30, S)
+mu_y, mc_s = mc.mean(1), mc.std(1)
+# linearize: σ_y ≈ |f'(μ)|·σ_x   (finite-difference Jacobian)
+fp = (f_mean(xt + 1e-2) - f_mean(xt - 1e-2)) / 2e-2
+lin_s = np.abs(fp) * sx
+
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 3.2))
+axL.fill_between(xt, mu_y - 2 * mc_s, mu_y + 2 * mc_s, color=COOL, alpha=0.30, label="Monte-Carlo")
+axL.plot(xt, mu_y - 2 * lin_s, c=CRASH, lw=1.6, ls="--")
+axL.plot(xt, mu_y + 2 * lin_s, c=CRASH, lw=1.6, ls="--", label="linearized  J σ_x")
+axL.plot(xt, mu_y, c=INK, lw=2)
+axL.set_title("propagate σ_x = 0.4", fontsize=11)
+axL.legend(fontsize=9, frameon=False, loc="upper center")
+
+for sxd, a in [(0.2, 0.20), (0.5, 0.32), (1.0, 0.45)]:               # drift: inflate σ_x
+    s = f_mean((xt[:, None] + sxd * rngp.standard_normal((30, S))).ravel()).reshape(30, S).std(1)
+    axR.fill_between(xt, mu_y - 2 * s, mu_y + 2 * s, color=WARM, alpha=a, label=f"σ_x = {sxd}")
+axR.plot(xt, mu_y, c=INK, lw=2)
+axR.set_title("drift → wider band", fontsize=11)
+axR.legend(fontsize=9, frameon=False, loc="upper center")
+for ax in (axL, axR):
+    ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+fig.tight_layout(); plt.show()
+```
+
+**Left:** Monte-Carlo and the linearized band agree where $f$ is straight, part
+where it curves.  **Right:** assume the inputs got noisier — a regime shift — and
+the band **widens honestly**.  *Drift is just inflated $\sigma_x$.*
+
+## Three Doubts, One Budget
+
+$$\sigma_{\text{total}}^2 \;=\; \underbrace{\sigma(x)^2}_{\text{noise}}
+\;+\; \underbrace{\operatorname{Var}_m \mu_m(x)}_{\text{ignorance}}
+\;+\; \underbrace{J\,\sigma_x^2\,J^\top}_{\text{uncertain }x}$$
+
+| source | what it is | how you answer it | shrinks with |
+|---|---|---|---|
+| **aleatoric** | irreducible noise $\sigma(x)$ | *predict* it — Gaussian / robust $t$ head | a better noise model |
+| **epistemic** | the model's ignorance | *admit* it — a deep ensemble | more data |
+| **input** | $x$ is an estimate / drifts | *propagate* it — $J\sigma_x^2 J^\top$ or MC | better inputs |
+
+Three terms, one promise: **claim only what your evidence justifies.**
+
+## Flip the Goal — Make the Prediction *Ignore* Something
+
+Sometimes you want the **opposite** of dependence: a prediction that must *not*
+depend on a protected attribute $S$ (sex, race) — **fair learning**.
+
+. . .
+
+We already *measure* dependence — **CKA**, Module 1's double-centering.  Add it to
+the same probabilistic loss:
+
+$$L \;=\; \underbrace{\text{NLL}\big(y;\,\mu(x),\sigma(x)\big)}_{\text{the probabilistic net}}
+\;+\; \lambda\cdot\underbrace{\operatorname{CKA}\big(\mu(x),\,S\big)}_{\text{dependence}\,\to\,0}$$
+
+$S$ **never enters the model — only the loss.**  The same machine that *measured*
+dependence in Module 1 now *removes* it.
+
+## The Price of Fairness — and the Band Tells You
+
+```{python}
+#| echo: false
+#| fig-width: 11
+#| fig-height: 3.0
+import keras.ops as kops
+from lectures.measures import cka_rbf
+
+
+def cka_g(pred, s):                                          # RBF CKA, in-graph (differentiable)
+    def rbf(z):
+        z = kops.reshape(z, (-1, 1)); d2 = (z - kops.transpose(z)) ** 2
+        return kops.exp(-d2 / (2 * (kops.median(d2) + 1e-12)))
+    def dc(M):
+        return M - kops.mean(M, 0, keepdims=True) - kops.mean(M, 1, keepdims=True) + kops.mean(M)
+    A, B = dc(rbf(pred)), dc(rbf(s)); h = lambda P, Q: kops.mean(P * Q)
+    return h(A, B) / kops.sqrt(h(A, A) * h(B, B) + 1e-12)
+
+
+class FairProb(keras.Model):                                 # Note-06 net + a CKA penalty
+    def __init__(self, lam):
+        super().__init__()
+        self.h1 = layers.Dense(40, activation="tanh"); self.h2 = layers.Dense(40, activation="tanh")
+        self.o = layers.Dense(2); self.lam = lam
+    def call(self, inp, training=False):
+        x, q = inp["x"], inp["q"]
+        p = self.o(self.h2(self.h1(x)))                      # head = [μ, log σ²]; sees FEATURES only
+        if training and self.lam > 0:
+            self.add_loss(self.lam * cka_g(p[:, :1], q))     # λ·CKA(μ, S); S in the loss only
+        return p
+
+
+dfr = datasets.fair_regression(n=400, seed=0)
+xd, Sd, yd = dfr["x"], dfr["s"], dfr["y"]
+prox = Sd + 0.3 * np.random.default_rng(1).standard_normal(len(Sd))   # a proxy that carries S
+Xf = np.column_stack([xd, prox]).astype("float32")
+Sc = Sd[:, None].astype("float32"); Yf = yd[:, None].astype("float32")
+# μ depends on x AND the proxy — so draw the band on a clean x-grid, proxy held at its mean
+xs = np.linspace(xd.min(), xd.max(), 200).astype("float32")
+grid = {"x": np.column_stack([xs, np.full_like(xs, prox.mean())]),
+        "q": np.zeros((len(xs), 1), "float32")}
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 3.0), sharey=True)
+for ax, (lam, ttl) in zip(axes, [(0.0, "plain"), (8.0, "+ CKA penalty")]):
+    keras.utils.set_random_seed(0)
+    m = FairProb(lam)
+    m.compile(optimizer=keras.optimizers.Adam(0.01), loss=gaussian_nll)
+    m.fit({"x": Xf, "q": Sc}, Yf, epochs=200, batch_size=64, verbose=0)
+    pdat = np.asarray(m.predict({"x": Xf, "q": Sc}, verbose=0))       # on the data → CKA, mean σ̂
+    mu_d, sig_d = pdat[:, 0], np.exp(pdat[:, 1])                     # σ = exp(log σ), matches gaussian_nll
+    pg = np.asarray(m.predict(grid, verbose=0))                      # on the grid → a smooth band
+    mu_g, sig_g = pg[:, 0], np.exp(pg[:, 1])
+    ax.scatter(xd, yd, s=8, c=INK, alpha=0.30)
+    ax.fill_between(xs, mu_g - 2 * sig_g, mu_g + 2 * sig_g, color=COOL, alpha=0.30)
+    ax.plot(xs, mu_g, c=INK, lw=2)
+    ax.set_title(f"{ttl}  ·  CKA(μ,S)={cka_rbf(mu_d, Sd):.2f}  ·  σ̂={sig_d.mean():.2f}", fontsize=10.5)
+    ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+fig.tight_layout(); plt.show()
+```
+
+Force the prediction independent of $S$ and it loses the $S$-signal — so the
+**honest net widens its band** ($\hat\sigma$ grows) to stay calibrated.
+**Fairness has a price, and the probabilistic band shows you exactly what it is.**
+
+## The Whole Machine — Measure · Transform · Propagate · Constrain
+
+The course is **one dependence machine**, read four ways:
+
+| | the move | the tool |
+|---|---|---|
+| **M1 · measure** | how much do $X,Y$ share? | correlation → MI → CKA |
+| **M2 · transform** | flatten to independent Gaussian | change of variables · $\log\lvert\det J\rvert$ |
+| **M3 · propagate** | carry uncertainty forward | sample the joint · $J\sigma_x^2 J^\top$ |
+| **M4 · constrain** | force a prediction to ignore $S$ | CKA on the loss |
+
+. . .
+
+The same **Jacobian** moves a density (M2) and an uncertainty (M3); the same
+**CKA** measures dependence (M1) and removes it (M4).
 
 ## The Capstone — One Machine, Three Uses
 

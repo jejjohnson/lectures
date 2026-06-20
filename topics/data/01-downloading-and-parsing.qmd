@@ -11,6 +11,10 @@ from lectures import plotting, datasets
 from lectures.plotting import INK, despine
 plotting.set_style("notes")
 import numpy as np, matplotlib.pyplot as plt
+import einx                      # linear algebra with the axes spelled out
+from jaxtyping import Float      # shape annotations: Float[Array, "n_days"]
+
+Array = np.ndarray
 ```
 
 Every market example in this course runs on one small table: daily **returns**
@@ -56,8 +60,8 @@ runs continuously from 2004.)*
 ## 2 · The Pipeline
 
 The download script does three things: fetch the **adjusted** close panel for the
-basket (`yfinance` returns it already wide, one column per ticker), drop days with
-any missing quote, and convert prices to **log-returns**.  The committed script is
+basket, drop days with any missing quote, and convert prices to **log-returns**.
+The committed script is
 [`scripts/download_market_data.py`](../../scripts/download_market_data.py); its
 core is just:
 
@@ -74,6 +78,72 @@ rets.to_csv("data/processed/returns_basket.csv")
 The `auto_adjust=True` flag matters: it folds **dividends and splits** into the
 price (e.g. Citigroup's 2011 1-for-10 reverse split), so a "return" reflects what
 an investor actually earned — not an artificial jump on the split date.
+
+We don't re-download at page-render time (CI has no network), so the steps below
+are illustrated on tiny hand-made frames — the *shapes* are real, the numbers are
+just legible stand-ins. The committed result lives in
+`data/processed/returns_basket.csv` and loads with `datasets.load_returns()`.
+
+### 2.1 · The shape `yfinance` hands back
+
+For a multi-ticker download, `yfinance` does **not** return a flat table.  Its
+columns are a two-level **`(field, ticker)` MultiIndex**: the outer level is the
+field (`Open`, `High`, `Low`, `Close`, `Volume`), the inner level is the ticker.
+Here is that exact shape on a 2-ticker × 2-day toy — the layout is honest, the
+prices are round numbers for reading:
+
+```{python}
+#| label: tbl-yf-multiindex
+import pandas as pd
+
+# the shape yfinance hands back — illustrated (2 tickers x 2 days, made-up prices)
+dates = pd.to_datetime(["2007-01-03", "2007-01-04"])
+cols = pd.MultiIndex.from_product([["Close", "Volume"], ["JPM", "AAPL"]],
+                                  names=["field", "ticker"])
+raw = pd.DataFrame(
+    [[48.27, 2.99, 1.1e7, 3.1e8],
+     [48.55, 3.06, 9.8e6, 2.9e8]],
+    index=dates, columns=cols)
+raw.index.name = "date"
+print(raw.to_string())
+```
+
+We only want the **adjusted close**, so we select the `Close` field.  Indexing the
+outer level with `raw["Close"]` *drops* it and leaves a flat, wide **price panel** —
+one column per ticker, one row per day.  This is the single line `raw["Close"]` in
+the script:
+
+```{python}
+#| label: tbl-yf-close
+prices = raw["Close"]            # select the 'Close' field -> flatten the MultiIndex
+print(prices.to_string())
+```
+
+### 2.2 · Aligning names with `dropna(how="any")`
+
+Different tickers have different **first trading dates** — a name that IPO'd late, or
+a quote Yahoo simply never filled, leaves a hole.  Because we ask for the *union* of
+all dates across the basket, those holes show up as `NaN` cells.  We want a panel
+where every name is quoted on every retained day (so correlations and crash dates
+line up across all 14), so we drop **any row with a missing quote**.  On a tiny frame
+with one stray gap:
+
+```{python}
+#| label: tbl-dropna
+# a late-listing name (T2) is unquoted on the first day -> a NaN row
+gap = pd.DataFrame(
+    {"T1": [10.0, 10.2, 10.1], "T2": [np.nan, 20.4, 20.1]},
+    index=pd.to_datetime(["2007-01-03", "2007-01-04", "2007-01-05"]))
+gap.index.name = "date"
+print("before dropna:")
+print(gap.to_string())
+print("\nafter dropna(how='any')  — the incomplete row is removed:")
+print(gap.dropna(how="any").to_string())
+```
+
+`how="any"` is deliberate: one missing name is enough to drop the whole row, which
+keeps all 14 columns **date-aligned**.  The cost is a slightly later common start
+date; the benefit is a rectangular panel with no gaps to special-case downstream.
 
 We don't re-download at page-render time (CI has no network); the result is
 committed as `data/processed/returns_basket.csv` and loaded with
@@ -94,12 +164,38 @@ is the **simple return** $P_t/P_{t-1} - 1$ — the everyday percentage change.  
 instead work with the *log* return $r_t = \log(P_t / P_{t-1})$.  The two are close
 but not identical, and it's worth *seeing* the difference before trusting it.
 
+Both are built from the same raw ingredient: today's price over yesterday's, the
+**gross return** $P_t/P_{t-1}$.  We don't ship prices, but we can reconstruct an
+illustrative price path from the returns we *do* ship and lay the two definitions
+side by side on a handful of real days.  On calm days they round to the same number;
+the third decimal is where they start to drift:
+
+```{python}
+#| label: tbl-simple-vs-log
+# Pₜ = 100·exp(Σ rₜ)   illustrative JPMorgan price path from its log-returns
+px = 100 * np.exp(R["JPM"].cumsum())
+gross = px / px.shift(1)                       # gross return  Pₜ / Pₜ₋₁
+simple_ret = gross - 1                         # simple  Pₜ/Pₜ₋₁ − 1
+log_ret = np.log(gross)                        # log     ln(Pₜ/Pₜ₋₁)
+step = pd.DataFrame({
+    "P_{t-1}": px.shift(1),
+    "P_t": px,
+    "gross  P_t/P_{t-1}": gross,
+    "simple  P_t/P_{t-1}-1": simple_ret,
+    "log  ln(P_t/P_{t-1})": log_ret,
+}).dropna()
+print(step.iloc[100:105].round(5).to_string())   # five consecutive real days
+```
+
+The last two columns are the whole choice: subtract one, or take a log.  Now the
+two side by side across the full history.
+
 ```{python}
 #| label: fig-simple-vs-log
 #| fig-cap: "Left: Citigroup's simple and log returns day-by-day through the 2008–09 crisis — indistinguishable on ordinary days, parting only on the violent ones. Right: every day of every name. The two agree along the dashed line near the origin but bend away in the tails, where the log return is always the more stabilising of the two (it tames big gains and deepens big losses, symmetrising both)."
 import matplotlib.dates as mdates
 
-simple = np.exp(R) - 1                 # recover the original simple returns
+simple = np.exp(R) - 1                 # simpleₜ = exp(rₜ) − 1   recover original simple returns
 name = "C"                             # Citigroup — the panel's most violent days
 win = (R.index >= "2008-09-01") & (R.index <= "2009-04-30")
 
@@ -115,8 +211,9 @@ axL.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
 axL.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
 despine(axL)
 
-s_all = simple.to_numpy().ravel() * 100
-l_all = R.to_numpy().ravel() * 100
+# every (day, name) cell of both panels, flattened to one cloud  (n_days·n_assets points)
+s_all: Float[Array, "n_points"] = simple.to_numpy().ravel() * 100   # simple returns (%)
+l_all: Float[Array, "n_points"] = R.to_numpy().ravel() * 100        # log returns (%)
 axR.scatter(s_all, l_all, s=4, c=plotting.COOL, alpha=0.25, edgecolors="none")
 lim = [s_all.min() - 2, s_all.max() + 2]
 axR.plot(lim, lim, color=INK, lw=1.2, ls="--", label="log = simple")
@@ -146,7 +243,8 @@ no linear axis can show at once.
 #| label: fig-price-paths
 #| fig-cap: "Reconstructed price paths (each name indexed to 100 at the start, log scale), coloured by sector. The banks (red) plunge together in 2008 and again in 2020; tech compounds relentlessly; utilities and staples drift calmly through both crises. This is the cumulative story the daily returns table encodes."
 meta = datasets.load_basket_meta().set_index("ticker")
-prices = 100 * np.exp(R.cumsum())            # P_t = 100 * exp(sum of log-returns)
+# Pₜ = 100·exp(Σ_{s≤t} rₛ)   reconstructed price, each name indexed to 100 at the start
+prices = 100 * np.exp(R.cumsum())
 
 sector_color = {
     "Banks": plotting.CRASH, "Tech": plotting.COOL, "Energy": "#b08968",
@@ -170,8 +268,10 @@ And the round-trip confirms the formula: re-deriving log-returns from the
 reconstructed prices reproduces the original table exactly.
 
 ```{python}
+# rₜ = ln(Pₜ / Pₜ₋₁)   re-derive log-returns from the reconstructed prices (the inverse transform)
 back = np.log(prices / prices.shift(1)).dropna(how="any")
-print(f"max |reconstructed return - original| = {np.abs(back - R.loc[back.index]).to_numpy().max():.2e}")
+round_trip_err: Float[Array, "n_days n_assets"] = np.abs(back - R.loc[back.index]).to_numpy()
+print(f"max |reconstructed return - original| = {round_trip_err.max():.2e}")
 ```
 
 ::: {.callout-tip}
@@ -179,6 +279,53 @@ print(f"max |reconstructed return - original| = {np.abs(back - R.loc[back.index]
 One table, two views: the **returns** are what we do statistics on (stationary,
 additive); the **prices** are the cumulative story they tell.  Everything in the
 market chapters starts from `datasets.load_returns()`.
+:::
+
+---
+
+## What the Labs Reload From Here
+
+This page **owns** the base returns panel.  The download, the `Close` selection, the
+`dropna` alignment, and the prices→log-returns transform happen **once, here** — and
+the result is exactly the object every market lab reloads.  That object is one
+function call away:
+
+```{python}
+#| label: tbl-handoff
+R = datasets.load_returns()              # the base returns panel — built once, above
+print(f"shape       : {R.shape[0]} trading days x {R.shape[1]} assets")
+print(f"date range  : {R.index.min().date()} -> {R.index.max().date()}")
+print(f"columns     : {', '.join(R.columns)}")
+print()
+print("corner (first 3 days x 6 names):")
+print(R.iloc[:3, :6].round(4).to_string())
+```
+
+That is the raw material.  A lab opens with this single line, shows one corner to
+confirm what it loaded, and then climbs straight to its own metric — it never
+re-derives prices or returns.
+
+::: {.callout-note icon=false}
+## The Lab Contract
+
+The **dependence**, **gaussianization**, and **uncertainty** labs reload this panel
+via `datasets.load_returns()` and do **not** re-derive prices → returns.  The
+cleaning (download, `Close` selection, `dropna` alignment) and the log-return
+transform live **here**, in the data primer, and nowhere else.
+
+The only lab-specific steps allowed on top of the reload are:
+
+- **column selection** — picking a sub-basket (e.g. the five banks, or one
+  bank-vs-energy pair), and
+- **subsampling** — restricting to a window of dates (e.g. the 2008 crisis).
+
+Anything heavier — recomputing returns, winsorizing, building targets — would
+duplicate this chapter and is out of bounds for a lab.
+
+Where each module reloads it:
+[Dependence](../dependence/index.qmd) ·
+[Gaussianization](../gaussianization/index.qmd) ·
+[Uncertainty](../uncertainty/index.qmd).
 :::
 
 ---

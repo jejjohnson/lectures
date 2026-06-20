@@ -201,7 +201,7 @@ neutral.** The Module-1 hole returns.
 #| echo: false
 #| fig-width: 10
 #| fig-height: 3.6
-d = datasets.fair_regression(n=1000, seed=0)
+d = datasets.fair_regression(n=600, seed=0)
 x, S, yt = d["x"], d["s"], d["y"]
 yh = fair_fit(x, yt, S, mu=0.0)
 b = np.cov(yh, S)[0, 1] / np.var(S)
@@ -241,7 +241,7 @@ Gaussianize each axis on its own and the bend — and the CKA — barely move. O
 #| echo: false
 #| fig-width: 11
 #| fig-height: 3.3
-d2 = datasets.fair_regression(n=1000, seed=0)
+d2 = datasets.fair_regression(n=600, seed=0)
 x2, S2, yt2 = d2["x"], d2["s"], d2["y"]
 yh2 = fair_fit(x2, yt2, S2, mu=0.0)
 Sg, yg = gaussianize_1d(S2), gaussianize_1d(yh2)  # the cheap per-axis shortcut

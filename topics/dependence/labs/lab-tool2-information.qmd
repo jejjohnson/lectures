@@ -1,6 +1,6 @@
 ---
 title: "Tool 2 — Information Measures"
-subtitle: "Mutual Information in Bits · Validating Estimators"
+subtitle: "Mutual Information Between Blocks · in Bits"
 ---
 
 ```{python}
@@ -9,271 +9,318 @@ import sys, pathlib
 sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
 from lectures import plotting, datasets
 from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
-from lectures.measures import mutual_information_bits, mutual_information_xy, linfoot_r, nats_to_bits
+from lectures.measures import mutual_information_xy, nats_to_bits, linfoot_r
+from lectures.gaussianization import gaussianize_1d
 plotting.set_style("notes")
 import numpy as np, matplotlib.pyplot as plt
-from scipy.stats import multivariate_normal, pearsonr, spearmanr
-from jaxtyping import Float      # shape annotations: Float[Array, "n_days"]
+import einx                      # linear algebra with the axes spelled out
+from jaxtyping import Float      # shape annotations: Float[Array, "n_days d"]
 
 Array = np.ndarray
+LN2 = np.log(2)                  # 1 bit = ln 2 nats
 ```
 
 *Learn-the-tool track · Lab 2 of 3.*
 
-Tool 1 walked the no-density road.  This lab crosses to the **density road**:
-instead of asking "how aligned are the points," we ask "how much do these two
-share, in bits?"  That is mutual information, and it sees *any* form of
-dependence, not just the part a straight line captures.
+Tool 1 walked the no-density road and topped out at *strength*.  This lab crosses
+to the **density road** and asks a sharper, harder question: how much information do
+two *blocks* of assets share?  Mutual information — the amount of information, measured
+in **bits**, that knowing one variable gives you about another — sees any form of
+dependence.  And, unlike correlation, it works block-against-block: a whole sector
+against another whole sector, not just one asset against one asset.  The catch is the
+*estimator*, the recipe we use to compute it from data: in more than one dimension the
+naive histogram falls apart, and the lab's spine is learning which estimator to
+trust and how to *prove* it on a known answer first.
 
-The responsible first move — and the spine of this lab — is to **prove the
-estimator works on a known answer** before trusting it on returns.
-
-**What you will produce:** a calibrated MI estimator and a measurement of
-shared information for every pair in the basket.
+**What you will produce:** a trustworthy block-MI estimator, validated against a
+closed form, and a cross-sector information report for the real basket.
 
 ---
 
-## Setup
+## 🧪 Rung 1 · Toy — Known Answer
+
+`datasets.info_blocks()` is built for exactly this check: two blocks
+$x = [x_1,\dots,x_{d}]$ and $y = [y_1,\dots,y_{d}]$ from a shared factor model whose
+mutual information has a **closed form** — an exact formula we can compute, printed in
+`truth["I_xy"]`.  We can dial the block width $d$ up and watch each estimator against
+the truth.
+
+**The algorithm.**  Mutual information is the KL divergence between the joint and
+the product of marginals, $I(x;y) = D_{\mathrm{KL}}\!\big(p_{x,y}\,\|\,p_x p_y\big)$.
+Two ways to estimate it:
+
+```{python}
+def gaussianize_cols(X: Float[Array, "n d"]) -> Float[Array, "n d"]:
+    """Rank → standard normal, column by column (the Gaussian-copula transform).
+
+    Strips each marginal's shape so only the dependence structure is left.
+    """
+    return np.column_stack([gaussianize_1d(X[:, j]) for j in range(X.shape[1])])
+
+
+def block_mi_bits(x: Float[Array, "n dx"], y: Float[Array, "n dy"]) -> float:
+    """Mutual information between two blocks — Gaussian-copula estimator   [bits].
+
+    Gaussianize every column, then   I(x;y) = ½·ln( |Σx|·|Σy| / |Σ| )   [nats].
+    """
+    dx = x.shape[1]
+
+    Z: Float[Array, "n d"] = gaussianize_cols(np.column_stack([x, y]))   # normal scores
+    Zc: Float[Array, "n d"] = Z - Z.mean(0)                              # center each column
+
+    Σ: Float[Array, "d d"] = einx.dot("n i, n j -> i j", Zc, Zc) / len(Z)   # Σ = (1/n)·ZcᵀZc
+
+    _, logdet = np.linalg.slogdet(Σ)                              # ln|Σ|
+    _, logdet_x = np.linalg.slogdet(np.atleast_2d(Σ[:dx, :dx]))   # ln|Σx|
+    _, logdet_y = np.linalg.slogdet(np.atleast_2d(Σ[dx:, dx:]))   # ln|Σy|
+
+    # I(x;y) = ½·ln(|Σx|·|Σy|/|Σ|)   [nats] → bits
+    return 0.5 * (logdet_x + logdet_y - logdet) / LN2
+
+
+def hist_block_mi_bits(
+    x: Float[Array, "n dx"], y: Float[Array, "n dy"], bins: int = 5
+) -> float:
+    """The naive alternative: bin the joint, sum   Σ pᵢⱼ·log₂[ pᵢⱼ/(pᵢ·pⱼ) ]   [bits].
+
+    Fine in 1-D; in many dimensions the cells empty out and the estimate breaks.
+    """
+    dx = x.shape[1]
+    d = x.shape[1] + y.shape[1]
+
+    XY: Float[Array, "n d"] = np.column_stack([x, y])
+    counts, _ = np.histogramdd(XY, bins=bins)            # (bins,)*d joint table
+    p = counts / counts.sum()                            # pᵢⱼ — joint cell probabilities
+
+    px = p.sum(axis=tuple(range(dx, d)))                 # pᵢ — marginal over the y axes
+    py = p.sum(axis=tuple(range(dx)))                    # pⱼ — marginal over the x axes
+    p_indep = np.tensordot(px, py, axes=0)               # pᵢ·pⱼ under independence
+
+    m = p > 0                                            # 0·log0 = 0 by convention
+
+    # I(x;y) = Σᵢⱼ pᵢⱼ·log₂[ pᵢⱼ/(pᵢ·pⱼ) ]   [bits]
+    return float((p[m] * np.log2(p[m] / p_indep[m])).sum())
+```
+
+At $d = 1$ — a scalar pair — both estimators land on the truth.  Widen the blocks
+and the histogram does not just lose accuracy, it **explodes**: empty cells read as
+spurious structure.  The Gaussian-copula estimator stays honest.
+
+```{python}
+#| label: curse-compute
+widths = [1, 2, 3, 4]
+truth, gauss, hist = [], [], []
+for d in widths:
+    b = datasets.info_blocks(n=4000, dx=d, dy=d, within=0.5, between=0.5, seed=1)
+    truth.append(b["truth"]["I_xy"] / LN2)               # exact I(x;y), nats → bits
+    gauss.append(block_mi_bits(b["x"], b["y"]))          # Gaussian-copula estimate, bits
+    hist.append(hist_block_mi_bits(b["x"], b["y"], bins=5))   # naive histogram, bits
+
+print(f"{'d':>2}{'truth':>9}{'gauss':>9}{'hist':>9}   (bits)")
+for d, t, g, h in zip(widths, truth, gauss, hist):
+    print(f"{d:>2}{t:>9.3f}{g:>9.3f}{h:>9.3f}")
+```
+
+```{python}
+#| label: fig-curse
+#| fig-cap: "The curse of dimensionality for block MI. As the block width d grows (info_blocks, n=4000, equal within/between loadings), the closed-form truth (black) drifts up gently. The Gaussian-copula estimator (blue) tracks it. The histogram (red) tracks at d=1 but blows up past it — by d=4 it reports ~10× the true bits, pure binning artefact. In more than one dimension, only the Gaussianized estimate is usable."
+fig, ax = plt.subplots(figsize=(7.6, 4.2))
+ax.plot(widths, truth, color=INK, lw=2, marker="o", label="closed-form truth")
+ax.plot(widths, gauss, color=COOL, lw=2, marker="s", label="Gaussian-copula estimate")
+ax.plot(widths, hist, color=CRASH, lw=2, marker="^", label="histogram estimate")
+ax.set_xticks(widths); ax.set_xlabel("block width  d  (each side is d-dimensional)")
+ax.set_ylabel("I(x; y)  (bits)")
+ax.set_title("Only the Gaussianized estimator survives past 1-D", fontsize=12)
+ax.legend(fontsize=9, frameon=False); despine(ax)
+fig.tight_layout(); plt.show()
+```
+
+The known answer is unambiguous: trust the Gaussian-copula estimator for blocks,
+and never a raw histogram above one dimension.
+
+---
+
+## 🎭 Rung 2 · Toy-Real — A Stylized Market
+
+Now the *same* estimator on a small, real block — the "toy example of real data"
+from the data primer: two banks against two energy majors,
+$x = [\text{JPM}, \text{BAC}]$, $y = [\text{XOM}, \text{CVX}]$.  **What we are looking
+for:** how much these two sectors move together.  There is **no closed
+form** here — no exact answer to check against — so we validate two ways.  First a
+**shuffle floor**: scramble the data so there is provably no link, and read what the
+estimator reports (it should read near zero).  Second the **histogram disagreement**:
+how badly the naive estimator misreads the real, fat-tailed data.  From here on we
+report the information on the **Linfoot R** scale: the mutual information rescaled so
+that R runs from 0 to 1, and equals |ρ| for a Gaussian — so it is directly comparable
+to the correlation-scale measures from Tool 1.
 
 ```{python}
 R = datasets.load_returns()
-META = datasets.load_basket_meta()
-label = dict(zip(META["ticker"], META["label"]))
-tickers = list(R.columns)
+x_blk: Float[Array, "n_days 2"] = R[["JPM", "BAC"]].to_numpy()    # block x — two banks
+y_blk: Float[Array, "n_days 2"] = R[["XOM", "CVX"]].to_numpy()    # block y — two energy
+print(f"real block: x = [JPM, BAC] {x_blk.shape}   y = [XOM, CVX] {y_blk.shape}")
+
+# MI rescaled to Linfoot R ∈ [0,1], = |ρ| for a Gaussian, so it is comparable to
+# the correlation-scale measures.  block_mi_bits returns bits → nats → R.
+r_real = linfoot_r(block_mi_bits(x_blk, y_blk) * LN2)            # I([JPM,BAC]; [XOM,CVX])
+r_hist = linfoot_r(hist_block_mi_bits(x_blk, y_blk, bins=5) * LN2)   # naive 4-D histogram
+
+# Shuffle floor: break the x↔y pairing by permuting y's rows; a sound estimator → ~0
 rng = np.random.default_rng(0)
-print(f"Loaded {len(R)} days × {len(tickers)} stocks")
-```
+floor: Float[Array, "n_shuffles"] = np.array(
+    [linfoot_r(block_mi_bits(x_blk, y_blk[rng.permutation(len(y_blk))]) * LN2)
+     for _ in range(40)]
+)
 
----
-
-## 0 · Warm-up — Entropy of the Basket, in Bits
-
-Before sharing information, each asset *carries* information: its entropy, the
-average surprise of one day's return.  Discretise every stock's history into
-the **same** bins (entropy comparisons are only fair on a common grid) and
-rank the basket:
-
-```{python}
-#| label: fig-basket-entropy
-#| fig-cap: "Average surprise per asset. Volatile financials take the most bits to describe; quiet staples and utilities the fewest. Entropy is the budget mutual information spends from — two assets can only share as much surprise as each one carries."
-bins = np.linspace(-0.12, 0.12, 49)   # one shared grid: ±12% daily return, 48 bins
-
-
-def entropy_bits(returns: Float[Array, "n_days"]) -> float:
-    """Average surprise of one day's return.
-
-    H(X) = −Σᵢ pᵢ · log₂(pᵢ)     [bits]   where pᵢ = (days in bin i) / n_days
-    """
-    counts, _ = np.histogram(returns, bins=bins)   # days per return bin
-    p = counts / counts.sum()                      # pᵢ — empirical probabilities
-    p = p[p > 0]                                   # 0·log(0) = 0 by convention
-    return -(p * np.log2(p)).sum()
-
-
-H_per = {t: entropy_bits(R[t].to_numpy()) for t in tickers}
-order = sorted(H_per, key=H_per.get)
-fig, ax = plt.subplots(figsize=(10, 3.6))
-ax.bar(range(len(order)), [H_per[t] for t in order], color=COOL)
-ax.set_xticks(range(len(order)))
-ax.set_xticklabels(order, fontsize=9)
-ax.set_ylabel("entropy  H  (bits)")
-despine(ax)
-fig.tight_layout()
-plt.show()
-```
-
-Sanity-check the ranking against what you know: the noisiest names should be
-the ones whose daily move is genuinely hardest to predict.  Hold on to the
-intuition **entropy = budget**: a pair's mutual information below can never
-exceed the entropy of its quieter member.
-
----
-
-## 1 · A Known Answer — The Gaussian Closed Form
-
-For a bivariate Gaussian with correlation $\rho$:
-
-$$I(X; Y) = -\tfrac{1}{2}\ln(1 - \rho^2) \quad \text{(nats)}$$
-
-This is our calibration target.  If the estimator gets this right, we can
-trust it on harder data.
-
-```{python}
-def mi_gaussian_nats(ρ: float) -> float:
-    """Theoretical MI for a bivariate Gaussian with correlation ρ.
-
-    I(X;Y) = −½ · ln(1 − ρ²)     [nats]   (× 1/ln 2 for bits)
-    """
-    return -0.5 * np.log(1 - ρ**2)
-
-# Test cases
-for rho in [0.0, 0.3, 0.6, 0.9]:
-    mi = mi_gaussian_nats(rho)
-    print(f"  rho={rho:.1f}  MI={mi:.4f} nats  = {nats_to_bits(mi):.4f} bits")
-```
-
----
-
-## 2 · Build the Histogram Estimator
-
-The simplest estimator: bin both variables into a 2-D histogram, then compute
-MI from the joint frequency table.
-
-```{python}
-def mi_histogram_bits(
-    x: Float[Array, "n_days"], y: Float[Array, "n_days"], bins: int = 25
-) -> float:
-    """I(X;Y) via a 2-D histogram estimator     [bits].
-
-    Bin both series jointly, then I = Σᵢⱼ pᵢⱼ · log₂[ pᵢⱼ / (pᵢ.·p.ⱼ) ].
-    """
-    joint_counts, _, _ = np.histogram2d(x, y, bins=bins, density=False)  # (bins, bins)
-    return mutual_information_bits(joint_counts)
-```
-
-**Validate on synthetic Gaussian data:**
-
-```{python}
-print(f"{'rho':>5s}  {'theory (bits)':>14s}  {'estimate (bits)':>16s}  {'error':>7s}")
-print("-" * 50)
-for rho in [0.0, 0.3, 0.6, 0.9]:
-    theory = nats_to_bits(mi_gaussian_nats(rho))
-    x, y = datasets.correlated_returns(n=2000, rho=rho)
-    est = mi_histogram_bits(x, y, bins=30)
-    print(f"  {rho:.1f}  {theory:14.4f}  {est:16.4f}  {abs(est - theory):7.4f}")
+print(f"\nI([JPM,BAC]; [XOM,CVX])   (MI rescaled to Linfoot R ∈ [0,1])")
+print(f"  Gaussian-copula  = {r_real:.3f} info R")
+print(f"  histogram (4-D)  = {r_hist:.3f} info R   ← untrustworthy here")
+print(f"  shuffle floor    = {floor.mean():.3f} ± {floor.std():.3f} info R")
 ```
 
 ```{python}
-#| label: fig-mi-validation
-#| fig-cap: "Histogram estimator vs. Gaussian theory across correlations."
-rhos = np.linspace(0, 0.95, 20)
-theory_bits = [nats_to_bits(mi_gaussian_nats(r)) for r in rhos]
-est_bits = [mi_histogram_bits(*datasets.correlated_returns(n=1500, rho=r), bins=25)
-            for r in rhos]
+#| label: fig-realtoy
+#| fig-cap: "Trusting a block-MI estimate with no closed form. Three readings of the information shared by [JPM,BAC] and [XOM,CVX], all on the Linfoot R scale (R ∈ [0,1], = |ρ| for a Gaussian). The shuffle floor (grey, with its spread as a whisker) is what the estimator reads once x and y are scrambled apart — essentially zero. The Gaussian-copula estimate (blue) sits far above it, so the dependence is real, not estimator bias. The histogram (red), fooled by the fat tails its coarse 4-D grid cannot resolve, under-reads well below it. The floor, not the histogram, is the honest cross-check."
+labels = ["shuffle floor\n(x, y scrambled)", "histogram\n(4-D bins)", "Gaussian-\ncopula"]
+values = [floor.mean(), r_hist, r_real]
+errors = [floor.std(), 0.0, 0.0]                   # only the floor has a spread to show
+colors = ["0.7", CRASH, COOL]
 
-fig, ax = plt.subplots(figsize=(8, 4.2))
-ax.plot(rhos, theory_bits, color=INK, lw=2, label="Gaussian theory")
-ax.scatter(rhos, est_bits, color=COOL, s=40, zorder=5, label="histogram estimate")
-ax.set_xlabel("Pearson correlation  ρ")
-ax.set_ylabel("Mutual information  (bits)")
-ax.set_title("Histogram MI: calibration against Gaussian theory", fontsize=12)
-ax.legend(frameon=False)
-despine(ax)
-plt.tight_layout()
-plt.show()
+fig, ax = plt.subplots(figsize=(8.4, 3.4))
+ax.barh(labels, values, xerr=errors, color=colors, alpha=0.95,
+        error_kw=dict(ecolor=INK, capsize=4))
+for y, v in enumerate(values):
+    ax.text(v + 0.012, y, f"{v:.3f}", va="center", fontsize=10, color=INK)
+ax.set_xlim(0, r_real * 1.28)                      # headroom so the value labels fit
+ax.set_xlabel("info R  (MI on the Linfoot scale, 0–1)")
+ax.set_title("The estimate clears its floor — the dependence is real", fontsize=12)
+despine(ax); fig.tight_layout(); plt.show()
 ```
 
----
-
-## 3 · Apply to the Real Basket
-
-```{python}
-import itertools
-
-results = []
-for a, b in itertools.combinations(tickers, 2):
-    x, y = R[a].values, R[b].values
-    mi = mi_histogram_bits(x, y)
-    rho = pearsonr(x, y)[0]
-    theory = nats_to_bits(mi_gaussian_nats(abs(rho)))
-    results.append(dict(
-        pair=f"{a}/{b}",
-        pearson=rho,
-        mi_bits=mi,
-        mi_theory=theory,
-        excess=mi - theory,   # excess MI beyond what Gaussian predicts
-    ))
-
-results.sort(key=lambda r: r["mi_bits"], reverse=True)
-
-print(f"{'Pair':<12s}  {'Pearson':>8s}  {'MI (bits)':>10s}  {'theory':>8s}  {'excess':>8s}")
-print("-" * 58)
-for r in results[:10]:
-    print(f"  {r['pair']:<10s}  {r['pearson']:+8.3f}  {r['mi_bits']:10.4f}  "
-          f"{r['mi_theory']:8.4f}  {r['excess']:+8.4f}")
-```
-
-::: {.callout-tip}
-## Reading the Excess Column
-Positive excess MI = dependence that Pearson correlation cannot account for
-(tail clustering, non-linear structure, regime switching).  Pairs with large
-excess are the hidden-risk candidates — candidates for Job C.
+::: {.callout-note icon=false}
+## Where This Block Comes From
+The `[JPM, BAC]` and `[XOM, CVX]` blocks — and why a *sector* is a block — are built
+in the data primer's
+[Co-Movement & Co-Crashes](../../data/04-co-movement-and-co-crashes.qmd).  This lab
+reloads them; the only lab-local step is the shuffle floor.
 :::
 
----
-
-## 4 · Linfoot R — Back to the Correlation Scale
-
-```{python}
-#| label: fig-linfoot-real
-#| fig-cap: "Linfoot R vs Pearson |r| on the real basket. Points above the diagonal have dependence that correlation misses."
-pearson_vals = [abs(r["pearson"]) for r in results]
-linfoot_vals = [linfoot_r(r["mi_bits"] * np.log(2))
-                for r in results]   # bits → nats (1 bit = ln 2 nats)
-
-fig, ax = plt.subplots(figsize=(7, 6))
-ax.scatter(pearson_vals, linfoot_vals, s=30, c=COOL, alpha=0.7)
-ax.plot([0, 1], [0, 1], color=INK, lw=1.2, ls="--", label="Linfoot R = |Pearson|")
-
-# Label the most interesting outliers
-for r, p, lf in zip(results, pearson_vals, linfoot_vals):
-    if lf - p > 0.08:
-        ax.annotate(r["pair"], xy=(p, lf), fontsize=8, color=CRASH,
-                    xytext=(p - 0.08, lf + 0.03))
-
-ax.set_xlabel("|Pearson r|"); ax.set_ylabel("Linfoot R")
-ax.set_xlim(0, 1); ax.set_ylim(0, 1)
-ax.set_title("Points above the line: non-Gaussian dependence", fontsize=12)
-ax.legend(frameon=False)
-despine(ax)
-plt.tight_layout()
-plt.show()
-```
-
-### The Shadow Test on the Worst Offender
-
-The Linfoot scatter says *which* pairs hide non-Gaussian dependence; the
-shadow test shows *what it looks like*.  Take the pair with the largest excess
-MI, fit a Gaussian to it (mean and covariance — everything Pearson uses), and
-draw the contours over the data:
-
-```{python}
-#| label: fig-shadow-real
-#| fig-cap: "The Gaussian shadow on the worst offender. The contours are the Gaussian implied by the pair's covariance. The data leaves the contours exactly where the risk lives — the joint crash quadrant — and that escape is the excess MI in the table above."
-worst = max(results, key=lambda r: r["excess"])
-t1, t2 = worst["pair"].split("/")
-x_w, y_w = R[t1].to_numpy(), R[t2].to_numpy()
-XY = np.column_stack([x_w, y_w])
-gpts = np.linspace(XY.min(), XY.max(), 160)
-XX, YY = np.meshgrid(gpts, gpts)
-Z = multivariate_normal(XY.mean(0), np.cov(XY.T)).pdf(np.dstack([XX, YY]))
-r_w = pearsonr(x_w, y_w)[0]
-R_w = linfoot_r(mutual_information_xy(x_w, y_w))
-
-fig, ax = plt.subplots(figsize=(7.5, 6))
-ax.scatter(x_w, y_w, s=8, c=COOL, alpha=0.4, edgecolors="none")
-ax.contour(XX, YY, Z, levels=6, colors=INK, linewidths=1.0, alpha=0.7)
-ax.set_title(f"{worst['pair']} — shadow r = {r_w:+.2f} · information R = {R_w:.2f}",
-             fontsize=12)
-ax.set_xlabel(t1); ax.set_ylabel(t2)
-despine(ax)
-fig.tight_layout()
-plt.show()
-```
-
-The gap $R - |r|$ is dependence the Gaussian family cannot represent — for
-equity pairs, almost always **joint tails**.  Job C turns exactly this gap
-into a co-crash count.
+The Gaussian-copula estimate, **info R ≈ 0.54**, clears its near-zero floor decisively —
+the two sectors genuinely move together — while the histogram, fooled by the fat
+tails, reports something much lower.  On real data with many dimensions the floor *is*
+the validation; the histogram is not.
 
 ---
 
-## 5 · Your Turn — The Honest Number
+## 📈 Rung 3 · Real — The Full Basket
 
-Pick the **three pairs** with the largest excess MI from your table.  For each:
+A *sector* is a block, so the same `block_mi_bits` now answers a portfolio question:
+how much information does each sector share with each other sector?  Group the basket
+into sector blocks (the grouping is the data primer's, reloaded) and fill the
+group-vs-group MI matrix.  We report each cell as **info R** — the mutual information
+rescaled to the Linfoot scale (R ∈ [0,1], which equals |ρ| for a Gaussian, so it lines
+up directly with the correlation-scale measures).  **What we are looking for:** the
+brightest cells, the sector pairs that share the most of their movement.
 
-1. What sector relationship do they represent?
-2. Is the excess plausible (tail crashes? regime co-movement?)?
-3. Does the Linfoot R exceed the Pearson $|r|$ by a meaningful amount?
+```{python}
+META = datasets.load_basket_meta()
+sector_of = dict(zip(META["ticker"], META["sector"]))
+sectors = ["Banks", "Tech", "Energy", "Utilities", "Staples"]
+blocks: dict[str, Float[Array, "n_days d"]] = {
+    s: R[[t for t in R.columns if sector_of[t] == s]].to_numpy() for s in sectors
+}
+for s in sectors:
+    print(f"  {s:<10s} block: {blocks[s].shape[1]} names")
 
-This is the start of Job B's deliverable — a *measure book* with honest
-numbers for every pair.
+n_s = len(sectors)
+MI: Float[Array, "n_s n_s"] = np.zeros((n_s, n_s))       # symmetric matrix, info R
+for i in range(n_s):
+    for j in range(i + 1, n_s):
+        # I(sectorᵢ; sectorⱼ) in bits → nats → Linfoot R ∈ [0,1]
+        r = linfoot_r(block_mi_bits(blocks[sectors[i]], blocks[sectors[j]]) * LN2)
+        MI[i, j] = MI[j, i] = r                           # MI (and so R) is symmetric
+```
+
+```{python}
+#| label: fig-sector-mi
+#| fig-cap: "Group-vs-group mutual information between sector blocks, Gaussian-copula estimator, shown as info R on the Linfoot scale (R ∈ [0,1], = |ρ| for a Gaussian). Bright = two sectors that share a lot of their movement (redundant — little diversification against each other); dark = sectors that move more independently. The brightest cells pair like with like — the two defensives (Utilities–Staples) and the cyclicals (Banks–Energy, Banks–Tech); the darkest pair a cyclical with a defensive (Banks–Utilities, Tech–Utilities), the cross-style combinations that move most on their own."
+fig, ax = plt.subplots(figsize=(6.6, 5.6))
+im = ax.imshow(MI, cmap="magma")
+ax.set_xticks(range(n_s)); ax.set_xticklabels(sectors, rotation=45, ha="right", fontsize=9)
+ax.set_yticks(range(n_s)); ax.set_yticklabels(sectors, fontsize=9)
+for i in range(n_s):
+    for j in range(n_s):
+        if i != j:
+            ax.text(j, i, f"{MI[i, j]:.2f}", ha="center", va="center",
+                    color="white" if MI[i, j] < MI.max() * 0.6 else "black", fontsize=9)
+fig.colorbar(im, ax=ax, fraction=0.046, label="info R  (MI on the Linfoot scale, 0–1)")
+ax.set_title("Information shared between sectors", fontsize=12)
+fig.tight_layout(); plt.show()
+```
+
+---
+
+## 💰 Rung 4 · Application — The Cross-Sector Information Report
+
+The deliverable is a ranked, **floor-debiased** report: of every pair of sectors, how
+much information do they share, and which pair actually diversifies?  We report it as
+**info R** on the Linfoot scale (R ∈ [0,1], = |ρ| for a Gaussian, comparable to the
+correlation-scale measures).  Each estimate is checked against its own shuffle floor —
+the reading once the two blocks are scrambled apart — so what we report is real
+dependence, not estimator bias.  **What we are looking for:** the lowest bars, the
+sector pairs that share the *least* and so diversify a portfolio.
+
+```{python}
+#| label: report-compute
+defensive = {"Utilities", "Staples"}
+
+
+def is_cross_style(name: str) -> bool:
+    """One cyclical sector and one defensive — the diversifying combinations."""
+    a, b = name.split("–")
+    return (a in defensive) != (b in defensive)   # exactly one side is defensive
+
+
+report = []
+for i in range(n_s):
+    for j in range(i + 1, n_s):
+        xi, yj = blocks[sectors[i]], blocks[sectors[j]]
+
+        # shuffle floor for this pair, on the same info-R scale: the estimator's
+        # reading once x↔y is scrambled apart (so ≈ 0)
+        floor_ij = np.mean([linfoot_r(block_mi_bits(xi, yj[rng.permutation(len(yj))]) * LN2)
+                            for _ in range(10)])
+
+        # debiased shared information = info R(sectorᵢ; sectorⱼ) − floor   [Linfoot R]
+        report.append((f"{sectors[i]}–{sectors[j]}", MI[i, j] - floor_ij))
+
+report.sort(key=lambda r: r[1])
+
+print(f"{'sector pair':<20s}{'shared info (info R)':>20s}   style")
+print("-" * 48)
+for name, r in report[::-1]:
+    print(f"{name:<20s}{r:>20.3f}   {'cross (diversifies)' if is_cross_style(name) else 'like'}")
+```
+
+```{python}
+#| label: fig-report
+#| fig-cap: "The cross-sector information report, on the Linfoot info-R scale (R ∈ [0,1], = |ρ| for a Gaussian). Each bar is the shared information between two sector blocks, debiased by its shuffle floor (≈0 throughout, confirming these are real). Information pools among like sectors (red): the two defensives Utilities–Staples share the most of all, the cyclicals Banks–Energy/Banks–Tech close behind. Every cross-style pair — a cyclical against a defensive (green) — sits lower. The green bars at the bottom are where diversification actually lives."
+fig, ax = plt.subplots(figsize=(7.8, 4.4))
+colors = [plotting.PALETTE["green"] if is_cross_style(n) else CRASH for n, _ in report]
+ax.barh([n for n, _ in report], [b for _, b in report], color=colors)
+ax.set_xlabel("shared info R, floor-debiased  (Linfoot scale, 0–1)")
+ax.set_title("Like pairs with like; cross-style pairs diversify", fontsize=12)
+despine(ax); fig.tight_layout(); plt.show()
+```
+
+Read the report as a diversification map.  Information pools among **like** sectors —
+the two defensives share the most of all, the cyclicals cluster close behind.  The
+**cross-style** pairs, a cyclical sector against a defensive one (Banks–Utilities,
+Tech–Utilities), share the least.  Those low green bars are the genuinely independent
+movement a portfolio wants: holdings that do not all rise and fall together.  All of it
+rests on one estimator we *proved* against a known answer before trusting it on returns.
+
+This counted shared information *between* two blocks.  The companion question — how
+much a block is redundant *within itself*, and how the two decompose the whole — is
+**total correlation**, the subject of [Tool 3 · Windows and Total
+Correlation](lab-tool3-windows.qmd).

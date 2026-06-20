@@ -1,0 +1,505 @@
+---
+title: "Propagating Input Uncertainty"
+subtitle: "The input was never exact either — push its error through the model"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, BAND, despine, annotate_box  # noqa: F401
+plotting.set_style("notes")
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import einx                      # linear algebra with the axes spelled out
+from jaxtyping import Float      # shape annotations: Float[Array, "n_obs"]
+
+Array = np.ndarray
+GREEN = plotting.PALETTE["green"]
+```
+
+```{python}
+#| echo: false
+import os
+os.environ["KERAS_BACKEND"] = "jax"          # set BEFORE importing keras — Keras 3 on the CPU JAX backend
+import keras
+from keras import layers
+```
+
+Every band in the [probabilistic-NN recipe](06-probabilistic-nn-recipe.qmd)
+quietly assumed one thing: that the input $x$ handed to $f$ was **exact**.  The
+net predicted the world's noise $\sigma(x)$ and a committee confessed its
+ignorance, but both read off a *known* $x$.  Real inputs are never known.  A
+realized-volatility number is a rolling-window estimate with sampling error; a
+sensor reading carries measurement noise; a macro feature is itself a forecast.
+And the input distribution can **drift** — at test time the feature you feed in
+may be noisier, or shifted, than anything training saw.
+
+The fix is to stop treating $x$ as a point and treat it as a random variable,
+$x \sim \mathcal N(\mu,\ \sigma_x^2)$, then **propagate** that distribution
+through $f$ to get the spread it induces on the output.  This is the third leg
+of the predictive-variance budget — the input-propagated term that Note 06's
+aleatoric-plus-epistemic sum left out.
+
+**What this gives you:** a way to push input error through any trained network —
+Monte Carlo (the gold standard) or a one-line linearization (the cheap one) — to
+get an honest output band; the move to bake that noise in at training time so
+the model is robust to it; and the recognition that **drift is just inflated
+input uncertainty**, answered by a wider band exactly where the inputs are
+unreliable.  The prediction-time propagation here follows the course author's
+[uncertainty-propagation
+notebook](https://jejjohnson.github.io/gaussx/notebooks/uncertainty_propagation/);
+the training-time and drift angles are this note's addition.
+
+## Propagate at Prediction Time — The Methods
+
+Start with a network $f$ that maps a 1-D input to a 1-D output, trained on the
+*mean* curve of `datasets.heteroscedastic_noise()` so $f$ is a smooth, curvy
+function we can probe.  We want: if the input at a test point is not $\mu$ but
+$\mu + \sigma_x\varepsilon$, how wide is the output?
+
+```{python}
+#| label: toy-fit
+def make_mlp(seed: int = 0) -> keras.Model:
+    """x → Dense(48, tanh) → Dense(48, tanh) → Dense(1) — a plain point regressor f(x)."""
+    keras.utils.set_random_seed(seed)            # reproducible weight init
+    return keras.Sequential([
+        layers.Dense(48, activation="tanh"),
+        layers.Dense(48, activation="tanh"),
+        layers.Dense(1),
+    ])
+
+
+xr: Float[Array, "n"]
+yr: Float[Array, "n"]
+xr, yr = datasets.heteroscedastic_noise(n=400, seed=0)   # y = sin(1.3·x) + σ(x)·ε
+
+net = make_mlp(seed=0)
+net.compile(optimizer=keras.optimizers.Adam(0.01), loss="mse")
+net.fit(xr[:, None], yr[:, None], epochs=150, batch_size=64, verbose=0)   # learns the smooth mean f(x)
+
+
+def f(net: keras.Model, xx: Float[Array, "k"]) -> Float[Array, "k"]:
+    """Evaluate the point regressor on a flat grid of inputs:  ŷ = f(x)."""
+    pred = net.predict(xx.reshape(-1, 1).astype("float32"), verbose=0)
+    return np.asarray(pred)[:, 0]
+```
+
+Two ways to push $x \sim \mathcal N(\mu,\ \sigma_x^2)$ through $f$:
+
+**Monte Carlo — the gold standard.**  Draw $S$ input samples
+$x^s \sim \mathcal N(\mu,\ \sigma_x^2)$, push each through $f$, and read off the
+empirical mean and covariance of the outputs:
+
+$$
+\mu_y \approx \frac1S\sum_s f(x^s),
+\qquad
+\Sigma_y \approx \widehat{\operatorname{Cov}}\big(f(x^s)\big).
+$$
+
+It makes no assumption about $f$ — curvature, kinks, anything — and its error
+shrinks as $\mathcal O(1/\sqrt S)$.  The only cost is the $S$ forward passes.
+
+**Taylor-1 linearization — the cheap one.**  Replace $f$ near $\mu$ by its
+tangent (the delta method / EKF-style linearization).  With Jacobian
+$J = \partial f/\partial x\big|_{\mu}$,
+
+$$
+\mu_y = f(\mu),
+\qquad
+\Sigma_y = J\,\Sigma_x\,J^{\!\top}
+\quad\Longrightarrow\quad
+\sigma_y = |f'(\mu)|\,\sigma_x \ \ \text{(scalar case)} .
+$$
+
+This is **exact for affine $f$** and one Jacobian-vector product cheap — but it
+**ignores curvature**, so wherever $f$ bends it will mis-state the spread.
+Between these two sit the middle-ground integrators the
+[gaussx notebook](https://jejjohnson.github.io/gaussx/notebooks/uncertainty_propagation/)
+compares: **Taylor-2**, which adds the Hessian
+$\tfrac12\operatorname{tr}(H\,\Sigma_x)$ to the mean to recover the leading
+curvature term, and the **unscented transform**, which pushes $2N+1$
+deterministically-placed sigma points through $f$ and reweights them — no
+derivatives, and exact to second order.
+
+```{python}
+#| label: propagate-compute
+sigma_x: float = 0.30                                  # input noise σ_x — the error on x itself
+
+xt: Float[Array, "t"] = np.linspace(-3.0, 3.0, 120)    # test grid of input *means* μ
+S: int = 400                                           # Monte-Carlo input samples per μ
+rng = np.random.default_rng(0)
+
+# Monte Carlo:  x ~ 𝒩(μ, σ_x²),  push through f,  take the output std
+samples: Float[Array, "t s"] = xt[:, None] + sigma_x * rng.standard_normal((xt.size, S))
+fy: Float[Array, "t s"] = f(net, samples.ravel()).reshape(xt.size, S)
+mc_mean: Float[Array, "t"] = einx.mean("t s -> t", fy)               # μ_y ≈ mean_s f(xˢ)
+mc_std: Float[Array, "t"] = fy.std(axis=1)                           # σ_y(μ) ≈ std_s f(xˢ)
+
+# Taylor-1 linearization:  σ_y ≈ |f'(μ)|·σ_x  =  √(J σ_x² Jᵀ),  J via central difference
+eps: float = 1e-2                                                    # finite-difference step
+fprime: Float[Array, "t"] = (f(net, xt + eps) - f(net, xt - eps)) / (2 * eps)   # J = f'(μ)
+lin_std: Float[Array, "t"] = np.abs(fprime) * sigma_x               # σ_y = |J|·σ_x
+
+mu_y: Float[Array, "t"] = f(net, xt)                                 # μ_y = f(μ)  for the band center
+
+# where the two methods diverge = where |f''| is large (linearization ignores curvature)
+disagree: float = np.abs(mc_std - lin_std).max()
+print(f"input noise σ_x = {sigma_x}")
+print(f"propagated σ_y  — Monte Carlo {mc_std.mean():.3f}  ·  linearization {lin_std.mean():.3f}  (mean over grid)")
+print(f"max |MC − linear| σ_y = {disagree:.3f}   ← the curvature the tangent misses")
+```
+
+```{python}
+#| label: fig-propagate
+#| fig-cap: "Input noise σ_x = 0.30 pushed through the trained f two ways. Top: f(x) with the Monte-Carlo band μ_y ± 2σ_y (blue) and the linearized band (orange dashed). Bottom: the two propagated widths σ_y(μ). Where f is nearly straight the bands coincide — the tangent is a fine stand-in. Where f curves hardest (the turning points of the sine) the linearization under- or over-states the spread, because |f''| is large there; Monte Carlo, making no assumption about f, is the gold standard the tangent approximates."
+fig, (axT, axB) = plt.subplots(2, 1, figsize=(9.5, 6.0), sharex=True,
+                               gridspec_kw={"height_ratios": [2.2, 1.0]})
+
+axT.fill_between(xt, mu_y - 2 * mc_std, mu_y + 2 * mc_std,
+                 color=COOL, alpha=0.30, label="Monte Carlo · μ_y ± 2σ_y")
+axT.plot(xt, mu_y + 2 * lin_std, c=WARM, lw=1.4, ls="--", label="linearization · μ_y ± 2σ_y")
+axT.plot(xt, mu_y - 2 * lin_std, c=WARM, lw=1.4, ls="--")
+axT.plot(xt, mu_y, c=INK, lw=2, label="f(x)")
+axT.scatter(xr, yr, s=8, c=INK, alpha=0.20, zorder=0)
+axT.set_ylabel("y")
+axT.set_yticks([])
+axT.legend(fontsize=9, frameon=False, loc="upper left")
+despine(axT)
+
+axB.plot(xt, mc_std, c=COOL, lw=2, label="Monte Carlo σ_y")
+axB.plot(xt, lin_std, c=WARM, lw=1.6, ls="--", label="linearization σ_y")
+axB.set_xlabel("input mean  μ")
+axB.set_ylabel("σ_y(μ)")
+axB.set_xticks([])
+axB.set_yticks([])
+axB.legend(fontsize=9, frameon=False, loc="upper left")
+despine(axB)
+
+fig.tight_layout()
+plt.show()
+```
+
+The two propagated bands **agree where $f$ is straight and diverge where $f$
+curves** — exactly the failure mode of a tangent line.  Monte Carlo is the
+gold standard: push enough samples and you get the true output spread, curvature
+and all.  Linearization is the one-derivative shortcut you reach for when $f$ is
+mild or you need it in closed form — and Taylor-2 / unscented are the
+middle-ground when you want curvature back without paying for $S$ forward passes.
+
+## Bake It In at Training Time
+
+Propagation above was a *post-hoc* act on a model that never knew its inputs
+were noisy.  If you **know up front** that the inputs carry error — and you
+usually do — you can tell the model during training.  Keras' `GaussianNoise`
+layer adds $\mathcal N(0,\ \sigma_x^2)$ to its input on every forward pass **but
+only while `fit` is running**; at prediction time it is the identity.  So the
+network sees a fresh jittered copy of each input every epoch and must learn a
+fit that is *stable under that jitter* — it cannot chase wiggles finer than
+$\sigma_x$, because they wash out across the noise it is shown.
+
+```{python}
+#| label: noisy-train
+def make_noisy_mlp(sigma: float, seed: int = 0) -> keras.Model:
+    """Same net as f, but a GaussianNoise(σ_x) layer jitters the input *during fit only*."""
+    keras.utils.set_random_seed(seed)
+    return keras.Sequential([
+        layers.GaussianNoise(sigma),                 # active in fit, identity at predict
+        layers.Dense(48, activation="tanh"),
+        layers.Dense(48, activation="tanh"),
+        layers.Dense(1),
+    ])
+
+
+# a wigglier target so the smoothing is visible: a fast ripple on the smooth mean
+xw: Float[Array, "n"] = np.sort(rng.uniform(-3.0, 3.0, 300))
+yw: Float[Array, "n"] = np.sin(1.3 * xw) + 0.25 * np.sin(6.0 * xw) + 0.10 * rng.standard_normal(xw.size)
+
+clean_net = make_mlp(seed=1)                          # trained on exact inputs
+clean_net.compile(optimizer=keras.optimizers.Adam(0.01), loss="mse")
+clean_net.fit(xw[:, None], yw[:, None], epochs=150, batch_size=64, verbose=0)
+
+noisy_net = make_noisy_mlp(sigma=0.60, seed=1)        # trained WITH input jitter σ_x = 0.60
+noisy_net.compile(optimizer=keras.optimizers.Adam(0.01), loss="mse")
+noisy_net.fit(xw[:, None], yw[:, None], epochs=150, batch_size=64, verbose=0)
+
+xt2: Float[Array, "t"] = np.linspace(-3.0, 3.0, 300)
+clean_fit: Float[Array, "t"] = f(clean_net, xt2)
+noisy_fit: Float[Array, "t"] = f(noisy_net, xt2)
+
+# roughness = mean |second difference|: how much the fitted curve wiggles
+rough_clean: float = np.abs(np.diff(clean_fit, n=2)).mean()
+rough_noisy: float = np.abs(np.diff(noisy_fit, n=2)).mean()
+print(f"fitted-curve roughness (mean |f''|·Δ²)  —  clean {rough_clean:.4f}  vs  noisy-trained {rough_noisy:.4f}")
+print(f"the input-noise fit is {rough_clean / rough_noisy:.1f}× smoother — it averaged over the input jitter")
+```
+
+```{python}
+#| label: fig-noisy-train
+#| fig-cap: "Same data, two trainings. The clean-trained net (red) chases the fast ripple and the per-point noise, because every input it saw was exact. The input-noise-trained net (blue, σ_x = 0.60), shown a fresh ±σ_x-jittered input each epoch, cannot fit structure finer than σ_x and settles on the smoother backbone — its prediction already accounts for the input jitter, so it is robust to an input that arrives a little off. Baking the noise in at training time is the up-front alternative to propagating it afterwards."
+fig, ax = plt.subplots(figsize=(9.5, 3.9))
+
+ax.scatter(xw, yw, s=12, c=INK, alpha=0.30, label="data")
+ax.plot(xt2, clean_fit, c=CRASH, lw=2, label="clean-trained f")
+ax.plot(xt2, noisy_fit, c=COOL, lw=2.2, label="input-noise-trained f  (σ_x = 0.60)")
+
+ax.set_xlabel("x")
+ax.set_ylabel("y")
+ax.set_xticks([])
+ax.set_yticks([])
+ax.legend(fontsize=9, frameon=False, loc="upper left")
+despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+The input-noise-trained fit is markedly smoother: it has effectively averaged
+$f$ over the input distribution, so a wobble in the input no longer throws the
+prediction off.  This is the same regularizing trick as input jitter / data
+augmentation, read through the uncertainty lens — **if the inputs are noisy,
+train as if they are**, and the model bakes the input uncertainty into the
+function it learns.
+
+## Drift at Prediction Time
+
+The input distribution is not frozen.  When the test inputs are **noisier or
+shifted** than the training inputs — *covariate drift* — the honest response is
+to propagate an **inflated** $\sigma_x$.  The propagated band then widens
+exactly where the inputs have become unreliable, and by exactly the amount the
+input degradation warrants.  Sweep $\sigma_x$ and watch the band grow:
+
+```{python}
+#| label: drift-compute
+sigmas_x: list[float] = [0.20, 0.50, 1.00]             # calm → mildly drifted → badly drifted inputs
+
+drift_std: dict[float, Float[Array, "t"]] = {}
+for sx in sigmas_x:
+    s: Float[Array, "t s"] = xt[:, None] + sx * rng.standard_normal((xt.size, S))   # x ~ 𝒩(μ, σ_x²)
+    drift_std[sx] = f(net, s.ravel()).reshape(xt.size, S).std(axis=1)               # σ_y(μ) at this σ_x
+
+band_width: dict[float, float] = {sx: drift_std[sx].mean() for sx in sigmas_x}      # mean propagated σ_y
+print("input drift  σ_x  →  propagated output width  σ_y  (mean over grid)")
+for sx in sigmas_x:
+    print(f"   σ_x = {sx:.2f}   →   σ_y = {band_width[sx]:.2f}")
+assert band_width[0.20] < band_width[0.50] < band_width[1.00]    # monotone: worse inputs → wider band
+print("monotone — a noisier input always buys a wider, honest band")
+```
+
+```{python}
+#| label: fig-drift
+#| fig-cap: "Covariate drift as inflated input uncertainty. The same trained f, propagated at three input-noise levels: σ_x = 0.20 (calm, training-like inputs), 0.50 (mild drift), 1.00 (badly drifted). Each step inflates σ_x and the propagated band μ_y ± 2σ_y widens monotonically — by the printed 0.18 → 0.43 → 0.68 in mean width. The band is the model's honest report that its inputs have degraded: it grows precisely where, and as much as, the inputs became unreliable."
+fig, ax = plt.subplots(figsize=(9.5, 3.9))
+
+shades = [BAND, COOL, INK]
+for sx, col in zip(sigmas_x, shades):
+    sd = drift_std[sx]
+    ax.fill_between(xt, mu_y - 2 * sd, mu_y + 2 * sd,
+                    color=col, alpha=0.28, label=f"σ_x = {sx:.2f}  →  σ_y ≈ {band_width[sx]:.2f}")
+
+ax.plot(xt, mu_y, c=CRASH, lw=2, label="f(x)")
+
+ax.set_xlabel("input mean  μ")
+ax.set_ylabel("y")
+ax.set_xticks([])
+ax.set_yticks([])
+ax.legend(fontsize=9, frameon=False, loc="upper left")
+despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+Drift needs no new machinery — it is the prediction-time propagation of §1 with
+a larger $\sigma_x$.  When you suspect the inputs have shifted regime, raise
+$\sigma_x$ to what you believe the test-time input error is, and the band tells
+you, honestly, how much less you should trust the prediction.
+
+## The Complete Uncertainty Budget
+
+Note 06 built a predictive band from two independent variances; this note adds
+the third.  All three are sources of variance in $\hat y$, so they **add**, and
+the full budget is
+
+$$
+\sigma_{\text{total}}^2(x) =
+\underbrace{\sigma_{\text{aleatoric}}^2(x)}_{\text{output noise } \sigma(x)^2}
+\;+\;
+\underbrace{\sigma_{\text{epistemic}}^2(x)}_{\operatorname{Var}_m \mu_m(x)}
+\;+\;
+\underbrace{J\,\sigma_x^2\,J^{\!\top}}_{\text{input-propagated}} .
+$$
+
+Each term answers a different question and is cured by a different action:
+
+```{python}
+#| label: budget-compute
+# illustrative magnitudes for the three terms on the toy grid, to show how they combine
+sigma_alea: float = 0.30                                # output noise σ(x)         — predict it (Gaussian head)
+sigma_epi: Float[Array, "t"] = 0.10 + 0.50 * (np.abs(xt) > 2.2)   # member spread   — more data shrinks it
+sigma_inp: Float[Array, "t"] = lin_std                 # √(J σ_x² Jᵀ)              — sharpen / de-noise the input
+
+var_total: Float[Array, "t"] = sigma_alea ** 2 + sigma_epi ** 2 + sigma_inp ** 2   # σ² add (independent)
+sigma_total: Float[Array, "t"] = np.sqrt(var_total)
+
+print(f"{'term':<26s}{'cured by':<28s}mean σ")
+print("-" * 62)
+print(f"{'aleatoric  σ(x)²':<26s}{'(nothing — irreducible)':<28s}{sigma_alea:.2f}")
+print(f"{'epistemic  Var μ':<26s}{'more data':<28s}{sigma_epi.mean():.2f}")
+print(f"{'input      J σ_x² Jᵀ':<26s}{'sharper / de-noised input':<28s}{sigma_inp.mean():.2f}")
+print(f"{'TOTAL      √(sum)':<26s}{'':<28s}{sigma_total.mean():.2f}")
+```
+
+```{python}
+#| label: fig-budget
+#| fig-cap: "The three-term predictive-variance budget, stacked as variance contributions across the input grid. Aleatoric (blue) is the world's output noise — flat here, irreducible. Epistemic (green) is the committee's spread — it jumps up in the extrapolation tails where data is sparse and would shrink with more data. Input (orange) is J σ_x² Jᵀ — the input error pushed through f, largest where f is steep. They add as variances; the black line is the total σ, the honest width Note 06's two-term band was missing a piece of."
+var_alea_arr: Float[Array, "t"] = np.full_like(xt, sigma_alea ** 2)
+var_epi_arr: Float[Array, "t"] = sigma_epi ** 2
+var_inp_arr: Float[Array, "t"] = sigma_inp ** 2
+
+fig, ax = plt.subplots(figsize=(9.5, 3.9))
+
+ax.stackplot(xt, var_alea_arr, var_epi_arr, var_inp_arr,
+             colors=[COOL, GREEN, WARM], alpha=0.55,
+             labels=["aleatoric  σ(x)²", "epistemic  Var μ", "input  J σ_x² Jᵀ"])
+ax.plot(xt, var_total, c=INK, lw=2, label="total variance σ²")
+
+ax.set_xlabel("x")
+ax.set_ylabel("variance contribution")
+ax.set_xticks([])
+ax.set_yticks([])
+ax.legend(fontsize=9, frameon=False, loc="upper center", ncol=2)
+despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+The litmus tests stack up: *would more data shrink it?* → epistemic; *is it the
+world's irreducible scatter?* → aleatoric; *is it error in the input I fed the
+model?* → the input term, cured by a sharper, less-drifted input.  Three
+questions, three honest contributions to one width.
+
+## A Real Example — Banding Noisy Volatility Inputs
+
+Note 06 forecast next-window volatility from current volatility and assumed the
+*current* number was exact.  It is not.  The realized-vol input is a **21-day
+rolling-window estimate**: a sample standard deviation over 21 observations has
+real sampling error, roughly $\sigma_x \approx \sigma/\sqrt{2(W-1)}$ for a window
+of $W$ days.  That input uncertainty propagates straight to the forecast.  We
+**reload** the realized-volatility target the [returns & volatility
+primer](../data/02-returns-and-volatility.qmd) builds and owns, and form the
+same next-window regression.
+
+```{python}
+#| label: real-target
+R = datasets.load_returns()                            # prepared 14-name daily panel
+W = 21                                                  # rolling window — the primer's choice
+sigma_series = R["JPM"].rolling(W).std().mul(np.sqrt(252)).dropna()   # σ(t) = σ_daily·√252  (primer's target)
+
+h = 5                                                   # forecast horizon — one trading week
+x_vol: Float[Array, "n_pairs"] = sigma_series.to_numpy()[:-h]   # σ(t)   — the (noisy) input
+y_vol: Float[Array, "n_pairs"] = sigma_series.to_numpy()[h:]    # σ(t+h) — the target
+
+# sampling error of a W-day rolling std:  σ_x ≈ σ / √(2(W−1))   [same units as σ]
+sigma_x_vol: Float[Array, "n_pairs"] = x_vol / np.sqrt(2 * (W - 1))
+
+print(f"realized-vol target · {sigma_series.shape[0]} days  "
+      f"({sigma_series.index.min().date()} → {sigma_series.index.max().date()})")
+print(f"{x_vol.size} regression pairs (σ_t → σ_{{t+{h}}})")
+print(f"input sampling error σ_x ≈ σ/√(2·{W - 1}):  {sigma_x_vol.min():.3f} (calm) .. {sigma_x_vol.max():.3f} (crisis)")
+```
+
+::: {.callout-note icon=false}
+## Where This Data Comes From
+The realized-volatility series is built and owned **once** in
+[Returns, Volatility & Fat Tails](../data/02-returns-and-volatility.qmd).  This
+note reloads it with the one-liner above and never re-derives it; the only local
+steps are lagging it into $(\sigma_t,\ \sigma_{t+h})$ pairs and attaching the
+rolling-window sampling error $\sigma_x$ that makes the input a *random variable*.
+:::
+
+Fit a plain regressor $f:\sigma_t \to \sigma_{t+h}$ on standardized inputs, then
+propagate the input uncertainty $\sigma_x(t)$ through it by Monte Carlo —
+sampling each input around its estimate and reading the spread of the forecast.
+
+```{python}
+#| label: real-fit
+xm, xs = x_vol.mean(), x_vol.std()                     # standardize: the net trains better on 𝒪(1) inputs
+xz: Float[Array, "n_pairs"] = (x_vol - xm) / xs        # z = (σ_t − μ) / σ
+
+vol_net = make_mlp(seed=0)
+vol_net.compile(optimizer=keras.optimizers.Adam(0.01), loss="mse")
+vol_net.fit(xz[:, None], y_vol[:, None], epochs=150, batch_size=128, verbose=0)
+
+# evaluate on a sorted grid of input levels, and propagate σ_x through f at each
+o: Float[Array, "n_pairs"] = np.argsort(x_vol)
+grid_vol: Float[Array, "g"] = x_vol[o]                              # input level σ_t, ascending
+grid_sx: Float[Array, "g"] = sigma_x_vol[o]                         # its sampling error
+grid_z: Float[Array, "g"] = (grid_vol - xm) / xs
+
+mu_fore: Float[Array, "g"] = f(vol_net, grid_z)                     # forecast μ_y = f(σ_t)
+
+# Monte Carlo input propagation: sample σ_t ~ 𝒩(σ_t, σ_x²), standardize, push through f
+draws: Float[Array, "g s"] = grid_vol[:, None] + grid_sx[:, None] * rng.standard_normal((grid_vol.size, S))
+draws_z: Float[Array, "g s"] = (draws - xm) / xs
+sig_inp_vol: Float[Array, "g"] = f(vol_net, draws_z.ravel()).reshape(grid_vol.size, S).std(axis=1)   # σ_y from input error
+
+print(f"propagated input σ_y on the forecast: {sig_inp_vol.min():.2f} (calm) .. {sig_inp_vol.max():.2f} (crisis)")
+print("the forecast band from input error alone widens with the vol level — noisy inputs in turbulent regimes")
+```
+
+Now the **drift** scenario.  Suppose the regime has shifted and the current
+vol estimate is far less reliable than its rolling-window sampling error
+suggests — inflate $\sigma_x$ (say $3\times$) and re-propagate.  The forecast
+band widens accordingly: the honest response to a suspected regime break.
+
+```{python}
+#| label: real-drift
+drift_factor: float = 3.0                               # assume the regime shifted → inputs 3× noisier
+draws_d: Float[Array, "g s"] = grid_vol[:, None] + (drift_factor * grid_sx)[:, None] * rng.standard_normal((grid_vol.size, S))
+draws_dz: Float[Array, "g s"] = (draws_d - xm) / xs
+sig_drift_vol: Float[Array, "g"] = f(vol_net, draws_dz.ravel()).reshape(grid_vol.size, S).std(axis=1)
+
+print(f"band width (mean σ_y) — sampling error {sig_inp_vol.mean():.2f}  →  drift ×{drift_factor:.0f} {sig_drift_vol.mean():.2f}")
+print("inflating σ_x widens the forecast band — drift is just larger input uncertainty")
+```
+
+```{python}
+#| label: fig-real-band
+#| fig-cap: "Propagating the noisy realized-vol input through the next-week forecaster, drawn against today's vol level σ_t. The forecast μ (red) is banded twice from input uncertainty alone: the inner blue band is the rolling-window sampling error σ_x ≈ σ/√(2·20), the outer band inflates σ_x ×3 for a suspected regime shift (drift). Both widen with the vol level — a noisy input in a turbulent regime is least trustworthy — and the drift band is the honest, wider report when the inputs can no longer be believed at face value."
+fig, ax = plt.subplots(figsize=(9.5, 3.9))
+
+ax.fill_between(grid_vol, mu_fore - 2 * sig_drift_vol, mu_fore + 2 * sig_drift_vol,
+                color=BAND, alpha=0.45, label=f"input drift ×{drift_factor:.0f}  (regime shift)")
+ax.fill_between(grid_vol, mu_fore - 2 * sig_inp_vol, mu_fore + 2 * sig_inp_vol,
+                color=COOL, alpha=0.45, label="input sampling error  σ_x")
+ax.plot(grid_vol, mu_fore, c=CRASH, lw=2, label="forecast μ = f(σ_t)")
+ax.scatter(x_vol, y_vol, s=8, c=INK, alpha=0.18, zorder=0)
+
+ax.set_xlabel("today's vol  σ(t)")
+ax.set_ylabel("next-week vol  σ(t+h)")
+ax.set_title("Input-uncertainty band on real volatility forecasting", fontsize=11.5)
+ax.legend(fontsize=8.5, frameon=False, loc="upper left")
+despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+The input was never exact — a rolling-window vol estimate carries sampling
+error — and propagating it gives a forecast band that widens with the vol level,
+where the estimate is noisiest.  Suspect a regime shift and you inflate
+$\sigma_x$; the band widens to match.  This input term sits *alongside* the
+aleatoric and epistemic bands of Note 06: in a full deployment you would add all
+three in quadrature for the complete width.
+
+## Close
+
+Input uncertainty completes the predictive-variance budget: on top of the
+world's noise (aleatoric) and the model's ignorance (epistemic) sits the error
+in the input you fed the model, propagated through $f$ by Monte Carlo or a
+one-line linearization.  Bake it in at training time when you know the inputs
+are noisy, propagate it at prediction time to band them, and remember that
+**drift is just inflated input uncertainty** — answered, honestly, by a wider
+band exactly where the inputs stopped being trustworthy.  With all three terms
+in hand, the [predictive-bands lab](labs/lab-tool3-bands.qmd) calibrates the
+total width against real coverage.

@@ -21,284 +21,344 @@ Array = np.ndarray
 
 *Learn-the-tool track · Lab 1 of 3.*
 
-This lab walks the **no-density road**: the measures that compare $X$ and $Y$
-directly from samples, never needing a probability distribution.  By the end
-you will have computed all three on the real basket, seen where they agree and
-where they split, and felt the `compare(transform(x), transform(y))` template
-through your own hands.
+This lab walks the **no-density road** — the measures that compare two return
+series $X$ and $Y$ straight from the samples, never needing to first estimate a
+probability distribution — up one ladder: the *idea* (three measures, one
+template) stays fixed while the **data grows up under it**, from a toy whose
+answer you can check by hand to the real basket of stocks.  Along the way two
+*gaps between the measures* turn out to flag two different dangers.
 
-**What you will produce:** a ranked table of every pair in the basket by each
-measure, and a clear answer to "when does the cheap tool suffice, and when does
-it lie?"
-
----
-
-## Setup — Load the Real Basket
-
-```{python}
-R = datasets.load_returns()
-META = datasets.load_basket_meta()
-label = dict(zip(META["ticker"], META["label"]))
-sector = dict(zip(META["ticker"], META["sector"]))
-tickers = list(R.columns)
-print(f"Loaded {len(R)} trading days × {len(tickers)} stocks")
-print(f"  {R.index.min().date()}  →  {R.index.max().date()}")
-R.head(3)
-```
+**What you will produce:** a watchlist of real stock pairs that crash together
+harder than the cheap tools let on — the candidates to hand to the tail-risk job.
 
 ---
 
-## 1 · The Template, Made Literal
+## 🧪 Rung 1 · Toy — Known Answer
 
-Every measure on this road has the same shape:
-
-```
-Pearson       = corr( x , y )                   # transform = identity
-Spearman      = corr( rank(x) , rank(y) )       # transform = rank
-distance corr = dcor( x , y )                   # distance-matrix association
-```
-
-Let's run all three on the two running characters from the lecture.
+Start where the truth is not in doubt.  `datasets.nonlinear_dependence()` draws
+$y = x^2 + \text{noise}$ on a range centered at zero: **$y$ is almost entirely
+fixed once you know $x$** — about as dependent as two variables can be — yet the
+relationship is symmetric (the same $y$ for $+x$ and $-x$), so a *linear* measure
+like Pearson must read $\approx 0$.  That gap between "obviously dependent" and
+"Pearson says nothing" is the whole reason this road climbs past Pearson, and here
+we can check the answer by eye.
 
 ```{python}
-def trio_print(ticker_a, ticker_b):
-    x, y = R[ticker_a].values, R[ticker_b].values
-    t = measure_trio(x, y)
-    la, lb = label.get(ticker_a, ticker_a), label.get(ticker_b, ticker_b)
-    print(f"{la:>15s} & {lb:<15s}  "
-          f"Pearson={t['pearson']:+.3f}  "
-          f"Spearman={t['spearman']:+.3f}  "
-          f"distance={t['distance']:.3f}")
-    return t
+# y = x² + noise   (y is ~determined by x, but the link is symmetric)
+x_toy: Float[Array, "n"]
+y_toy: Float[Array, "n"]
+x_toy, y_toy = datasets.nonlinear_dependence(n=1000, noise=0.05, seed=0)
 
-print("Pair                                    Pearson  Spearman  distance")
-print("-" * 68)
-_ = trio_print("JPM", "BAC")    # two banks
-_ = trio_print("JPM", "KO")     # bank vs. staple
-_ = trio_print("XOM", "CVX")    # two energy majors
+print(f"x: {x_toy.shape}    y = x² + noise   (y is ~determined by x)")
 ```
 
-For roughly elliptical daily equity returns the three measures land close
-together — which is exactly what we expect when the relationship is nearly
-linear.  That agreement is *informative*: it says the no-density road already
-tells you most of the story.
+**The algorithm — one template, three transforms.**  Every measure on this road
+has the shape `compare(transform(x), transform(y))`:
 
----
-
-## 2 · When Do They Disagree?
-
-Three measures agree on the bulk.  They split on **tails** and
-**non-monotone** structure.  Manufacture those two cases:
-
-```{python}
-rng = np.random.default_rng(42)
-n = 500
-
-# U-shape: strong dependence, zero Pearson and Spearman
-x_u = rng.uniform(-2.5, 2.5, n)
-y_u = x_u**2 + 0.4 * rng.normal(size=n)
-
-# Tail-crash injection on a real pair
-x_real = R["JPM"].values.copy()
-y_real = R["BAC"].values.copy()
-crash_mask = (x_real < np.percentile(x_real, 5)) & (y_real < np.percentile(y_real, 5))
-# Amplify the crash tail 2×
-x_amp, y_amp = x_real.copy(), y_real.copy()
-x_amp[crash_mask] *= 2.0
-y_amp[crash_mask] *= 2.0
-
-print("Case                    Pearson   Spearman   distance")
-print("-" * 55)
-for (name, x, y) in [
-    ("U-shape (synthetic)",    x_u, y_u),
-    ("JPM/BAC real",           x_real, y_real),
-    ("JPM/BAC tail-amplified", x_amp, y_amp),
-]:
-    t = measure_trio(x, y)
-    print(f"  {name:<24s}  {t['pearson']:+.3f}    {t['spearman']:+.3f}    {t['distance']:.3f}")
+```
+Pearson       = corr( x , y )                 # transform = identity
+Spearman      = corr( rank x , rank y )       # transform = rank
+distance corr = corr( Ã , B̃ )                 # Ã, B̃ = double-centered |distances|
 ```
 
-```{python}
-#| label: fig-disagreement
-#| fig-cap: "U-shape and tail-amplified pair: where the measures split."
-fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.2))
-
-axL.scatter(x_u, y_u, s=10, c=WARM, alpha=0.5, edgecolors="none")
-tu = measure_trio(x_u, y_u)
-axL.set_title("U-shape (strong dep, Pearson≈0)", fontsize=11)
-annotate_box(axL, 0.5, -0.10,
-             f"P={tu['pearson']:+.3f}  S={tu['spearman']:+.3f}  d={tu['distance']:.3f}")
-despine(axL)
-
-axR.scatter(x_real[~crash_mask], y_real[~crash_mask], s=10, c=COOL,
-            alpha=0.4, edgecolors="none", label="bulk")
-axR.scatter(x_real[crash_mask], y_real[crash_mask], s=18, c=CRASH,
-            alpha=0.9, edgecolors="none", label="crash days")
-tr = measure_trio(x_real, y_real)
-axR.set_title("JPM / BAC — crash days highlighted", fontsize=11)
-annotate_box(axR, 0.5, -0.10,
-             f"P={tr['pearson']:+.3f}  S={tr['spearman']:+.3f}  d={tr['distance']:.3f}")
-axR.legend(fontsize=9, frameon=False)
-despine(axR)
-
-for ax in (axL, axR):
-    ax.set_xlabel("X"); ax.set_ylabel("Y")
-fig.tight_layout()
-plt.show()
-```
-
----
-
-## 3 · See the Transforms
-
-Every rung is `compare(transform(x), transform(y))`.  In this section you make
-each transform *visible* on data you just loaded — the same pictures as the
-lecture, built by your own hands.
-
-### Spearman Is Pearson After Ranking
-
-First verify the claim numerically — they are not approximately equal, they
-are **the same number**:
+The first two are one line.  The third needs the **distance transform**: turn
+each point into its vector of distances to every other point, double-center the
+matrix, and correlate.  Spelled out with the axes visible:
 
 ```{python}
-x, y = R["JPM"].values, R["BAC"].values
-rx, ry = rankdata(x), rankdata(y)
-print(f"Spearman(x, y)          = {spearmanr(x, y)[0]:.6f}")
-print(f"Pearson(rank x, rank y) = {pearsonr(rx, ry)[0]:.6f}")
-```
-
-Then look at what the transform does to real returns:
-
-```{python}
-#| label: fig-rank-real
-#| fig-cap: "The rank transform on a real pair. Left: raw JPM/BAC returns — a fat-tailed cloud whose extremes dominate the eye. Right: the same days after ranking — the marginals are now uniform by construction, so what remains is *pure dependence structure*. This panel is your first copula."
-fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.4))
-axL.scatter(x, y, s=8, c=COOL, alpha=0.35, edgecolors="none")
-axL.set_title("Raw returns — tails dominate", fontsize=11)
-axR.scatter(rx, ry, s=8, c=WARM, alpha=0.35, edgecolors="none")
-axR.set_title("rank(x) vs rank(y) — pure dependence", fontsize=11)
-for ax in (axL, axR):
-    ax.set_xticks([]); ax.set_yticks([])
-    despine(ax)
-fig.tight_layout()
-plt.show()
-```
-
-Note what ranking *removed*: the marginal distributions.  The right panel
-would look identical no matter how fat the tails are — only the *coupling*
-between the two columns survives.  (When you meet copulas later, this is one.)
-
-### Distance Correlation Is Pearson After the Distance Transform
-
-The lecture's claim: build the pairwise distance matrices, double-center them,
-and the correlation of their entries **is** $\operatorname{dCor}^2$.  Verify
-it on the U-shape from Section 2:
-
-```{python}
-def centered_distances(z: Float[Array, "n_days"]) -> Float[Array, "n_days n_days"]:
+def centered_distances(z: Float[Array, "n"]) -> Float[Array, "n n"]:
     """The dCor transform: double-centered pairwise distances.
 
-    Dᵢⱼ = |zᵢ − zⱼ|                      [same units as z]
-    Aᵢⱼ = Dᵢⱼ − D̄ᵢ. − D̄.ⱼ + D̄..         (row, column, grand means removed)
+    Dᵢⱼ = |zᵢ - zⱼ|                      [same units as z]
+    Ãᵢⱼ = Dᵢⱼ - D̄ᵢ. - D̄.ⱼ + D̄..         (row, column, grand means removed)
     """
-    D = np.abs(einx.subtract("i, j -> i j", z, z))   # (n_days, n_days)
-    row_mean = einx.mean("i j -> i", D)              # D̄ᵢ. — day i's mean distance
-    col_mean = einx.mean("i j -> j", D)              # D̄.ⱼ — day j's mean distance
-    A = einx.subtract("i j, i -> i j", D, row_mean)
-    A = einx.subtract("i j, j -> i j", A, col_mean)
-    return A + D.mean()                              # add back the grand mean D̄..
+    D: Float[Array, "n n"] = np.abs(einx.subtract("i, j -> i j", z, z))   # Dᵢⱼ = |zᵢ - zⱼ|
+    row_mean: Float[Array, "n"] = einx.mean("i j -> i", D)                # D̄ᵢ. — point i's mean distance
+    col_mean: Float[Array, "n"] = einx.mean("i j -> j", D)               # D̄.ⱼ
+
+    A: Float[Array, "n n"] = einx.subtract("i j, i -> i j", D, row_mean)   # remove row mean
+    A = einx.subtract("i j, j -> i j", A, col_mean)                        # remove column mean
+    return A + D.mean()                                                    # add back the grand mean D̄..
 
 
-A = centered_distances(x_u)
-B = centered_distances(y_u)
-# dCor² = corr(Aᵢⱼ, Bᵢⱼ) over all n² matrix entries — verify the identity:
-corr_entries = pearsonr(A.ravel(), B.ravel())[0]
-dcor = distance_correlation(x_u, y_u)
-print(f"corr of centered distance entries = {corr_entries:.4f}")
-print(f"dCor²                             = {dcor**2:.4f}")
+# dCor² is the correlation of the centered-distance entries — verify the identity:
+A: Float[Array, "n n"] = centered_distances(x_toy)
+B: Float[Array, "n n"] = centered_distances(y_toy)
+corr_entries = pearsonr(A.ravel(), B.ravel())[0]   # corr(Ã, B̃) over all n² entries
+
+print(f"corr(Ã, B̃) over all n² entries = {corr_entries:.4f}")
+print(f"dCor²                          = {distance_correlation(x_toy, y_toy) ** 2:.4f}")
 ```
 
-And draw the transform itself.  Sorting the days by $x$ makes the matrix
-structure readable:
+Now run all three and read them against what we *know* is there:
 
 ```{python}
-#| label: fig-distance-matrices
-#| fig-cap: "The distance transform on the U-shape, days sorted by x. The X-distances form a smooth gradient; the Y-distances show the U as a cross — days on opposite arms have similar y. dCor is the correlation of these two patterns; Pearson on the raw values sees nothing."
-order = np.argsort(x_u)[::3]          # sort days by x, keep every 3rd — readable matrix
-xs_, ys_ = x_u[order], y_u[order]
-# Aᵢⱼ = |xᵢ − xⱼ|  and  Bᵢⱼ = |yᵢ − yⱼ|       shape: (n_days, n_days)
-A_show = np.abs(einx.subtract("i, j -> i j", xs_, xs_))
-B_show = np.abs(einx.subtract("i, j -> i j", ys_, ys_))
+t_toy = measure_trio(x_toy, y_toy)
+nonlin_gap = t_toy["distance"] - abs(t_toy["spearman"])   # dCor − |Spearman| — what the distance step adds
 
+print(f"Pearson  = {t_toy['pearson']:+.3f}   (linear — blind to the symmetry)")
+print(f"Spearman = {t_toy['spearman']:+.3f}   (monotone — also blind)")
+print(f"distance = {t_toy['distance']:.3f}   (sees the dependence)")
+print(f"\ndCor − |Spearman| = {nonlin_gap:+.3f}   ← the non-monotone gap")
+```
+
+```{python}
+#| label: fig-toy-distance-compute
+# Sort by x and thin out, so the distance matrices read as smooth images.
+order: Float[Array, "m"] = np.argsort(x_toy)[::3]
+xs: Float[Array, "m"] = x_toy[order]
+ys: Float[Array, "m"] = y_toy[order]
+
+Dx: Float[Array, "m m"] = np.abs(einx.subtract("i, j -> i j", xs, xs))   # |xᵢ - xⱼ|
+Dy: Float[Array, "m m"] = np.abs(einx.subtract("i, j -> i j", ys, ys))   # |yᵢ - yⱼ|
+```
+
+```{python}
+#| label: fig-toy-distance
+#| fig-cap: "The U-shape and its distance transform (points sorted by x, every 3rd kept for a readable matrix). The X-distances form a smooth gradient; the Y-distances show the U as a cross — points on opposite arms have similar y. Distance correlation is the correlation of these two patterns; Pearson and Spearman on the raw values see almost nothing."
 fig, (ax0, ax1, ax2) = plt.subplots(1, 3, figsize=(12.5, 4.0))
-ax0.scatter(xs_, ys_, s=12, c=WARM, alpha=0.55, edgecolors="none")
+ax0.scatter(xs, ys, s=12, c=WARM, alpha=0.55, edgecolors="none")
 ax0.set_title("the U-shape (sorted by x)", fontsize=11)
 despine(ax0)
-for ax, M, ttl, cmap in [(ax1, A_show, "pairwise distances in X", "Blues"),
-                         (ax2, B_show, "pairwise distances in Y", "Oranges")]:
+for ax, M, ttl, cmap in [(ax1, Dx, "pairwise distances in X", "Blues"),
+                         (ax2, Dy, "pairwise distances in Y", "Oranges")]:
     ax.imshow(M, cmap=cmap, origin="lower")
     ax.set_title(ttl, fontsize=11)
 for ax in (ax0, ax1, ax2):
-    ax.set_xticks([]); ax.set_yticks([])
+    ax.set_xticks([])
+    ax.set_yticks([])
 fig.tight_layout()
 plt.show()
 ```
 
-::: {.callout-tip}
-## Your Turn — Real Pair, Same Check
-Repeat the `corr of centered distances = dCor²` verification on **JPM/BAC**
-(subsample ~500 days first — the matrices are $n \times n$).  Then try a pair
-from different sectors.  The identity holds every time; what changes is how
-much of the dependence survives each transform.
-:::
+The known answer holds: the two cheap measures read $\approx 0$, distance
+correlation does not.  The **`dCor − Spearman` gap** is the tell-tale sign of
+*non-monotone* dependence — a link where $y$ does not simply rise or fall with $x$.
+That is the first of the two gaps this lab tracks.
 
 ---
 
-## 4 · Full Basket Ranking
+## 🎭 Rung 2 · Toy-Real — A Stylized Market
 
-Compute all three measures for every pair; rank by distance correlation.
+$y = x^2$ never happens in markets.  What *does* is **joint crashes**: two banks
+that drift together on calm days and plunge together on the bad ones.
+`datasets.two_banks()` is that stylized picture — a shared driving factor plus a
+~10% set of days where both names fall hard at once (the `crash_mask`).  Here both
+banks move the same way (both fall together), so Spearman already catches the link
+and the `dCor − Spearman` gap stays shut.  The crash days are instead a handful of
+huge moves that show up in both banks at once — *outliers* — and **Pearson gives
+them too much weight**, opening a *second* gap, `Pearson − Spearman`, precisely on
+those days.
+
+```{python}
+a: Float[Array, "n_days"]
+b: Float[Array, "n_days"]
+crash: Float[Array, "n_days"]                       # boolean mask of co-crash days
+a, b, crash = datasets.two_banks(n=1500, seed=0)
+print(f"{int(crash.sum())} crash days of {crash.size}  ({crash.mean():.0%})\n")
+
+
+def tail_gap(m: dict) -> float:
+    """How far Pearson runs ahead of Spearman — the heavy-joint-tail fingerprint."""
+    return m["pearson"] - m["spearman"]   # P − S: ranks cap outliers; raw Pearson does not
+
+
+all_days  = measure_trio(a, b)
+calm_only = measure_trio(a[~crash], b[~crash])     # the same pair, crash days removed
+
+print("            Pearson  Spearman  distance   Pearson−Spearman")
+print(f"all days    {all_days['pearson']:+.3f}   {all_days['spearman']:+.3f}    "
+      f"{all_days['distance']:.3f}      {tail_gap(all_days):+.3f}")
+print(f"calm only   {calm_only['pearson']:+.3f}   {calm_only['spearman']:+.3f}    "
+      f"{calm_only['distance']:.3f}      {tail_gap(calm_only):+.3f}")
+```
+
+```{python}
+#| label: fig-twobanks
+#| fig-cap: "The stylized bank pair, crash days highlighted. The calm cloud is roughly elliptical — where all three measures agree — but the red crash days in the lower-left corner are huge co-moving outliers. They lift the magnitude-sensitive Pearson more than the rank-based Spearman, so the Pearson − Spearman gap opens on exactly these days."
+fig, ax = plt.subplots(figsize=(6.4, 5.0))
+ax.scatter(a[~crash], b[~crash], s=12, c=COOL, alpha=0.4, edgecolors="none", label="calm days")
+ax.scatter(a[crash], b[crash], s=26, c=CRASH, alpha=0.9, edgecolors="none", label="crash days")
+ax.set_xlabel("bank A return")
+ax.set_ylabel("bank B return")
+ax.set_title("Crash days inflate Pearson; the ranks shrug", fontsize=11.5)
+ax.legend(fontsize=9, frameon=False, loc="upper left")
+despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+Two readings.  First, all three measures are **high and close together** — the two
+banks move the same way, so the cheap tools already capture the link; you do *not*
+need the top of the ladder here.  Second, adding the crash days back lifts Pearson
+far more than Spearman: Spearman works on ranks, so the biggest crash counts only
+as "the most extreme day," whereas Pearson multiplies the raw return sizes, so a
+huge crash pulls it up sharply.  That widening `Pearson − Spearman` gap is the
+fingerprint of a **heavy joint tail** — two names that crash together far more
+violently than their calm-day relationship suggests.  That is the signal we now
+hunt on the real book of stocks.
+
+---
+
+## 📈 Rung 3 · Real — The Full Basket
+
+Now the real data.  We **reload** the prepared daily returns — there is no cleaning
+here; the steps that turn raw prices into log-returns live in
+[the data primer](../../data/01-downloading-and-parsing.qmd) — show a corner of the
+table, and run the *same* `measure_trio` on every pair of stocks.  We are looking
+for the same two gaps as before, now across all the real pairs: which pairs have a
+non-monotone link (`d − S`), and which hide a heavy joint tail (`P − S`).
+
+```{python}
+R = datasets.load_returns()                       # prepared 14-name daily panel
+META = datasets.load_basket_meta()
+label  = dict(zip(META["ticker"], META["label"]))
+sector = dict(zip(META["ticker"], META["sector"]))
+tickers = list(R.columns)
+print(f"{len(R)} trading days × {len(tickers)} stocks   "
+      f"({R.index.min().date()} → {R.index.max().date()})")
+R.iloc[:3, :6].round(4)
+```
+
+Distance correlation builds an $n \times n$ matrix, which gets expensive on the
+full history, so we take **one** lab-local shortcut — pick a random ~600 days for
+that one measure (the order of the days does not matter for measuring dependence) —
+then sort the pairs by strength and report **both** gaps:
 
 ```{python}
 import itertools
 
+Rs = R.sample(600, random_state=0)            # subsample only for the O(n²) distance corr
+
 rows = []
-for a, b in itertools.combinations(tickers, 2):
-    t = measure_trio(R[a].values, R[b].values)
-    s_a, s_b = sector.get(a, "?"), sector.get(b, "?")
-    rows.append(dict(
-        pair=f"{a}/{b}",
-        sector_match=(s_a == s_b),
-        **t,
-    ))
+for x_t, y_t in itertools.combinations(tickers, 2):
+    xf: Float[Array, "n_days"] = R[x_t].values                   # full series — cheap measures
+    yf: Float[Array, "n_days"] = R[y_t].values
+    xs_sub: Float[Array, "w"] = Rs[x_t].values                   # subsample — the n×n distance corr
+    ys_sub: Float[Array, "w"] = Rs[y_t].values
 
-rows.sort(key=lambda r: r["distance"], reverse=True)
+    pear = pearsonr(xf, yf)[0]
+    spear = spearmanr(xf, yf)[0]
+    dist = distance_correlation(xs_sub, ys_sub)
 
-print(f"{'Pair':<12s}  {'Pearson':>8s}  {'Spearman':>9s}  {'distance':>9s}  same sector")
-print("-" * 60)
-for r in rows[:10]:
-    print(f"  {r['pair']:<10s}  {r['pearson']:+8.3f}  {r['spearman']:+9.3f}  "
-          f"{r['distance']:9.3f}  {'✓' if r['sector_match'] else ''}")
+    rows.append(dict(pair=f"{x_t}/{y_t}",
+                     same_sector=(sector[x_t] == sector[y_t]),
+                     pearson=pear, spearman=spear, distance=dist,
+                     tail=pear - spear,                  # P − S: heavy-joint-tail flag → Job C
+                     nonlin=dist - abs(spear)))          # dCor − |Spearman|: non-monotone flag → Tool 2
+rows.sort(key=lambda r: r["distance"], reverse=True)     # rank by dependence strength
+
+print(f"{'pair':<11s}{'Pears':>7s}{'Spear':>7s}{'dist':>7s}{'P−S':>7s}{'d−S':>7s}  sector")
+print("-" * 53)
+for r in rows[:8]:
+    print(f"{r['pair']:<11s}{r['pearson']:>+7.3f}{r['spearman']:>+7.3f}"
+          f"{r['distance']:>7.3f}{r['tail']:>+7.3f}{r['nonlin']:>+7.3f}"
+          f"  {'✓' if r['same_sector'] else ''}")
 ```
 
-::: {.callout-tip}
-## What to Look for
-Within-sector pairs dominate the top.  Cross-sector pairs where distance
-correlation *exceeds* Spearman by more than 0.05 are your candidates for
-non-linear or tail dependence — worth investigating with mutual information
-(Tool 2) or a tail-crash analysis (Job C).
+::: {.callout-note icon=false}
+## Where This Data Comes From
+The panel, its sectors, and the co-crash structure these pairs ride on are laid
+bare in the data primer —
+[From Raw Prices to a Clean Panel](../../data/01-downloading-and-parsing.qmd) and
+[Co-Movement & Co-Crashes](../../data/04-co-movement-and-co-crashes.qmd).  This
+lab reloads that panel and never re-derives it.
 :::
+
+Read the two gap columns.  `d − S` (the non-monotone flag) is **near zero
+everywhere** — daily stock pairs move the same way, so the U-shape problem of
+Rung 1 simply does not arise on this book.  `P − S` (the heavy-tail flag) is the
+interesting one, and it does *not* simply follow dependence strength: the most
+strongly linked pairs (the bank pairs sitting on top) carry only a small gap,
+because both of their numbers are already high.  The largest `P − S` values, as
+the watchlist below shows, belong to other pairs.
 
 ---
 
-## 5 · Your Turn — The Cheapest Tool That Suffices
+## 💰 Rung 4 · Application — Which Pairs Hide a Heavy Joint Tail
 
-For each pair below, decide: does Pearson already tell the story, or do you
-need to climb the ladder?
+The deliverable is a **watchlist**: the pairs with the largest `Pearson − Spearman`
+gap.  A positive gap means a few extreme days where both names move together are
+pulling Pearson (which reacts to the size of each move) up, while Spearman (which
+only looks at ranks) ignores them — a cheap fingerprint of a **heavy joint tail**,
+and one we found without assuming any model for the returns.  The surprise is
+*which* pairs top the list: not the banks (already tightly linked on every kind of
+day), but **cross-sector** pairs — utilities and energy against the rest — that
+look only weakly related in calm times yet get dragged down together in 2008 and
+2020.  Those are the diversification illusions: pairs that look safe to hold side
+by side until the crisis hits.  They are exactly what to hand to [Job C · Hidden
+Risk](lab-jobC-hidden-risk.qmd), whose measure looks specifically at crash days to
+test the tail properly — something none of the all-days measures on this road can
+do.
 
-| Pair | Pearson | Spearman | distance | Verdict |
-|------|---------|----------|----------|---------|
-| (fill in from your ranking) | | | | |
+```{python}
+#| label: fig-watchlist-compute
+flagged = sorted(rows, key=lambda r: r["tail"], reverse=True)[:12]   # the 12 heaviest P − S tails
 
-**Rule of thumb:** if $|P - S| < 0.05$ and $|S - d| < 0.05$, the relationship
-is close to linear/elliptical and Pearson is fine.  Any larger gap signals
-something the cheap tool is missing.
+print(f"top {len(flagged)} pairs by Pearson − Spearman  →  hand to Job C\n")
+print(f"{'pair':<11s}{'Pearson':>9s}{'Spearman':>10s}{'P−S':>8s}  sector")
+print("-" * 46)
+for r in flagged:
+    print(f"{r['pair']:<11s}{r['pearson']:>+9.3f}{r['spearman']:>+10.3f}"
+          f"{r['tail']:>+8.3f}  {'same' if r['same_sector'] else 'cross'}")
+```
+
+```{python}
+#| label: fig-watchlist
+#| fig-cap: "The watchlist: the 12 real pairs with the largest Pearson − Spearman gap. Each is a pair whose extreme co-moving days inflate the linear number — a model-free fingerprint of joint-tail risk, and the triage queue for the tail job. Cross-sector pairs (red) dominate — utilities and energy coupling to the rest only in the tail, the diversification illusions; the strongly-coupled within-sector pairs (blue) carry a smaller gap."
+top = flagged[::-1]                                                 # smallest gap at the bottom of the bars
+fig, ax = plt.subplots(figsize=(7.6, 4.0))
+colors = [COOL if r["same_sector"] else CRASH for r in top]
+ax.barh([r["pair"] for r in top], [r["tail"] for r in top], color=colors)
+ax.set_xlabel("Pearson − Spearman  (the cheap tool over-reads the tail)")
+ax.set_title("Watchlist — heaviest joint tails first", fontsize=12)
+despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+Read the list as a priority queue: the largest gaps are pairs that are linked
+mainly through their shared crises, where Pearson most overstates how related they
+are on ordinary days.  Hand them to Job C for the crash-day test.  The
+*non-monotone* candidates instead (a large `d − S`, rare on this book) belong to
+[Tool 2 (mutual information)](lab-tool2-information.qmd) — mutual information is a
+measure that counts how much knowing one variable tells you about the other, in
+**bits**.
+
+---
+
+## Confirm It — The Gap *Is* the Crashes
+
+The watchlist is only as good as its premise: that the `Pearson − Spearman` gap
+really is caused by the shared crashes.  Let us check it directly by **reloading
+the real crash days** — the worst 10% of days for the average bank, defined once in
+[Crashes & Drawdowns](../../data/03-crashes-and-drawdowns.qmd) — and re-running the
+Rung 2 split on the top flagged pair.  If the premise holds, dropping the crash days
+should shrink the gap.
+
+```{python}
+worst = flagged[0]                                            # the heaviest-tail pair
+t1, t2 = worst["pair"].split("/")
+
+bank_avg = R[["JPM", "BAC", "C", "WFC", "GS"]].mean(axis=1)   # systemic factor = mean bank return
+crash: Float[Array, "n_days"] = (bank_avg <= bank_avg.quantile(0.10)).to_numpy()   # worst 10% of bank days
+
+xr: Float[Array, "n_days"] = R[t1].to_numpy()
+yr: Float[Array, "n_days"] = R[t2].to_numpy()
+
+gap_all = pearsonr(xr, yr)[0] - spearmanr(xr, yr)[0]                              # P − S, all days
+gap_calm = pearsonr(xr[~crash], yr[~crash])[0] - spearmanr(xr[~crash], yr[~crash])[0]   # P − S, crashes dropped
+shrink = 100 * (gap_all - gap_calm) / gap_all                                    # % of the gap the crashes carried
+
+print(f"{worst['pair']}   Pearson − Spearman gap")
+print(f"  all days             {gap_all:+.3f}")
+print(f"  crash days removed   {gap_calm:+.3f}   ← {shrink:.0f}% of the gap was the crises")
+```
+
+Drop the market-wide crashes and roughly a third of the gap goes with them — the
+same drop `two_banks` showed in Rung 2, now on a real cross-sector pair you would
+never have flagged by ordinary correlation alone.  The model-free ladder has done
+its job: it found *where* to look.  How many **bits** that crash-time link is
+actually worth — and whether there is dependence the cheapest tools cannot count at
+all — is the question [Tool 2 · Information
+Measures](lab-tool2-information.qmd) takes up next.

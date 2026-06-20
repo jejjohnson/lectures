@@ -79,6 +79,19 @@ ensembles for model doubt, and **calibration** to check the promise was kept.
    with neural networks: a Keras net that predicts its own noise σ(x) (the
    Gaussian-NLL loss), volatility, deep ensembles for model doubt;
    calibration; and the capstone — one machine, three uses.
+6. **[A probabilistic neural-network recipe](06-probabilistic-nn-recipe.qmd)** —
+   three heads for an honest band: Gaussian and robust **Student-t** likelihoods
+   for the noise, a **deep ensemble** for model doubt, combined into one calibrated
+   predictive band, with a real volatility example.
+7. **[Fair learning with CKA](07-fair-learning-with-cka.qmd)** — extend that net
+   with one term: a **CKA penalty** that forces the prediction independent of a
+   protected attribute, `S` entering the loss alone. Fairness costs accuracy — and
+   the probabilistic band shows the price by widening to stay calibrated.
+8. **[Propagating input uncertainty](08-input-uncertainty-propagation.qmd)** — when
+   the *inputs* are uncertain or **drift**: propagate them through the model
+   (Monte-Carlo or the Jacobian, $\sigma_y^2 \approx J\sigma_x^2 J^\top$ — the same
+   Jacobian as change of variables), bake input noise in at training, and complete
+   the three-term uncertainty budget.
 
 The hands-on [labs](labs/index.qmd) build each rung and propagate a real portfolio
 to its tail risk.

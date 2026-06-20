@@ -9,75 +9,348 @@ import sys, pathlib
 sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
 from lectures import plotting, datasets
 from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
-from rbig import AnnealedRBIG
 from lectures.measures import cocrash_fraction
 plotting.set_style("notes")
 import numpy as np, matplotlib.pyplot as plt
+from scipy.stats import pearsonr
+import einx                      # linear algebra with the axes spelled out
+from jaxtyping import Float      # shape annotations: Float[Array, "n_days"]
+
+Array = np.ndarray
 ```
 
 *Learn-the-tool track · Lab 1 of 3.*
 
-The failure you must internalize before trusting any scenario generator:
-sampling each variable on its own gets the marginals right and the **joint**
-wrong.
+This lab walks **one wrong move** — sampling each variable on its own — up the same
+ladder, from a toy whose answer you know by hand to the portfolio loss you stake
+capital on.  The *idea* (resample each margin independently and watch the joint
+disappear) stays fixed while the **data grows more realistic at each rung**, and at
+the top the cost of the mistake is a single number: a Value-at-Risk (VaR — the size of
+a loss you only expect to be exceeded rarely) that comes out far too small.
+
+**What you will produce:** the **understated VaR** that an independent resample reports
+for a real bank book. Resampling each name on its own makes the banks look as if they
+diversify each other when they do not — the false sense of safety that the joint
+generators in the next labs exist to fix.
 
 ---
 
-## 1 · Build the Failure
+## 🧪 Rung 1 · Toy — Known Answer
+
+Start where the truth is not in doubt.  `datasets.correlated_returns(rho=0.6)` draws
+a pair with a *known* linear correlation $\rho = 0.6$ — a single number for how
+strongly the two move together — so we can check by eye whether a resampling scheme
+keeps it.  The point to take away: matching each variable's own histogram is **not** the
+same as matching the pair.
 
 ```{python}
-a, b = datasets.tail_dependent_pair(n=2000, seed=0)
-rng = np.random.default_rng(1)
-indep = np.column_stack([rng.permutation(a), rng.permutation(b)])
+x_toy: Float[Array, "n"]
+y_toy: Float[Array, "n"]
+x_toy, y_toy = datasets.correlated_returns(n=2000, rho=0.6, seed=0)
 
-print(f"marginals preserved?  std a: {a.std():.2f} vs {indep[:,0].std():.2f}")
-print(f"real co-crash      = {cocrash_fraction(a, b):.0%}")
-print(f"independent co-crash = {cocrash_fraction(indep[:,0], indep[:,1]):.0%}  ← destroyed")
+ρ_real: float = pearsonr(x_toy, y_toy)[0]   # ρ = Cov(x,y)/(σₓ·σᵧ)   the truth to preserve
+
+print(f"x, y: {x_toy.shape}   built-in correlation ρ = 0.6 (the known answer)")
+print(f"measured ρ(x, y) = {ρ_real:+.3f}   ← the truth to preserve")
 ```
 
-Shuffling each column keeps the histograms identical but breaks the pairing — the
-co-crash collapses toward the independence baseline.
+**The algorithm — resample each margin on its own.**  An *independent resample*
+draws a new sample of $X$ and a new sample of $Y$ **with no regard for which $x$ went
+with which $y$**.  The cheapest way to do exactly that is to **shuffle one column**:
+permuting $Y$'s rows leaves $Y$'s histogram untouched (it is the same numbers in a new
+order) but severs every original $(x, y)$ pairing.  Spelled out, it is sampling the
+**product of the marginals** instead of the joint:
+
+```
+real          ~  p(x, y)            # the pairing kept
+independent   ~  p(x) · p(y)        # each margin alone — the pairing thrown away
+```
 
 ```{python}
-#| label: fig-tool1-independent
-#| fig-cap: "Same marginals, different joint: real (left) vs independent resample (right)."
-fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.4), sharex=True, sharey=True)
-for ax, data, col, name in [
-    (axL, np.column_stack([a, b]), COOL, f"real · {cocrash_fraction(a,b):.0%}"),
-    (axR, indep, CRASH, f"independent · {cocrash_fraction(indep[:,0],indep[:,1]):.0%}"),
+def resample_independent(
+    x: Float[Array, "n"], y: Float[Array, "n"], seed: int = 1
+) -> Float[Array, "n 2"]:
+    """Sample each margin on its own — draw p(x)·p(y), not p(x, y).
+
+    Permuting a column keeps its histogram exactly (same values, new order) but
+    destroys the row-pairing, so the result has the right *marginals* and the
+    *independence* joint.  This is the one operation the whole lab reuses.
+    """
+    rng = np.random.default_rng(seed)
+    return einx.rearrange(
+        "n, n -> n (1 + 1)", rng.permutation(x), rng.permutation(y)
+    )  # (n, 2): column 0 a reshuffle of x, column 1 an independent reshuffle of y
+
+
+indep: Float[Array, "n 2"] = resample_independent(x_toy, y_toy)
+
+ρ_indep: float = pearsonr(indep[:, 0], indep[:, 1])[0]   # ρ after the row-pairing is severed
+
+print(f"marginals preserved?  std y: {y_toy.std():.5f} → {indep[:, 1].std():.5f}  (identical)")
+print(f"ρ(x, y)         real        = {ρ_real:+.3f}")
+print(f"ρ independent resample      = {ρ_indep:+.3f}  ← ρ destroyed")
+```
+
+The marginals are byte-for-byte the same; the correlation collapses from $0.6$ toward
+$0$.  Read it as the whole lesson in miniature: a scheme can match every marginal
+perfectly and still throw the **joint** away.
+
+```{python}
+#| label: fig-toy-independent
+#| fig-cap: "The known-answer toy: real pair (left, ρ ≈ 0.6) vs the independent resample (right, ρ ≈ 0). Same two histograms on the margins — the resample only reshuffled the rows — but the tilted real cloud collapses into a round, structureless blob. Independent resampling keeps the marginals and erases the dependence."
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.6), sharex=True, sharey=True)
+for ax, (u, v), col, name in [
+    (axL, (x_toy, y_toy), COOL, f"real · ρ = {ρ_real:+.2f}"),
+    (axR, (indep[:, 0], indep[:, 1]), CRASH, f"independent · ρ = {ρ_indep:+.2f}"),
 ]:
-    ax.scatter(data[:, 0], data[:, 1], s=7, c=col, alpha=0.3, edgecolors="none")
-    ax.axvspan(-6, np.quantile(data[:, 0], 0.1), color=CRASH, alpha=0.06)
-    ax.axhspan(-6, np.quantile(data[:, 1], 0.1), color=CRASH, alpha=0.06)
-    ax.set_title(name, fontsize=11); ax.set_xlim(-5, 4); ax.set_ylim(-5, 4)
-    ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+    ax.scatter(u, v, s=8, c=col, alpha=0.3, edgecolors="none")
+    ax.set_title(name, fontsize=11.5)
+    ax.set_xlabel("x return")
+    ax.set_ylabel("y return")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    despine(ax)
+
+fig.suptitle("Same marginals, different joint — the tilt is gone", fontsize=12)
 fig.tight_layout()
 plt.show()
 ```
 
 ---
 
-## 2 · The Fix Is Joint Sampling
+## 🎭 Rung 2 · Toy-Real — A Stylized Market
+
+A round Gaussian blob never happens in markets.  What *does* is the **joint crash**:
+two banks that drift together on calm days and plunge together on the bad ones.
+`datasets.two_banks()` is that stylized version — a shared driver plus a ~10% set of
+days where both names crater (the `crash_mask`).  We run the **same**
+`resample_independent` on it and watch the co-crash — the lower-left quadrant where
+both names fall hard — empty out.
+
+What we are looking for is one number, `cocrash_fraction`: on the days one bank has one
+of its worst 10% returns, how often is the *other* bank also having one of its worst
+days?  A high number means they tend to crash together; ~10% would mean they crash
+independently, as if by coincidence.
 
 ```{python}
-gen = AnnealedRBIG(n_layers=30, random_state=0).fit(np.column_stack([a, b])).sample(2000)
-print(f"RBIG (joint) co-crash = {cocrash_fraction(gen[:,0], gen[:,1]):.0%}   ← restored")
+a: Float[Array, "n_days"]
+b: Float[Array, "n_days"]
+crash: Float[Array, "n_days"]                    # boolean mask of co-crash days
+a, b, crash = datasets.two_banks(n=1500, seed=0)
+print(f"{int(crash.sum())} crash days of {crash.size}  ({crash.mean():.0%})\n")
+
+indep_bank: Float[Array, "n_days 2"] = resample_independent(a, b)   # the SAME op as Rung 1
+
+cc_real: float = cocrash_fraction(a, b)                             # P(B crashes | A crashes)
+cc_indep: float = cocrash_fraction(indep_bank[:, 0], indep_bank[:, 1])
+
+ρ_bank_real: float = pearsonr(a, b)[0]                              # ρ = Cov(a,b)/(σₐ·σᵦ)
+ρ_bank_indep: float = pearsonr(indep_bank[:, 0], indep_bank[:, 1])[0]
+
+print(f"co-crash   real               = {cc_real:.0%}")
+print(f"co-crash   independent resample = {cc_indep:.0%}   ← collapsed to the ~10% floor")
+print(f"ρ          real {ρ_bank_real:+.2f}   independent {ρ_bank_indep:+.2f}")
 ```
 
-::: {.callout-tip}
-## What to Look for
-Any method that samples coordinates independently — however carefully it matches
-each marginal — sits at the independence floor for joint extremes.  Only joint
-generation (next two labs) escapes it.
-:::
+```{python}
+#| label: fig-twobanks-independent
+#| fig-cap: "The stylized bank pair, real (left) vs independent resample (right), with the joint-crash quadrant shaded (both names in their worst 10%). Real crash days (red) pile into the lower-left corner — the co-crash. Resampling each margin on its own scatters those same red points at random, emptying the corner: the co-crash falls from ~83% to the ~10% independence floor while the margins are untouched."
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.6), sharex=True, sharey=True)
+for ax, u, v, col, name in [
+    (axL, a, b, COOL, f"real · co-crash {cc_real:.0%}"),
+    (axR, indep_bank[:, 0], indep_bank[:, 1], CRASH, f"independent · co-crash {cc_indep:.0%}"),
+]:
+    qˣ, qʸ = np.quantile(u, 0.10), np.quantile(v, 0.10)   # the 10% crash lines
+    box: Float[Array, "n_days"] = (u <= qˣ) & (v <= qʸ)   # joint lower-tail quadrant: both ≤ Q₀.₁₀
+    ax.axvspan(u.min(), qˣ, color=CRASH, alpha=0.06)
+    ax.axhspan(v.min(), qʸ, color=CRASH, alpha=0.06)
+    ax.scatter(u[~box], v[~box], s=8, c=col, alpha=0.25, edgecolors="none")
+    ax.scatter(u[box], v[box], s=22, c=CRASH, alpha=0.85, edgecolors="none")
+    ax.set_title(name, fontsize=11.5)
+    ax.set_xlabel("bank A return")
+    ax.set_ylabel("bank B return")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    despine(ax)
+
+fig.suptitle("Independent resampling empties the co-crash corner", fontsize=12)
+fig.tight_layout()
+plt.show()
+```
+
+Same code, sterner stakes.  The marginals still match, so each bank *alone* looks
+right — but the resample puts the co-crash at the independence floor.  A risk model
+built on it would believe the two banks fall together only ~10% of the time, when in
+truth it is ~83%.  That gap is what the next rung prices on real data.
 
 ---
 
-## 3 · Your Turn
+## 📈 Rung 3 · Real — The Full Basket
 
-- Quantify it across quantiles: plot co-crash vs `q` for real vs independent.
-- Replace the shuffle with sampling each marginal from a fitted normal — does the
-  joint improve?  (It should not.)
+Now the real panel.  We **reload** the prepared returns — there is no data cleaning to
+do here, because the steps from raw prices to daily log-returns already live in the data
+primer.  We show a small corner of the table, then run the *same* `resample_independent`
+on a real pair of banks. The question is the same as the last rung: does the real
+co-crash survive when we shuffle the two names apart?
 
-Next: [Tool 2 — Gaussian Monte-Carlo](lab-tool2-gaussian-mc.qmd) keeps the
-correlation but still thins the tail.
+```{python}
+R = datasets.load_returns()                       # prepared 14-name daily panel
+META = datasets.load_basket_meta()
+label = dict(zip(META["ticker"], META["label"]))
+print(f"{len(R)} trading days × {len(R.columns)} stocks   "
+      f"({R.index.min().date()} → {R.index.max().date()})")
+R[["JPM", "BAC", "XOM"]].iloc[:3].round(4)
+```
+
+::: {.callout-note icon=false}
+## Where This Data Comes From
+The panel, its sectors, and the co-crash structure these names ride on are laid bare
+in the data primer —
+[Co-Movement & Co-Crashes](../../data/04-co-movement-and-co-crashes.qmd) builds the
+`cocrash_fraction` we read here.  This lab reloads that panel and never re-derives it.
+:::
+
+Take two real banks — JPM and BAC, the pair that falls together most reliably in the
+book — and resample them independently.  The *only* new code is the reload; the
+operation is exactly Rung 1's:
+
+```{python}
+jpm: Float[Array, "n_days"] = R["JPM"].to_numpy()
+bac: Float[Array, "n_days"] = R["BAC"].to_numpy()
+
+indep_real: Float[Array, "n_days 2"] = resample_independent(jpm, bac)   # SAME op — real series now
+
+cc_real = cocrash_fraction(jpm, bac)                         # P(BAC crashes | JPM crashes)
+cc_indep = cocrash_fraction(indep_real[:, 0], indep_real[:, 1])
+
+ρ_jpm_bac: float = pearsonr(jpm, bac)[0]                     # ρ = Cov(JPM,BAC)/(σ·σ)
+ρ_jpm_bac_indep: float = pearsonr(indep_real[:, 0], indep_real[:, 1])[0]
+
+print(f"JPM · BAC   real co-crash        = {cc_real:.0%}")
+print(f"            independent resample = {cc_indep:.0%}   ← back to the ~10% floor")
+print(f"            ρ  real {ρ_jpm_bac:+.2f}   independent {ρ_jpm_bac_indep:+.2f}")
+```
+
+```{python}
+#| label: fig-real-independent
+#| fig-cap: "JPM vs BAC, real (left) vs independent resample (right), joint-crash quadrant shaded. The real pair packs the lower-left corner — when JPM has a worst-10% day, BAC craters too on ~70% of them. Shuffling each column independently scatters those crash days apart, dropping the co-crash to the ~10% independence floor. The marginals — each bank's own return histogram — are untouched."
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.6), sharex=True, sharey=True)
+for ax, u, v, col, name in [
+    (axL, jpm, bac, COOL, f"real · co-crash {cc_real:.0%}"),
+    (axR, indep_real[:, 0], indep_real[:, 1], CRASH, f"independent · co-crash {cc_indep:.0%}"),
+]:
+    qˣ, qʸ = np.quantile(u, 0.10), np.quantile(v, 0.10)   # the 10% crash lines
+    box: Float[Array, "n_days"] = (u <= qˣ) & (v <= qʸ)   # joint lower-tail quadrant: both ≤ Q₀.₁₀
+    ax.axvspan(u.min(), qˣ, color=CRASH, alpha=0.06)
+    ax.axhspan(v.min(), qʸ, color=CRASH, alpha=0.06)
+    ax.scatter(u[~box], v[~box], s=6, c=col, alpha=0.18, edgecolors="none")
+    ax.scatter(u[box], v[box], s=16, c=CRASH, alpha=0.7, edgecolors="none")
+    ax.set_title(name, fontsize=11.5)
+    ax.set_xlabel("JPM return")
+    ax.set_ylabel("BAC return")
+    ax.set_xlim(-0.15, 0.15)
+    ax.set_ylim(-0.15, 0.15)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    despine(ax)
+
+fig.suptitle("Real co-movement, destroyed by per-marginal resampling", fontsize=12)
+fig.tight_layout()
+plt.show()
+```
+
+The lesson survives the jump to real data unchanged: the independent resample keeps
+each bank's own tail (the marginals match) but throws away the fact that they fall
+**together**.  On a single pair that is a vanished co-crash; on a *portfolio* it
+becomes money, which is the last rung.
+
+---
+
+## 💰 Rung 4 · Application — The VaR Understatement
+
+The deliverable is the cost of the mistake, in money.  Reload the **portfolio loss
+target** from the [risk-measures primer](../../data/05-risk-measures.qmd): pick weights,
+form the portfolio return $r_p = \sum_a R_a w_a$ (each stock's return times its share of
+the book, added up), and define the loss as $-r_p$.  **Value at Risk** at $1\%$ is then
+the 99th percentile of that loss — a loss this large or worse should show up only about
+1 day in 100.  We compute it two ways on a banks-only book: once from the **real** data,
+where the banks keep crashing together, and once from an **independent resample** of the
+same names, where that link is severed.  What we are looking for is how far apart the two
+VaR numbers come out.
+
+```{python}
+BANKS = ["JPM", "BAC", "C", "WFC", "GS"]
+R_banks: Float[Array, "n_days d_banks"] = R[BANKS].to_numpy()
+w: Float[Array, "d_banks"] = np.full(len(BANKS), 1.0 / len(BANKS))   # equal-weight bank book
+
+
+def var_1pct(book: Float[Array, "n_days d"], weights: Float[Array, "d"]) -> float:
+    """1% VaR of a portfolio loss.   rₚ = Σₐ Rₐ·wₐ,  loss = −rₚ,  VaR₁% = Q₀.₉₉(loss)."""
+    port: Float[Array, "n_days"] = einx.dot("day asset, asset -> day", book, weights)   # rₚ = Σₐ Rₐ·wₐ
+    return float(np.quantile(-port, 0.99))           # 99th-pct loss = 1-in-100-day level
+
+
+# Independent resample: shuffle EACH name's column on its own, severing the joint.
+rng = np.random.default_rng(7)
+R_indep: Float[Array, "n_days d_banks"] = np.column_stack(
+    [rng.permutation(R_banks[:, a]) for a in range(len(BANKS))]
+)
+
+var_true: float = var_1pct(R_banks, w)               # real joint — co-crashes intact
+var_indep: float = var_1pct(R_indep, w)              # independence — co-crashes erased
+understate: float = 100 * (var_true - var_indep) / var_true   # % VaR shrinks under independence
+
+# Portfolio loss series for the figure:  rₚ = Σₐ Rₐ·wₐ,  loss = −rₚ
+port_true: Float[Array, "n_days"] = einx.dot("day asset, asset -> day", R_banks, w)
+port_indep: Float[Array, "n_days"] = einx.dot("day asset, asset -> day", R_indep, w)
+loss_true: Float[Array, "n_days"] = -port_true       # loss = −return; right tail = bad days
+loss_indep: Float[Array, "n_days"] = -port_indep
+
+print(f"equal-weight bank book   1% daily VaR")
+print(f"  real (joint)            {var_true:.2%}")
+print(f"  independent resample    {var_indep:.2%}   ← understated by {understate:.0f}%")
+```
+
+```{python}
+#| label: fig-var-understatement
+#| fig-cap: "The understated VaR. Left: the equal-weight bank-book loss distribution, real joint (filled) vs independent resample (outline) — same marginals, but the real tail reaches far further right because the five banks crash together. Right: the 1% VaR each implies. Resampling each name on its own thins the joint tail, so it reports a VaR roughly half as large — diversification the book does not actually have."
+fig, (axH, axB) = plt.subplots(1, 2, figsize=(11, 4.2),
+                               gridspec_kw={"width_ratios": [1.6, 1]})
+
+bins = np.linspace(-0.10, 0.16, 70)
+axH.hist(loss_true, bins=bins, color=CRASH, alpha=0.55, label="real (joint)")
+axH.hist(loss_indep, bins=bins, histtype="step", color=INK, lw=1.6, label="independent")
+axH.axvline(var_true, color=CRASH, lw=2)
+axH.axvline(var_indep, color=INK, lw=2, ls="--")
+axH.set_ylim(0, 320)                                 # clip the calm-day peak
+axH.set_xlabel("bank-book loss  (−return)")
+axH.set_ylabel("days")
+axH.set_title("Independent resampling thins the joint tail", fontsize=11.5)
+axH.legend(fontsize=9, frameon=False, loc="upper right")
+despine(axH)
+
+axB.bar(["real\n(joint)", "independent\nresample"], [var_true * 100, var_indep * 100],
+        color=[CRASH, INK])
+axB.set_ylabel("1% daily VaR (%)")
+axB.set_title(f"VaR understated by {understate:.0f}%", fontsize=11.5)
+for i, v in enumerate([var_true, var_indep]):
+    axB.text(i, v * 100 + 0.05, f"{v:.1%}", ha="center", fontsize=10, color=INK)
+despine(axB)
+
+fig.tight_layout()
+plt.show()
+```
+
+Read the gap as capital.  Each bank's own loss histogram is matched exactly, so a
+naive check on the marginals would sign off — yet the independent resample reports a
+$1\%$ VaR roughly **half** what the real joint demands.  The error is not in any one name; it is in
+the *joint*: shuffling each column away from the others manufactures a diversification
+the bank book does not have, precisely on the systemic days when the banks fall as one.
+
+That is the entire case for joint sampling.  Getting each bank's own histogram right is
+necessary but never enough; the tail risk lives in how the names move together, and only
+a generator that draws from the joint $p(x, y)$ — not the product $p(x)\,p(y)$ — can
+carry it.  And keeping the correlation is not enough either: if you keep $\rho$ but still
+assume the crashes are milder than they really are, the VaR is wrong again, just less
+obviously.  That is the failure [Tool 2 · Gaussian
+Monte-Carlo](lab-tool2-gaussian-mc.qmd) takes up next.

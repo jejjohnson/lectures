@@ -134,14 +134,14 @@ x2, y2 = x2[order], y2[order]
 # the alternative: an ordinary mean net + one constant bar from the residuals
 mean_net = make_mlp(n_out=1, seed=1)
 mean_net.compile(optimizer=keras.optimizers.Adam(0.01), loss="mse")
-mean_net.fit(x2[:, None], y2[:, None], epochs=500, batch_size=64, verbose=0)
+mean_net.fit(x2[:, None], y2[:, None], epochs=150, batch_size=64, verbose=0)
 μ_mse = mean_net.predict(x2[:, None], verbose=0)[:, 0]
 σ_const = (y2 - μ_mse).std()                 # one number for every x
 
 # the tool: one net, two outputs, NLL loss
 noise_net = make_mlp(n_out=2, seed=2)
 noise_net.compile(optimizer=keras.optimizers.Adam(0.01), loss=gaussian_nll)
-noise_net.fit(x2[:, None], y2[:, None], epochs=800, batch_size=64, verbose=0)
+noise_net.fit(x2[:, None], y2[:, None], epochs=200, batch_size=64, verbose=0)
 pred2 = noise_net.predict(x2[:, None], verbose=0)
 μ_nll, σ_nll = pred2[:, 0], np.exp(pred2[:, 1])
 
@@ -285,11 +285,11 @@ def train_member(seed: int) -> Float[Array, "n_grid"]:
     net = make_mlp(n_out=1, seed=seed)                  # fresh random init
     net.compile(optimizer=keras.optimizers.Adam(0.01), loss="mse")
     net.fit(x_obs[idx][:, None], y_obs[idx][:, None],
-            epochs=600, batch_size=x_obs.size, verbose=0)
+            epochs=150, batch_size=x_obs.size, verbose=0)
     return net.predict(x_grid[:, None], verbose=0)[:, 0]
 
 
-ensemble = np.stack([train_member(seed) for seed in range(15)])  # (n_members, n_grid)
+ensemble = np.stack([train_member(seed) for seed in range(8)])  # (n_members, n_grid)
 μ_epi = einx.mean("m g -> g", ensemble)
 σ_epi = einx.std("m g -> g", ensemble)                  # disagreement = doubt
 
@@ -336,7 +336,7 @@ $\sigma_{\text{epistemic}}(x)$.
 char_net = make_mlp(n_out=2, seed=0)
 char_net.compile(optimizer=keras.optimizers.Adam(0.01), loss=gaussian_nll)
 char_net.fit(x_obs[:, None], y_obs[:, None],
-             epochs=800, batch_size=x_obs.size, verbose=0)
+             epochs=200, batch_size=x_obs.size, verbose=0)
 pred_char = char_net.predict(x_grid[:, None], verbose=0)
 μ_fit, σ_alea = pred_char[:, 0], np.exp(pred_char[:, 1])
 

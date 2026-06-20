@@ -12,6 +12,10 @@ from lectures.plotting import INK, COOL, WARM, CRASH, BAND, despine
 from lectures.measures import cocrash_fraction
 plotting.set_style("notes")
 import numpy as np, pandas as pd, matplotlib.pyplot as plt
+import einx                      # linear algebra with the axes spelled out
+from jaxtyping import Float      # shape annotations: Float[Array, "n_days"]
+
+Array = np.ndarray
 R = datasets.load_returns()
 meta = datasets.load_basket_meta().set_index("ticker")
 BANKS = ["JPM", "BAC", "C", "WFC", "GS"]
@@ -35,9 +39,10 @@ the next sections show, a systemic crisis lifts even those cross-sector links.
 #| label: fig-corr-block
 #| fig-cap: "Return correlation matrix, ordered by sector. The bank block (top-left) is uniformly bright — average within-bank correlation ~0.77 — while bank-vs-utility correlation averages ~0.29: far lower, but no longer negligible (the 2008 and 2020 crises couple everything to a degree). Sector membership still predicts co-movement."
 order = meta.sort_values("sector").index.tolist()
-C = R[order].corr()
+C = R[order].corr()                              # 14×14 Pearson matrix for the display
+C_mat: Float[Array, "n_assets n_assets"] = C.values
 fig, ax = plt.subplots(figsize=(7.2, 6.2))
-im = ax.imshow(C.values, cmap="RdBu_r", vmin=-1, vmax=1)
+im = ax.imshow(C_mat, cmap="RdBu_r", vmin=-1, vmax=1)
 ax.set_xticks(range(len(order))); ax.set_xticklabels(order, rotation=90, fontsize=8)
 ax.set_yticks(range(len(order))); ax.set_yticklabels(order, fontsize=8)
 # sector dividers
@@ -50,6 +55,119 @@ ax.set_title("Correlation lives in sector blocks", fontsize=12)
 fig.tight_layout(); plt.show()
 ```
 
+That ordering isn't magic — it's just the `sector` column of the basket
+metadata. Before the matrix can light up in blocks, the tickers have to be
+*grouped* by sector. Here is that grouping made explicit: load the metadata and
+collapse it into a plain `sector → tickers` dictionary. Every block in this
+chapter (and every block the labs reload) is one entry of this mapping.
+
+```{python}
+#| label: sector-grouping
+# meta is already loaded in the setup cell, indexed by ticker.
+# Re-read it un-indexed so we can group the `ticker` column by `sector`.
+meta_flat = datasets.load_basket_meta()
+sector_to_tickers = {
+    sec: grp["ticker"].tolist()
+    for sec, grp in meta_flat.groupby("sector", sort=False)
+}
+for sec, tickers in sector_to_tickers.items():
+    print(f"{sec:10s} → {tickers}")
+```
+
+The matrix above is just this dictionary laid end to end: banks, then tech, then
+energy, utilities, and staples. The bright squares are the *within*-sector
+entries of the mapping; the dimmer off-diagonal rectangles are the *between*-sector
+ones. We will lean on exactly this distinction below.
+
+## Blocks: From a Panel to Multidimensional Variables
+
+So far every quantity — a correlation, a co-crash fraction — has been built from
+*two scalar columns*. But the correlation matrix already hinted at something
+larger: a whole **sector** behaves like one object. Slice those columns out
+together and you get a **block** — a multidimensional variable
+$X \in \mathbb{R}^{n \times d}$, where $n$ is the number of trading days and $d$
+is the number of names in the sector. A block is not a column; it is a *bundle*
+of columns you treat as a single variable.
+
+```{python}
+#| label: sector-blocks
+# A sector is a block: select all of its columns at once.
+X_banks:  Float[Array, "n_days d_banks"]  = R[sector_to_tickers["Banks"]]    # (n_days, 5)
+X_tech:   Float[Array, "n_days d_tech"]   = R[sector_to_tickers["Tech"]]     # (n_days, 3)
+X_energy: Float[Array, "n_days d_energy"] = R[sector_to_tickers["Energy"]]   # (n_days, 2)
+
+for name, blk in [("X_banks", X_banks), ("X_tech", X_tech), ("X_energy", X_energy)]:
+    print(f"{name:9s} shape = {blk.shape}   columns = {list(blk.columns)}")
+```
+
+Read the shapes carefully: `X_banks` is `(n_days, 5)` — five real numbers per
+day, a point in $\mathbb{R}^5$, not a scalar. That single change of viewpoint
+splits every dependence question cleanly in two:
+
+- **Within a block** — *how redundant are the banks?* JPM, BAC, C, WFC and GS
+  carry overlapping information; a within-block measure (later: **total
+  correlation** $T(X_\text{banks})$) quantifies that shared core.
+- **Between blocks** — *how much do banks and energy move together?* That is a
+  between-block measure (later: **mutual information** $I(X_\text{banks};
+  X_\text{energy})$) — one number summarising a $5 \times 2$ slab of the
+  correlation matrix, not a single cell.
+
+Correlation can only ever fill one cell at a time. The information-theoretic
+measures in the dependence and gaussianization chapters take a *whole block* as
+their argument — which is exactly why those labs need blocks handed to them, not
+columns.
+
+### The Real-Toy Block: Two Banks vs Two Energy Majors
+
+The full bank block lives in $\mathbb{R}^5$ — too wide to follow by hand. So we
+keep a deliberately small **real-toy block**: two banks against two energy
+majors, a real `[x1, x2, y1, y2]` panel you can read row by row. It is real
+market data, but small enough to reason about like a toy.
+
+```{python}
+#| label: real-toy-block
+x: Float[Array, "n_days d_x"] = R[["JPM", "BAC"]]   # block x: two banks      → (n_days, 2)
+y: Float[Array, "n_days d_y"] = R[["XOM", "CVX"]]   # block y: two energy majors → (n_days, 2)
+toy: Float[Array, "n_days 4"] = pd.concat([x, y], axis=1)   # the [JPM, BAC, XOM, CVX] panel
+print("x shape =", x.shape, " y shape =", y.shape, " toy shape =", toy.shape)
+toy.head().round(4)
+```
+
+Now the 4×4 correlation of that little panel. This is the structure the
+information labs will later re-derive — and the *ordering* is the whole point:
+
+```{python}
+#| label: fig-toy-corr-block
+#| fig-cap: "The 4×4 correlation block of the real-toy panel [JPM, BAC, XOM, CVX]. Two bright 2×2 squares on the diagonal — within-banks (JPM·BAC ≈ 0.83) and within-energy (XOM·CVX ≈ 0.78) — and a dimmer off-diagonal 2×2 slab coupling banks to energy (≈ 0.35). Read as information: redundancy *within* a sector outweighs the shared signal *between* sectors — the ordering the labs quantify as T(x) within banks > I(x;y) banks↔energy."
+# Corr(X) = (1/n)·ZᵀZ   with Z = (X − μ)/σ   (standardize columns, then gram)
+M: Float[Array, "n_days 4"] = toy.to_numpy()
+n_days = M.shape[0]
+μ = M.mean(axis=0)                               # per-column mean μⱼ
+σ = M.std(axis=0)                                # per-column std σⱼ  (population, ddof=0)
+Z: Float[Array, "n_days 4"] = (M - μ) / σ        # standardized columns, ⟨zⱼ⟩=0, Var(zⱼ)=1
+Ctoy: Float[Array, "4 4"] = einx.dot("n i, n j -> i j", Z, Z) / n_days   # ρᵢⱼ = (1/n)·zᵢ·zⱼ
+fig, ax = plt.subplots(figsize=(5.2, 4.6))
+im = ax.imshow(Ctoy, cmap="RdBu_r", vmin=-1, vmax=1)
+ax.set_xticks(range(4)); ax.set_xticklabels(toy.columns, fontsize=10)
+ax.set_yticks(range(4)); ax.set_yticklabels(toy.columns, fontsize=10)
+ax.axhline(1.5, color=INK, lw=1.2); ax.axvline(1.5, color=INK, lw=1.2)  # x | y divider
+for i in range(4):
+    for j in range(4):
+        ax.text(j, i, f"{Ctoy[i, j]:.2f}", ha="center", va="center",
+                color=INK if abs(Ctoy[i, j]) < 0.6 else "white", fontsize=9)
+fig.colorbar(im, ax=ax, fraction=0.046, label="correlation")
+ax.set_title("within-bank & within-energy high,\nbank↔energy lower", fontsize=11)
+fig.tight_layout(); plt.show()
+```
+
+::: {.callout-note icon=false}
+## Block vs Column, in One Sentence
+A **column** is a scalar variable (one name's return). A **block** is a
+multidimensional variable (a sector, or a hand-picked bundle). Pearson
+correlation compares columns; the information measures ahead compare *blocks* —
+so this chapter's job is to build and hand off the blocks.
+:::
+
 ## 2 · Co-Movement Up Close: Two Scatters
 
 Correlation is an average over all days.  Zoom into two pairs and the *shape* of
@@ -61,8 +179,8 @@ though, in this crisis-spanning sample, not empty.
 ```{python}
 #| label: fig-scatters
 #| fig-cap: "Daily returns, JPM vs BAC (two banks) and JPM vs DUK (bank vs utility). The shaded lower-left box is the joint-crash quadrant (both below their 10% tail). It is crowded for the banks (~70% co-crash) and far sparser — but not empty — for the bank-utility pair (~30%). Tail dependence you can see."
-def lower_tail_box(ax, x, y, q=0.10):
-    tx, ty = np.quantile(x, q), np.quantile(y, q)
+def lower_tail_box(ax, x: Float[Array, "n_days"], y: Float[Array, "n_days"], q=0.10):
+    tx, ty = np.quantile(x, q), np.quantile(y, q)   # the q-quantile crash lines (qˣ, qʸ)
     ax.axvspan(x.min(), tx, color=CRASH, alpha=0.08)
     ax.axhspan(y.min(), ty, color=CRASH, alpha=0.08)
     ax.axvline(tx, color=CRASH, lw=0.8, ls="--")
@@ -70,7 +188,8 @@ def lower_tail_box(ax, x, y, q=0.10):
 
 fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.6))
 for ax, b, name in [(axL, "BAC", "two banks"), (axR, "DUK", "bank vs utility")]:
-    x, y = R["JPM"].to_numpy(), R[b].to_numpy()
+    x: Float[Array, "n_days"] = R["JPM"].to_numpy()
+    y: Float[Array, "n_days"] = R[b].to_numpy()
     lower_tail_box(ax, x, y)
     ax.scatter(x, y, s=7, c=COOL, alpha=0.18, edgecolors="none")
     cc = cocrash_fraction(x, y)
@@ -100,22 +219,23 @@ BAC shrugged off (blue)?
 ```{python}
 #| label: fig-cocrash-anatomy
 #| fig-cap: "Anatomy of one co-crash number (JPM·BAC). The shaded band is the *condition* — the 10% of days JPM falls hardest. Among those days, red points fall below BAC's crash line too (a co-crash) and blue ones do not; their ratio is the co-crash fraction, here ~70%. The bar chart below runs this same tally for every name."
-x, y = R["JPM"].to_numpy(), R["BAC"].to_numpy()
-tx, ty = np.quantile(x, 0.10), np.quantile(y, 0.10)
-band = x <= tx                    # condition: JPM in its worst 10%
-co = band & (y <= ty)             # …and BAC craters too → a co-crash
-hold = band & (y > ty)            # …but BAC held up
+x: Float[Array, "n_days"] = R["JPM"].to_numpy()
+y: Float[Array, "n_days"] = R["BAC"].to_numpy()
+qˣ, qʸ = np.quantile(x, 0.10), np.quantile(y, 0.10)   # the 10% crash lines
+band: Float[Array, "n_days"] = x <= qˣ                 # condition: JPM in its worst 10%
+co:   Float[Array, "n_days"] = band & (y <= qʸ)        # …and BAC craters too → a co-crash
+hold: Float[Array, "n_days"] = band & (y > qʸ)         # …but BAC held up
 fig, ax = plt.subplots(figsize=(7.6, 5.0))
-ax.axvspan(x.min(), tx, color=CRASH, alpha=0.06)
-ax.axhline(ty, color=INK, lw=0.8, ls=":")
+ax.axvspan(x.min(), qˣ, color=CRASH, alpha=0.06)
+ax.axhline(qʸ, color=INK, lw=0.8, ls=":")
 ax.scatter(x[~band], y[~band], s=7, c="0.78", alpha=0.25, edgecolors="none")
 ax.scatter(x[hold], y[hold], s=26, c=COOL, alpha=0.8, edgecolors="none",
            label=f"JPM crashes, BAC holds  ({int(hold.sum())})")
 ax.scatter(x[co], y[co], s=30, c=CRASH, alpha=0.9, edgecolors="none",
            label=f"both crash — a co-crash  ({int(co.sum())})")
-ax.text(tx, ax.get_ylim()[1], "  condition: JPM in its worst 10%",
+ax.text(qˣ, ax.get_ylim()[1], "  condition: JPM in its worst 10%",
         color=CRASH, fontsize=9, va="top", ha="left")
-ax.text(ax.get_xlim()[1], ty, "BAC's crash line  ", color=INK, fontsize=8.5,
+ax.text(ax.get_xlim()[1], qʸ, "BAC's crash line  ", color=INK, fontsize=8.5,
         va="bottom", ha="right")
 ax.set_xlabel("JPM return"); ax.set_ylabel("BAC return")
 ax.set_title(f"Of JPM's {int(band.sum())} worst days, BAC also craters on "
@@ -164,18 +284,20 @@ bivariate Gaussian with their *exact* correlation beside the real cloud:
 ```{python}
 #| label: fig-real-vs-gaussian
 #| fig-cap: "Same correlation, two worlds (JPM·BAC). Left: real standardized returns. Right: a bivariate Gaussian fit to that exact correlation, r ≈ 0.83. Same tilt, same ellipse — but the Gaussian barely passes ±4σ, while real crashes sprawl past −10σ and pack the lower-left corner, so the real co-crash (~70%) outruns the Gaussian's (~60%). Axes clipped at ±5σ; the gap is tail dependence."
-x, y = R["JPM"].to_numpy(), R["BAC"].to_numpy()
-xz = (x - x.mean()) / x.std(); yz = (y - y.mean()) / y.std()
-rho = np.corrcoef(xz, yz)[0, 1]
+x: Float[Array, "n_days"] = R["JPM"].to_numpy()
+y: Float[Array, "n_days"] = R["BAC"].to_numpy()
+xz: Float[Array, "n_days"] = (x - x.mean()) / x.std()   # standardized JPM, z = (x−μ)/σ
+yz: Float[Array, "n_days"] = (y - y.mean()) / y.std()   # standardized BAC
+ρ = np.corrcoef(xz, yz)[0, 1]                            # the pair's exact correlation
 rng = np.random.default_rng(0)
-g = rng.multivariate_normal([0, 0], [[1, rho], [rho, 1]], size=len(xz))
+g: Float[Array, "n_days 2"] = rng.multivariate_normal([0, 0], [[1, ρ], [ρ, 1]], size=len(xz))
 LIM = 5
 
-def _corner(ax, u, v, title):
-    tu, tv = np.quantile(u, 0.10), np.quantile(v, 0.10)
-    box = (u <= tu) & (v <= tv)
-    ax.axvspan(-LIM, tu, color=CRASH, alpha=0.05)
-    ax.axhspan(-LIM, tv, color=CRASH, alpha=0.05)
+def _corner(ax, u: Float[Array, "n_days"], v: Float[Array, "n_days"], title):
+    qᵘ, qᵛ = np.quantile(u, 0.10), np.quantile(v, 0.10)   # the 10% crash lines
+    box: Float[Array, "n_days"] = (u <= qᵘ) & (v <= qᵛ)   # joint lower-tail quadrant
+    ax.axvspan(-LIM, qᵘ, color=CRASH, alpha=0.05)
+    ax.axhspan(-LIM, qᵛ, color=CRASH, alpha=0.05)
     ax.scatter(u[~box], v[~box], s=6, c="0.78", alpha=0.22, edgecolors="none")
     ax.scatter(u[box], v[box], s=13, c=CRASH, alpha=0.8, edgecolors="none")
     ax.set_title(f"{title}\nco-crash = {cocrash_fraction(u, v):.0%}", fontsize=11)
@@ -184,7 +306,7 @@ def _corner(ax, u, v, title):
 
 fig, (axL, axR) = plt.subplots(1, 2, figsize=(10.5, 5.0))
 _corner(axL, xz, yz, "Real returns (JPM·BAC, standardized)")
-_corner(axR, g[:, 0], g[:, 1], f"A Gaussian, same r = {rho:.2f}")
+_corner(axR, g[:, 0], g[:, 1], f"A Gaussian, same r = {ρ:.2f}")
 fig.suptitle("Same correlation, same tilt — but real losses sprawl into the corner",
              fontsize=12)
 fig.tight_layout(); plt.show()
@@ -199,21 +321,22 @@ everywhere:
 #| fig-cap: "Co-crash for three pairs: what a Gaussian fit to the pair's own correlation predicts (blue) versus what actually happens (red), against the 10% independence baseline (dashed). Every real pair lands above its Gaussian — by 6–11 points — so the joint crashing is not just 'they're correlated'. The gap is tail dependence the correlation never sees, and it survives even for the loosely-tied bank-utility pair."
 from scipy.stats import multivariate_normal, norm
 
-def gaussian_cocrash(rho, q=0.10):
+def gaussian_cocrash(ρ, q=0.10):
     """Co-crash a bivariate normal with this correlation would produce."""
     z = norm.ppf(q)
-    return float(multivariate_normal([0, 0], [[1, rho], [rho, 1]]).cdf([z, z]) / q)
+    return float(multivariate_normal([0, 0], [[1, ρ], [ρ, 1]]).cdf([z, z]) / q)
 
 pairs = [("JPM", "BAC", "JPM·BAC\n(two banks)"),
          ("JPM", "KO", "JPM·KO\n(bank · staple)"),
          ("JPM", "DUK", "JPM·DUK\n(bank · utility)")]
 labels, data, gauss = [], [], []
 for x, y, lab in pairs:
-    xv, yv = R[x].to_numpy(), R[y].to_numpy()
-    rho = np.corrcoef(xv, yv)[0, 1]
+    xv: Float[Array, "n_days"] = R[x].to_numpy()
+    yv: Float[Array, "n_days"] = R[y].to_numpy()
+    ρ = np.corrcoef(xv, yv)[0, 1]                 # the pair's exact correlation
     labels.append(lab)
     data.append(cocrash_fraction(xv, yv) * 100)
-    gauss.append(gaussian_cocrash(rho) * 100)
+    gauss.append(gaussian_cocrash(ρ) * 100)
 
 xs = np.arange(len(pairs)); w = 0.38
 fig, ax = plt.subplots(figsize=(8.5, 4.2))
@@ -259,6 +382,70 @@ co-movement **concentrates in the tail** — the days you most need diversificat
 are the days it vanishes.  Catching that is the job of the
 [dependence](../dependence/index.qmd) measures and the reason Gaussian risk models
 fail in the [uncertainty](../uncertainty/index.qmd) chapter.
+:::
+
+---
+
+## What the Labs Reload From Here
+
+The information-theoretic "Venn" labs — mutual information and total correlation
+between multidimensional blocks — **reload** the blocks defined above rather than
+re-deriving them. Below is the single, copy-pasteable recipe they start from:
+load the returns, build the sector blocks from the metadata, and build the
+real-toy `[JPM, BAC] · [XOM, CVX]` block.
+
+```{python}
+#| label: reload-recipe
+from lectures import datasets
+
+R = datasets.load_returns()                 # (n_days, 14) panel of daily returns
+meta = datasets.load_basket_meta()          # ticker → label, sector
+
+# Sector blocks: each sector is one multidimensional variable.
+sector_cols = {
+    sec: meta.loc[meta.sector == sec, "ticker"].tolist()
+    for sec in meta.sector.unique()
+}
+X_banks:  Float[Array, "n_days d_banks"]  = R[sector_cols["Banks"]]    # (n_days, 5)
+X_energy: Float[Array, "n_days d_energy"] = R[sector_cols["Energy"]]   # (n_days, 2)
+X_tech:   Float[Array, "n_days d_tech"]   = R[sector_cols["Tech"]]     # (n_days, 3)
+
+# The real-toy block: 2 banks vs 2 energy majors — small enough to read by hand.
+x: Float[Array, "n_days d_x"] = R[["JPM", "BAC"]]    # (n_days, 2)
+y: Float[Array, "n_days d_y"] = R[["XOM", "CVX"]]    # (n_days, 2)
+
+print("sector blocks:",
+      {k: R[v].shape for k, v in sector_cols.items()})
+print("real-toy block:  x", x.shape, " y", y.shape)
+pd.concat([x, y], axis=1).head(3).round(4)
+```
+
+::: {.callout-note icon=false}
+## The Lab Contract
+The information-Venn labs **reload these exact blocks** from the one-line recipe
+above and *do not re-derive them*. The two halves of the contract:
+
+- **Sector blocks** (`X_banks`, `X_energy`, `X_tech`, …) are the full
+  multidimensional variables for within-block redundancy
+  ($T(X_\text{banks})$) and between-block coupling
+  ($I(X_\text{banks}; X_\text{energy})$).
+- **The real-toy block** `x = R[["JPM","BAC"]]`, `y = R[["XOM","CVX"]]` is the
+  small "toy examples of real data" rung — four columns you can read by hand,
+  with the structure already visible in the 4×4 block above.
+
+The **only** lab-specific extra step allowed is **subsampling** (~500 rows) for
+the $O(n^2)$ estimators (kNN mutual information, RBIG), e.g.
+`x.sample(500, random_state=0)`. Everything upstream of that — selection,
+sectoring, the real-toy pairing — is owned here.
+
+Three labs reload from this chapter:
+
+- [Tool 2 · Information](../dependence/labs/lab-tool2-information.qmd) — mutual
+  information between blocks.
+- [Tool 3 · Windows](../dependence/labs/lab-tool3-windows.qmd) — block dependence
+  through rolling windows.
+- [Tool 3 · Mutual Information](../gaussianization/labs/lab-tool3-mutual-information.qmd)
+  — MI via Gaussianization on these blocks.
 :::
 
 ---

@@ -193,6 +193,123 @@ def heteroscedastic_noise(
     return x, y
 
 
+def info_blocks(
+    n: int = 2000,
+    dx: int = 2,
+    dy: int = 2,
+    within: float = 0.7,
+    between: float = 0.5,
+    fat_tails: bool = False,
+    df: int = 3,
+    seed: int = DEFAULT_SEED,
+) -> dict:
+    """Two multidimensional blocks with known information-Venn region values.
+
+    Builds ``x = [x_1, ..., x_dx]`` and ``y = [y_1, ..., y_dy]`` from a shared
+    linear factor model so the Watanabe total-correlation decomposition has a
+    *closed form*.  Each standardized component is::
+
+        c_i = between·g + within·f_block + sqrt(1 - between² - within²)·eps_i
+
+    with unit-variance factors: a global ``g`` shared by **all** components, a
+    per-block factor ``f_x`` / ``f_y`` shared within a block, and idiosyncratic
+    ``eps_i``.  The resulting covariance has unit diagonal, within-block
+    off-diagonals ``between² + within²`` and cross-block off-diagonals
+    ``between²``.
+
+    The dials:
+
+    * ``between=0`` makes the two blocks **independent** — ``I(x; y) = 0`` exactly
+      (regardless of ``within``).
+    * ``within`` raises the within-block correlation *above* its global-factor
+      floor ``between²``, so it grows ``T(x)`` / ``T(y)``.  Because the global
+      factor also couples components within a block, ``T(x) = T(y) = 0`` requires
+      ``within = 0`` **and** ``between = 0`` (a single component, ``dx = 1``, also
+      has ``T(x) = 0`` trivially).
+
+    Args:
+        n: number of samples (rows).
+        dx: components in block ``x``.
+        dy: components in block ``y``.
+        within: per-block factor loading (raises ``T(x)``, ``T(y)``).
+        between: global factor loading (raises ``I(x; y)``).
+        fat_tails: if ``True`` the factors are standardized Student-*t*, adding
+            heavy tails / tail dependence on top of the same covariance; the
+            closed form is then a Gaussian/linear *reference*, not exact.
+        df: degrees of freedom for the Student-*t* factors (``fat_tails=True``).
+        seed: RNG seed.
+
+    Returns:
+        Dict with ``x`` ``(n, dx)``, ``y`` ``(n, dy)``, ``xy`` ``(n, dx + dy)``,
+        the analytic covariance ``Sigma`` ``(dx + dy, dx + dy)``, a ``truth`` dict
+        of region values **in nats** (``T_x``, ``T_y``, ``I_xy``, ``T_xy``,
+        ``H_x``, ``H_y``, ``H_xy``), and ``truth_exact`` — ``True`` for the
+        Gaussian model, ``False`` for ``fat_tails`` (where ``truth`` is the
+        Gaussian reference and the heavy-tailed sample carries extra dependence
+        above it).
+
+    Raises:
+        ValueError: if ``between² + within² > 1`` (no idiosyncratic variance
+            left) or any of ``n``, ``dx``, ``dy`` is not positive.
+    """
+    if n < 1 or dx < 1 or dy < 1:
+        raise ValueError("n, dx and dy must all be positive")
+    shared = between**2 + within**2  # within-block off-diagonal correlation
+    if shared > 1.0 + 1e-12:
+        raise ValueError(
+            f"between² + within² = {shared:.3f} > 1 — no idiosyncratic variance left"
+        )
+
+    rng = np.random.default_rng(seed)
+    d = dx + dy
+    idiosyncratic = float(np.sqrt(max(0.0, 1.0 - shared)))
+
+    def draw(size):
+        if fat_tails:
+            scale = np.sqrt((df - 2) / df)  # standardize Student-t to unit variance
+            return rng.standard_t(df, size=size) * scale
+        return rng.standard_normal(size=size)
+
+    g = draw(n)  # global factor → couples everything → I(x; y)
+    f_x, f_y = draw(n), draw(n)  # per-block factors → T(x), T(y)
+    eps = draw((n, d))  # idiosyncratic noise → unique entropy
+
+    block_factor = np.empty((n, d))
+    block_factor[:, :dx] = f_x[:, None]
+    block_factor[:, dx:] = f_y[:, None]
+    components = between * g[:, None] + within * block_factor + idiosyncratic * eps
+
+    # Analytic covariance: unit diag, within-block between²+within², cross between².
+    cov = np.full((d, d), float(between**2))
+    cov[:dx, :dx] = shared
+    cov[dx:, dx:] = shared
+    np.fill_diagonal(cov, 1.0)
+
+    # Closed-form Gaussian regions in nats (exact iff the factors are Gaussian).
+    _, logdet = np.linalg.slogdet(cov)
+    _, logdet_x = np.linalg.slogdet(cov[:dx, :dx])
+    _, logdet_y = np.linalg.slogdet(cov[dx:, dx:])
+    log_2pi_e = float(np.log(2.0 * np.pi * np.e))
+    truth = {
+        "T_x": -0.5 * logdet_x,  # ΣᵢH(xᵢ) - H(x) = -½ln|Σ_x|
+        "T_y": -0.5 * logdet_y,
+        "I_xy": 0.5 * (logdet_x + logdet_y - logdet),  # ½ln(|Σ_x||Σ_y|/|Σ|)
+        "T_xy": -0.5 * logdet,  # -½ln|Σ|
+        "H_x": 0.5 * (dx * log_2pi_e + logdet_x),  # ½ln((2πe)^dx |Σ_x|)
+        "H_y": 0.5 * (dy * log_2pi_e + logdet_y),
+        "H_xy": 0.5 * (d * log_2pi_e + logdet),
+    }
+
+    return {
+        "x": components[:, :dx],
+        "y": components[:, dx:],
+        "xy": components,
+        "Sigma": cov,
+        "truth": truth,
+        "truth_exact": not fat_tails,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Real-data loaders (require pandas — installed in the docs/demos environment)
 # ---------------------------------------------------------------------------
