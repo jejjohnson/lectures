@@ -12,95 +12,389 @@ from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
 from lectures.measures import cocrash_fraction
 plotting.set_style("notes")
 import numpy as np, matplotlib.pyplot as plt
+from scipy.stats import norm
+import einx                      # linear algebra with the axes spelled out
+from jaxtyping import Float      # shape annotations: Float[Array, "n_days"]
+
+Array = np.ndarray
 ```
 
 *Learn-the-tool track · Lab 2 of 3.*
 
-Gaussian Monte-Carlo matches the covariance — and still understates joint risk,
-because Gaussian tails are thin and tail-independent.  You will measure the VaR
-gap it leaves.
+This lab climbs **one Monte-Carlo recipe** — Monte-Carlo just means "simulate by
+drawing many random scenarios." The recipe is: fit a mean $\mu$ and a covariance
+$\Sigma$ (how the assets move together), draw many random scenarios from a Gaussian
+(bell-curve) world $\mathcal N(\mu, \Sigma)$, and read off the loss cutoff — the VaR
+(Value at Risk, the loss you only exceed 1% of the time). We run the same recipe up
+the same ladder and watch the **one thing it cannot do** grow from harmless to
+expensive.  Gaussian MC always gets the *correlation* right, because $\Sigma$ is
+exactly the correlation.  What it misses is the **joint tail** — the rare days when
+many assets crash *together*. Gaussian draws have thin tails and do not crash together,
+so the deep loss cutoff — the VaR — comes out too small.  On a toy that *is* Gaussian
+the recipe is exact; on real returns the same recipe sets aside too little capital.
+
+**What you will produce:** the **VaR gap** — how much capital a Gaussian MC sets aside
+at the 1% level versus what the market actually lost — the number that sends the desk
+to a heavy-tailed generator instead.
 
 ---
 
-## 1 · A Tail-Dependent Pair, and Its Gaussian Twin
+## 🧪 Rung 1 · Toy — Known Answer
+
+Start where Gaussian MC is the *true* model.  `datasets.correlated_returns(rho)`
+draws a pair of returns straight from a Gaussian $\mathcal N(0, \Sigma)$ with a chosen
+correlation — so the way the data was made is **exactly** what Gaussian MC assumes.
+Here the recipe has no excuse to be wrong, and we can check it against an exact formula
+instead of a simulation: for a Gaussian, the VaR is just
+$\mathrm{VaR}_\alpha = -(\mu + z_\alpha\sigma)$.
+If the simulation and that formula agree, the recipe is correct. Everything above this
+rung is the same recipe meeting data it did *not* generate.
 
 ```{python}
-rng = np.random.default_rng(2)
-n = 4000
-z = rng.normal(0, 1, n)
-a = 0.5 * z + 0.5 * rng.normal(0, 1, n)
-b = 0.5 * z + 0.5 * rng.normal(0, 1, n)
-crash = rng.random(n) < 0.05
-shock = np.abs(rng.standard_t(2.5, n) * 3.0)
-a, b = np.where(crash, a - shock, a), np.where(crash, b - shock, b)
-D = np.column_stack([a, b]); D = (D - D.mean(0)) / D.std(0)
+# a jointly-Gaussian pair with a known correlation — the model MC assumes
+x_toy: Float[Array, "n"]
+y_toy: Float[Array, "n"]
+x_toy, y_toy = datasets.correlated_returns(n=4000, rho=0.6, seed=0)
+D_toy: Float[Array, "n 2"] = np.column_stack([x_toy, y_toy])   # stack the two names → n×2
 
-gmc = rng.multivariate_normal(D.mean(0), np.cov(D.T), size=n)
-
-print(f"covariance matched? real corr {np.corrcoef(D.T)[0,1]:.2f} "
-      f"vs GMC {np.corrcoef(gmc.T)[0,1]:.2f}")
-print(f"co-crash:  real {cocrash_fraction(D[:,0], D[:,1], 0.02):.0%}  "
-      f"vs GMC {cocrash_fraction(gmc[:,0], gmc[:,1], 0.02):.0%}  (deep tail)")
+print(f"toy pair: {D_toy.shape}   target ρ = 0.60   "
+      f"(data IS Gaussian — MC has no excuse)")
+print(f"sample correlation = {np.corrcoef(D_toy.T)[0, 1]:.3f}")   # ρ̂ from Σ̂
 ```
 
-The two clouds share a middle but not a tail — see where they part:
+**The algorithm — one recipe, three lines.**  Every rung below runs *exactly* this
+function.  Fit the mean and covariance, split $\Sigma$ into $LL^\top$ (the Cholesky
+factor — a kind of square root of the covariance), push plain random noise through $L$
+so the draws pick up the right correlations, then read off the loss cutoff:
 
 ```{python}
-#| label: fig-tool2-clouds
-#| fig-cap: "Real tail-dependent returns vs a Gaussian Monte-Carlo with the same covariance. The bulk matches; the Gaussian has no joint lower-tail (shaded)."
-fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.2), sharex=True, sharey=True)
-for ax, data, col, name in [
-    (axL, D, COOL, f"real · co-crash {cocrash_fraction(D[:,0], D[:,1], 0.02):.0%}"),
-    (axR, gmc, CRASH, f"Gaussian MC · co-crash {cocrash_fraction(gmc[:,0], gmc[:,1], 0.02):.0%}"),
-]:
-    ax.scatter(data[:, 0], data[:, 1], s=6, c=col, alpha=0.3, edgecolors="none")
-    ax.axvspan(-10, np.quantile(D[:, 0], 0.02), color=INK, alpha=0.05)
-    ax.axhspan(-10, np.quantile(D[:, 1], 0.02), color=INK, alpha=0.05)
-    ax.set_title(name, fontsize=11); ax.set_xlim(-8, 4); ax.set_ylim(-8, 4)
-    ax.set_xticks([]); ax.set_yticks([]); despine(ax)
+def gaussian_mc_var(
+    data: Float[Array, "n d"],
+    weights: Float[Array, "d"],
+    alpha: float = 0.01,
+    n_draws: int = 200_000,
+    seed: int = 0,
+) -> tuple[float, Float[Array, "n_draws"]]:
+    """Gaussian Monte-Carlo VaR.   Fit μ,Σ → draw 𝒩(μ,Σ) → quantile of the loss.
+
+    VaRα = −Qα(rₚ),   rₚ = Σₐ rₐ·wₐ   (portfolio return = weighted asset sum)
+    The draw uses Σ = L Lᵀ:   r = μ + L·z,  z ~ 𝒩(0, I).
+    """
+    mu: Float[Array, "d"] = data.mean(0)             # μ — per-asset mean
+    cov: Float[Array, "d d"] = np.cov(data.T)        # Σ — covariance (the correlation)
+    L: Float[Array, "d d"] = np.linalg.cholesky(cov) # Σ = L Lᵀ
+
+    rng = np.random.default_rng(seed)
+    z: Float[Array, "n_draws d"] = rng.standard_normal((n_draws, data.shape[1]))
+    r: Float[Array, "n_draws d"] = mu + einx.dot("n i, j i -> n j", z, L)  # μ + L·z
+    port: Float[Array, "n_draws"] = einx.dot("n a, a -> n", r, weights)    # rₚ = Σₐ rₐ·wₐ
+    return -np.quantile(port, alpha), port           # VaRα = −Qα(rₚ)
+```
+
+Run it, and check the simulated VaR against the analytic Gaussian VaR — the formula
+the data actually obeys:
+
+```{python}
+w_equal: Float[Array, "2"] = np.array([0.5, 0.5])    # equal-weight the two names
+var_mc, port_mc = gaussian_mc_var(D_toy, w_equal, alpha=0.01)
+
+# closed form: a weighted sum of jointly-Gaussian returns is Gaussian, so
+# VaR₁% = −(μₚ + z₀.₀₁·σₚ),  with μₚ, σₚ the portfolio mean/std from μ, Σ
+mu_p = (D_toy.mean(0) * w_equal).sum()                              # μₚ = wᵀμ
+sig_p = np.sqrt(w_equal @ np.cov(D_toy.T) @ w_equal)               # σₚ = √(wᵀΣw)
+var_exact = -(mu_p + norm.ppf(0.01) * sig_p)                       # −(μₚ + z₀.₀₁·σₚ)
+
+print(f"1% VaR   Gaussian MC = {var_mc:.5f}")
+print(f"1% VaR   analytic    = {var_exact:.5f}   (z₀.₀₁ = {norm.ppf(0.01):.3f})")
+print(f"agree to {abs(var_mc - var_exact):.2e}   ← the recipe is correct")
+```
+
+```{python}
+#| label: fig-tool2-toy-compute
+# A Gaussian twin of the toy: same μ, Σ, drawn straight from 𝒩(μ, Σ).
+gmc_toy: Float[Array, "n 2"] = np.random.default_rng(1).multivariate_normal(
+    D_toy.mean(0), np.cov(D_toy.T), size=len(D_toy))
+```
+
+```{python}
+#| label: fig-tool2-toy
+#| fig-cap: "Gaussian Monte-Carlo on data that IS Gaussian. Left: the toy pair (blue) and a Gaussian MC draw with the same μ,Σ (red) — the clouds are indistinguishable because they share a model. Right: the simulated portfolio-loss histogram with the MC 1% VaR (solid) sitting exactly on the analytic −(μₚ+z₀.₀₁·σₚ) cutoff (dashed). When the data is Gaussian, simulation and formula coincide."
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11.5, 4.3))
+axL.scatter(D_toy[:, 0], D_toy[:, 1], s=7, c=COOL, alpha=0.3,
+            edgecolors="none", label="toy data")
+axL.scatter(gmc_toy[:, 0], gmc_toy[:, 1], s=7, c=CRASH, alpha=0.18,
+            edgecolors="none", label="Gaussian MC")
+axL.set_title("data vs its Gaussian twin — identical", fontsize=11)
+axL.set_xticks([])
+axL.set_yticks([])
+axL.legend(fontsize=8, frameon=False, loc="upper left")
+despine(axL)
+
+axR.hist(port_mc, bins=80, density=True, color=CRASH, alpha=0.45, label="MC losses")
+axR.axvline(-var_mc, color=CRASH, lw=2, label=f"MC 1% VaR = {var_mc:.3f}")
+axR.axvline(-var_exact, color=INK, lw=1.8, ls="--", label="analytic cutoff")
+axR.set_xlabel("portfolio return")
+axR.set_ylabel("density")
+axR.set_title("simulated VaR = analytic VaR", fontsize=11)
+axR.legend(fontsize=8, frameon=False, loc="upper left")
+despine(axR)
+
 fig.tight_layout()
 plt.show()
 ```
 
-## 2 · The VaR Gap
+The known answer holds: on Gaussian data the simulated VaR lands on the analytic
+formula to five decimals.  The recipe is **correct** — fitting $\Sigma$ captures the
+correlation, and when the tails truly are Gaussian there is nothing left to miss.
+Every rung from here keeps this exact function and only changes what we feed it.
+
+---
+
+## 🎭 Rung 2 · Toy-Real — A Stylized Market
+
+Markets are not Gaussian.  `datasets.tail_dependent_pair()` is a stand-in for a real
+market: a shared Student-*t* factor (a heavy-tailed distribution) gives each name a
+**fat tail** — extreme moves happen more often than a bell curve allows — and makes the
+pair crash together on the worst days.  The covariance still exists, so Gaussian MC
+will match the correlation perfectly; but the recipe assumes that matching $\Sigma$
+also matches the *tail*, and here it does not.  Same recipe, harder data — watch the
+deep-loss VaR come out too small.
 
 ```{python}
-port_real, port_gmc = D[:, 0] + D[:, 1], gmc[:, 0] + gmc[:, 1]
-for ql in [0.05, 0.01, 0.005]:
-    vr, vg = np.quantile(port_real, ql), np.quantile(port_gmc, ql)
-    print(f"{ql:>6.1%} VaR:  real {vr:+.2f}   GMC {vg:+.2f}   "
-          f"understated by {vr - vg:+.2f}")
+# a shared Student-t factor → fat marginal tails and a strong joint lower tail
+a: Float[Array, "n"]
+b: Float[Array, "n"]
+a, b = datasets.tail_dependent_pair(n=4000, df=3, seed=2)
+D_real: Float[Array, "n 2"] = np.column_stack([a, b])   # stack the two names → n×2
+
+print(f"fat-tail pair: {D_real.shape}")
+print(f"correlation:  data {np.corrcoef(D_real.T)[0, 1]:.2f}   "
+      f"(Gaussian MC will match this exactly)")
+print(f"deep co-crash (2% tail):  data {cocrash_fraction(a, b, 0.02):.0%}   "
+      f"← the joint tail Gaussian MC cannot make")
+```
+
+The *same* `gaussian_mc_var`, the *same* equal weights — only the data changed:
+
+```{python}
+var_mc_2, port_mc_2 = gaussian_mc_var(D_real, w_equal, alpha=0.01)
+port_emp: Float[Array, "n"] = einx.dot("n a, a -> n", D_real, w_equal)  # rₚ = Σₐ rₐ·wₐ  (empirical return)
+var_emp_2 = -np.quantile(port_emp, 0.01)                                # VaR₁% = −Q₁%(rₚ)  (historical)
+
+print(f"1% VaR   Gaussian MC = {var_mc_2:.3f}")
+print(f"1% VaR   empirical   = {var_emp_2:.3f}")
+print(f"understated by         {var_emp_2 - var_mc_2:+.3f}   "
+      f"({100 * (var_emp_2 - var_mc_2) / var_emp_2:.0f}% short)")
 ```
 
 ```{python}
-#| label: fig-tool2-gmc
-#| fig-cap: "Portfolio loss distribution: the Gaussian MC misses the deep-loss tail and reports a too-optimistic 1% VaR."
-bins = np.linspace(min(port_real.min(), port_gmc.min()), 3, 60)
-fig, ax = plt.subplots(figsize=(7.5, 4.4))
-ax.hist(port_real, bins=bins, density=True, color=COOL, alpha=0.55, label="real")
-ax.hist(port_gmc, bins=bins, density=True, color=CRASH, alpha=0.45, label="Gaussian MC")
-ax.axvline(np.quantile(port_real, 0.01), color=COOL, lw=2, ls="--")
-ax.axvline(np.quantile(port_gmc, 0.01), color=CRASH, lw=2, ls="--")
-ax.set_xlabel("portfolio return"); ax.set_ylabel("density")
-ax.set_title("1% VaR: real vs Gaussian MC", fontsize=12)
-ax.legend(fontsize=9, frameon=False); despine(ax)
+#| label: fig-tool2-stylized-compute
+# the Gaussian twin of the fat-tail pair: same μ, Σ, drawn from 𝒩(μ, Σ)
+gmc_2: Float[Array, "n 2"] = np.random.default_rng(3).multivariate_normal(
+    D_real.mean(0), np.cov(D_real.T), size=len(D_real))
+```
+
+```{python}
+#| label: fig-tool2-stylized
+#| fig-cap: "The stylized fat-tail pair (blue) and its Gaussian MC twin (red), same μ,Σ. Left: the bulk matches but the data has a heavy joint lower-left tail the Gaussian cloud never reaches (shaded). Right: the empirical portfolio loss has a longer left tail than the Gaussian MC; the MC 1% VaR (red dashed) sits well inside the empirical 1% VaR (blue dashed). Matching covariance did not match the tail."
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11.5, 4.3))
+axL.scatter(D_real[:, 0], D_real[:, 1], s=7, c=COOL, alpha=0.3,
+            edgecolors="none", label="real-shape data")
+axL.scatter(gmc_2[:, 0], gmc_2[:, 1], s=7, c=CRASH, alpha=0.18,
+            edgecolors="none", label="Gaussian MC")
+axL.axvspan(-12, np.quantile(D_real[:, 0], 0.02), color=INK, alpha=0.05)
+axL.axhspan(-12, np.quantile(D_real[:, 1], 0.02), color=INK, alpha=0.05)
+axL.set_xlim(-9, 5)
+axL.set_ylim(-9, 5)
+axL.set_title("fat tail the Gaussian never reaches", fontsize=11)
+axL.set_xticks([])
+axL.set_yticks([])
+axL.legend(fontsize=8, frameon=False, loc="upper left")
+despine(axL)
+
+bins = np.linspace(min(port_emp.min(), port_mc_2.min()), 3, 70)
+axR.hist(port_emp, bins=bins, density=True, color=COOL, alpha=0.55, label="empirical")
+axR.hist(port_mc_2, bins=bins, density=True, color=CRASH, alpha=0.4, label="Gaussian MC")
+axR.axvline(-var_emp_2, color=COOL, lw=2, ls="--", label=f"emp 1% VaR = {var_emp_2:.2f}")
+axR.axvline(-var_mc_2, color=CRASH, lw=2, ls="--", label=f"MC 1% VaR = {var_mc_2:.2f}")
+axR.set_xlabel("portfolio return")
+axR.set_ylabel("density")
+axR.set_title("MC 1% VaR sits inside the real one", fontsize=11)
+axR.legend(fontsize=8, frameon=False, loc="upper left")
+despine(axR)
+
 fig.tight_layout()
 plt.show()
 ```
 
-::: {.callout-tip}
-## What to Look for
-The deeper the quantile, the wider the gap — Gaussian tail-independence means the
-error *grows* exactly where it hurts.  Matching covariance is not matching tail
-risk.
+The correlation is matched to two decimals and the recipe is **still too optimistic**:
+its 1% VaR falls short of the loss the data actually delivered by more than a tenth.
+The gap is not a bug in the simulation — the simulation is exact for what it models.
+It is the signature of **tail-independence**: in a Gaussian world the worst days for
+one name do not line up with the worst days for the other, so deep losses never pile up
+the way the real ones do and the worst 1% comes out shallower.  This is the gap the
+real book will turn into a capital number.
+
+---
+
+## 📈 Rung 3 · Real — The Full Basket
+
+Now the real portfolio.  We **reload** the prepared 14-name panel (the table of daily
+returns for 14 stocks) and form the equal-weight portfolio loss — the same
+`loss = -einx.dot(...)` target built once in
+[the risk-measures primer](../../data/05-risk-measures.qmd); there is no cleaning or
+weighting here.  Then we run the *same* `gaussian_mc_var` on all 14 assets and compare
+its 1% VaR to the **historical** 1% VaR the desk actually lived through.  **What we are
+looking for:** does the simulated 1% VaR — the buffer the model says to hold — match
+the worst losses the basket really suffered? If the model's number is smaller, the desk
+would have set aside too little.
+
+```{python}
+R = datasets.load_returns()                       # prepared 14-name daily panel
+META = datasets.load_basket_meta()
+R_mat: Float[Array, "n_days n_assets"] = R.to_numpy()
+n_assets = R.shape[1]
+w_eq: Float[Array, "n_assets"] = np.full(n_assets, 1.0 / n_assets)   # equal-weight book
+
+print(f"{len(R)} trading days × {n_assets} stocks   "
+      f"({R.index.min().date()} → {R.index.max().date()})")
+R.iloc[:3, :6].round(4)
+```
+
+::: {.callout-note icon=false}
+## Where This Data Comes From
+The panel, the equal-weight book, and the **portfolio-loss target** this VaR is a
+quantile of are built once in
+[Risk: VaR, the Market Factor & Beta](../../data/05-risk-measures.qmd) — the
+historical-vs-Gaussian split there is exactly the gap this lab simulates.  This lab
+reloads `loss = -einx.dot("day asset, asset -> day", R, w)` and never re-derives it.
 :::
 
+The same recipe, now fed 14 real assets; historical VaR is just the quantile of the
+realized loss:
+
+```{python}
+# historical (empirical) loss target — what the desk actually lived through
+port_hist: Float[Array, "n_days"] = einx.dot("day asset, asset -> day", R_mat, w_eq)
+var_hist = -np.quantile(port_hist, 0.01)                  # historical 1% VaR = −Q₁%(rₚ)
+
+# same Gaussian MC recipe, 14 assets in, one VaR out
+var_mc_3, port_mc_3 = gaussian_mc_var(R_mat, w_eq, alpha=0.01)
+
+# the recipe matches Σ by construction — confirm portfolio volatility lines up
+sig_hist = port_hist.std()                                # realized portfolio σ
+sig_mc = port_mc_3.std()                                  # simulated portfolio σ
+print(f"portfolio volatility — MC matches Σ by construction:")
+print(f"  historical σ {sig_hist:.4f}   vs   Gaussian MC σ {sig_mc:.4f}   "
+      f"(agree → covariance captured)\n")
+print(f"equal-weight book   1% daily VaR")
+print(f"  Gaussian MC   {var_mc_3:.4f}   ({var_mc_3:.2%})")
+print(f"  historical    {var_hist:.4f}   ({var_hist:.2%})")
+print(f"  MC undershoots by {var_hist - var_mc_3:+.4f}   "
+      f"({100 * (var_hist - var_mc_3) / var_hist:.0f}% short of history)")
+```
+
+```{python}
+#| label: fig-tool2-basket
+#| fig-cap: "Equal-weight basket portfolio loss: historical (blue) vs Gaussian MC (red), both at 1% VaR. The Gaussian MC matches the calm centre but its left tail is too short — the historical 1% VaR (blue dashed) sits deeper than the MC 1% VaR (red dashed). The undershoot is the cost of assuming the 14 names never crash together."
+fig, ax = plt.subplots(figsize=(8.6, 4.4))
+lo = min(port_hist.min(), np.quantile(port_mc_3, 0.001))
+bins = np.linspace(lo, np.quantile(port_hist, 0.97), 80)
+ax.hist(port_hist, bins=bins, density=True, color=COOL, alpha=0.55, label="historical")
+ax.hist(port_mc_3, bins=bins, density=True, color=CRASH, alpha=0.4, label="Gaussian MC")
+ax.axvline(-var_hist, color=COOL, lw=2, ls="--", label=f"historical 1% VaR = {var_hist:.2%}")
+ax.axvline(-var_mc_3, color=CRASH, lw=2, ls="--", label=f"Gaussian MC 1% VaR = {var_mc_3:.2%}")
+ax.set_xlabel("equal-weight portfolio return")
+ax.set_ylabel("density")
+ax.set_title("Gaussian MC undershoots the real deep tail", fontsize=12)
+ax.legend(fontsize=9, frameon=False, loc="upper left")
+despine(ax)
+
+fig.tight_layout()
+plt.show()
+```
+
+On the real book the verdict is the same as the stylized rung, only now in real capital
+the desk would have to fund: the correlation is matched by construction, yet the
+Gaussian MC's 1% VaR sits short of the loss the panel actually delivered.  The 14 names
+crashed together in 2008 and 2020 the way no Gaussian draw ever does, so the simulated
+worst case is too mild — and a 1% VaR is exactly a worst-case number.
+
 ---
 
-## 3 · Your Turn
+## 💰 Rung 4 · Application — The VaR Gap
 
-- Push the crash fraction up and down; does the VaR gap track it?
-- Compare against an RBIG scenario set (next: [Job A](lab-jobA-stress-scenarios.qmd)) on the
-  same data — which VaR is closer to the empirical one?
+The deliverable is the **VaR gap**: how much less capital a Gaussian MC sets aside than
+history demanded, at the confidence level that decides the buffer.  **The key number:**
+at the 1% level, the gap is the dollars per \$1 of the book the model leaves
+unprotected.  Read across the levels — going from a 5% loss day down to a rare 0.5% one
+— and the gap *widens* as the losses get deeper.  That is the defining failure of
+assuming assets never crash together: the error grows exactly where the buffer must
+hold.
 
-Next: predictive uncertainty by sampling — [Tool 3 — bands](lab-tool3-bands.qmd).
+```{python}
+levels = [0.05, 0.025, 0.01, 0.005]
+print(f"equal-weight book — VaR gap by level   (capital per \$1 notional)")
+print(f"{'level':>7s}{'Gaussian MC':>14s}{'historical':>13s}{'gap':>9s}{'short':>8s}")
+print("-" * 51)
+gaps = []
+for ql in levels:
+    v_mc = gaussian_mc_var(R_mat, w_eq, alpha=ql)[0]   # same recipe, deeper quantile
+    v_hist = -np.quantile(port_hist, ql)
+    gaps.append((ql, v_mc, v_hist))
+    print(f"{ql:>6.1%}{v_mc:>13.2%}{v_hist:>13.2%}{v_hist - v_mc:>+9.2%}"
+          f"{100 * (v_hist - v_mc) / v_hist:>+7.0f}%")
+
+ql0, v_mc0, v_hist0 = next(g for g in gaps if g[0] == 0.01)
+notional = 100_000_000   # $100M book
+under = (v_hist0 - v_mc0) * notional
+print(f"\non a \${notional / 1e6:.0f}M book, the 1% VaR gap is "
+      f"\${under / 1e6:.2f}M under-reserved")
+```
+
+```{python}
+#| label: fig-tool2-gap
+#| fig-cap: "The VaR gap by confidence level. Each pair of bars is the 1-day VaR a Gaussian MC reserves (red) vs what history demanded (blue); the gap between them is the under-reservation. It is small at 5% and widens toward 0.5% — tail-independence makes the Gaussian err most exactly where the capital buffer matters. This widening gap is what motivates a heavy-tailed generator."
+labels = [f"{q:.1%}" for q, _, _ in gaps]
+mc_vals = [v * 100 for _, v, _ in gaps]
+hist_vals = [v * 100 for _, _, v in gaps]
+xpos: Float[Array, "n_levels"] = np.arange(len(gaps))
+bw = 0.38
+
+fig, ax = plt.subplots(figsize=(8.4, 4.4))
+ax.bar(xpos - bw / 2, mc_vals, bw, color=CRASH, label="Gaussian MC")
+ax.bar(xpos + bw / 2, hist_vals, bw, color=COOL, label="historical")
+for i, (_, v_mc, v_hist) in enumerate(gaps):
+    ax.annotate("", xy=(i + bw / 2, v_hist * 100), xytext=(i - bw / 2, v_mc * 100),
+                arrowprops=dict(arrowstyle="<->", color=INK, lw=1.0))
+    ax.text(i, max(v_mc, v_hist) * 100 + 0.25, f"{(v_hist - v_mc) * 100:+.1f}",
+            ha="center", fontsize=8.5, color=INK)
+ax.set_xticks(xpos)
+ax.set_xticklabels(labels)
+ax.set_xlabel("VaR confidence level")
+ax.set_ylabel("1-day VaR (%)")
+ax.set_title("The VaR gap widens into the tail", fontsize=12)
+ax.legend(fontsize=9, frameon=False, loc="upper left")
+despine(ax)
+
+fig.tight_layout()
+plt.show()
+```
+
+The synthesis, end to end: one recipe — fit $\mu, \Sigma$, draw $\mathcal N(\mu,
+\Sigma)$, read the loss cutoff — was **exact** on Gaussian data (Rung 1), came up more
+than a tenth short on a stylized fat-tail pair (Rung 2), and fell short of the real
+basket's historical 1% VaR (Rung 3) by a margin that *grows* as the losses get deeper
+(Rung 4).  At a shallow 5% the Gaussian is even slightly *too cautious* — its tall,
+narrow centre pulls the cutoff in — but by the 1% level it has flipped to setting aside
+too little, and at 0.5% it is short by roughly 40%.
+
+The correlation was never the problem; $\Sigma$ matches it at every rung.  The problem
+is the tail. Because Gaussian draws never crash together, the deep shared-loss days that
+set a 1% VaR simply do not show up in the simulation — so the capital buffer it sizes is
+too small by real dollars on a real book.
+
+To close that gap you need a generator that reproduces the heavy *joint* tail instead
+of assuming it away — the inverse RBIG map of
+[Job A · Stress Scenarios](lab-jobA-stress-scenarios.qmd), which keeps this exact VaR
+recipe but feeds it draws that crash together like the market does.

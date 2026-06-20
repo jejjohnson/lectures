@@ -9,163 +9,423 @@ import sys, pathlib
 sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
 from lectures import plotting, datasets
 from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
-from lectures.measures import (distance_correlation, mutual_information_bits,
-                               linfoot_r, nats_to_bits, measure_trio)
+from lectures.measures import (measure_trio, distance_correlation,
+                               mutual_information_xy, linfoot_r)
 plotting.set_style("notes")
 import numpy as np, matplotlib.pyplot as plt
 from scipy.stats import pearsonr, spearmanr
-import itertools
+import einx                      # linear algebra with the axes spelled out
+from jaxtyping import Float      # shape annotations: Float[Array, "n_days n_assets"]
+
+Array = np.ndarray
 ```
 
-*Do-the-job track · deliverable.*
+*Apply-the-tool track · Job B.*
 
-A risk manager's first question: "what is the dependence structure of our book?"
-This job produces that answer — a systematic, honest, multi-measure report for
-every pair in the basket.
+A risk manager's first question is "what is the dependence structure of our
+book?" — their *book* being the whole portfolio of positions they hold — and the
+only honest answer reads **every** pair of holdings through **every** lens,
+because no single number catches all four kinds of dependence at once: linear (a
+straight-line link), monotone (one rises whenever the other does), curved, and
+tail (they move together only in extreme moves).  This lab builds that report once
+on a toy example whose answer we can check by hand, then climbs the same routine
+up to the full basket without rewriting a line of it — only the **data** grows up
+under it.
 
-**Deliverable:** a ranked pairwise dependence table, a heatmap, and a written
-interpretation of the three most interesting pairs.
+**What you will produce:** a ranked, multi-measure measure book for the 14-stock
+basket, with a worked reading and the routing of each flagged pair to the
+calibration job (A) and the tail-risk job (C).
 
 ---
 
-## Setup
+## 🧪 Rung 1 · Toy — Known Answer
+
+Start where the truth is not in doubt.  We build **three synthetic streams** with
+a *known* correlation structure, so the report we are about to write has an answer
+we can grade it against.  `datasets.correlated_returns(rho=...)` draws a Gaussian
+pair with an exact Pearson $\rho$; we wire three of them into one panel with a
+shared driver so the off-diagonal $\rho$ values are known going in.
 
 ```{python}
-R = datasets.load_returns()
+def three_stream_panel(seed: int = 0) -> tuple[Float[Array, "n 3"], list[str]]:
+    """Three correlated streams with a KNOWN pairwise ρ structure.
+
+    A·B share a strong driver (ρ≈0.80), A·C a weak one (ρ≈0.30), and B·C
+    inherit only the overlap — so we know each pair's linear truth by design.
+    """
+    rng = np.random.default_rng(seed)
+
+    # each stream = (load · shared driver) + idiosyncratic noise   [unitless z]
+    g: Float[Array, "n"] = rng.standard_normal(2000)                   # shared driver g
+    A: Float[Array, "n"] = 0.80 * g + 0.60 * rng.standard_normal(2000)  # loads heavily on g
+    B: Float[Array, "n"] = 0.80 * g + 0.60 * rng.standard_normal(2000)  # loads heavily on g  → A·B strong
+    C: Float[Array, "n"] = 0.30 * g + 0.95 * rng.standard_normal(2000)  # loads weakly on g   → A·C, B·C weak
+
+    streams: Float[Array, "n 3"] = einx.rearrange("n, n, n -> n (1 + 1 + 1)", A, B, C)  # (2000, 3)
+    return 0.01 * streams, ["A", "B", "C"]              # 0.01 → daily-return scale
+
+
+X_toy: Float[Array, "n 3"]
+X_toy, names_toy = three_stream_panel()
+known_rho = {("A", "B"): "≈0.80 (strong)", ("A", "C"): "≈0.30 (weak)",
+             ("B", "C"): "≈0.30 (weak)"}
+print(f"panel: {X_toy.shape}   streams {names_toy}")
+for pair, truth in known_rho.items():
+    print(f"  known ρ[{pair[0]}·{pair[1]}] = {truth}")
+```
+
+**The report routine — one template, every pair × every measure.**  This is the
+deliverable's engine, written **once** here and reused unchanged on every rung
+above.  For each unordered pair it computes the four lenses of the dependence
+ladder and returns a tidy list of rows, ranked by strength:
+
+```{python}
+import itertools
+
+
+def measure_book(
+    panel: Float[Array, "n d"],
+    names: list[str],
+    *,
+    sub: Float[Array, "m d"] | None = None,   # subsample for the O(n²) measures
+    rank_by: str = "distance",
+) -> list[dict]:
+    """The measure book: every pair × {Pearson, Spearman, dCor, info R}, ranked.
+
+    Pearson    = corr(x, y)                      linear move-together     [−1,1]
+    Spearman   = corr(rank x, rank y)            any monotone relation    [−1,1]
+    distance   = dCor(x, y)                      ANY dependence (0 iff ⫫) [0,1]
+    info R     = linfoot_r(I(x; y))              shared info, rescaled    [0,1]
+
+    The last column is mutual information — the bits two streams share —
+    rescaled onto the Linfoot R scale so it is bounded in [0, 1] and reads
+    like a correlation (it equals |ρ| for a Gaussian pair); raw MI is in
+    unbounded bits and would not line up with the other three columns.
+
+    `sub` feeds the O(n²) measures (dCor) a thinned panel when n is large; the
+    cheap rank/linear measures always see the full series.
+    """
+    sub = panel if sub is None else sub
+    col = {nm: i for i, nm in enumerate(names)}
+    rows = []
+    for a, b in itertools.combinations(names, 2):
+        xf: Float[Array, "n"] = panel[:, col[a]]    # full series — cheap measures
+        yf: Float[Array, "n"] = panel[:, col[b]]
+        xs: Float[Array, "m"] = sub[:, col[a]]      # thinned — the O(n²) one
+        ys: Float[Array, "m"] = sub[:, col[b]]
+
+        trio = measure_trio(xf, yf)                            # Pearson, Spearman, raw dCor
+        info_r = linfoot_r(mutual_information_xy(xf, yf))      # I(x;y) in nats → Linfoot R ∈ [0,1]
+        rows.append(dict(
+            pair=f"{a}/{b}",
+            pearson=trio["pearson"],
+            spearman=trio["spearman"],
+            distance=distance_correlation(xs, ys),            # subsampled dCor
+            info_r=info_r,
+            tail=trio["pearson"] - trio["spearman"],          # heavy-joint-tail flag → Job C
+            nonlin=distance_correlation(xs, ys) - abs(trio["spearman"]),  # non-monotone flag
+        ))
+    rows.sort(key=lambda r: r[rank_by], reverse=True)
+    return rows
+
+
+def show_book(rows: list[dict], head: int | None = None) -> None:
+    """Print a measure book as a tidy fixed-width table."""
+    print(f"{'pair':<11s}{'Pears':>7s}{'Spear':>7s}{'dCor':>7s}"
+          f"{'infoR':>7s}{'P−S':>7s}{'d−S':>7s}")
+    print("-" * 53)
+    for r in (rows if head is None else rows[:head]):
+        print(f"{r['pair']:<11s}{r['pearson']:>+7.3f}{r['spearman']:>+7.3f}"
+              f"{r['distance']:>7.3f}{r['info_r']:>7.3f}"
+              f"{r['tail']:>+7.3f}{r['nonlin']:>+7.3f}")
+
+
+book_toy = measure_book(X_toy, names_toy)
+show_book(book_toy)
+```
+
+Read it against what we built in.  `A/B` tops the table — Pearson $\approx 0.80$,
+the strong driver — and `A/C`, `B/C` sit far below near $\rho \approx 0.30$,
+exactly the known structure.  The last column, `infoR`, is the mutual information
+— the amount of information the two streams share — but rescaled to the Linfoot R
+scale, which runs from 0 to 1 and equals $|\rho|$ for a Gaussian pair, so it sits
+on the same scale as the correlation columns and can be read straight across.  All
+four lenses **agree** here: Pearson $\approx$ Spearman (the `P−S` tail column is
+$\approx 0$, no heavy tail), and dCor tracks the monotone strength (the `d−S`
+non-monotone column is $\approx 0$, no U-shape).  The report format is validated:
+when the data is plain linear-Gaussian, every column reads the same story, and the
+ranking is the correlation ranking.
+
+```{python}
+#| label: fig-toy-book
+#| fig-cap: "The three toy streams and their measure book. Left: A and B (the strong pair) ride a tight cloud; A and C scatter loosely. Right: the four lenses agree on every pair — a plain-Gaussian book reads one story per row, and dCor's ranking is just the Pearson ranking. This agreement is the baseline the real rungs will break."
+fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(11.5, 4.4))
+ax0.scatter(X_toy[:, 0], X_toy[:, 1], s=10, c=COOL, alpha=0.4,
+            edgecolors="none", label="A vs B  (strong)")
+ax0.scatter(X_toy[:, 0], X_toy[:, 2], s=10, c=WARM, alpha=0.4,
+            edgecolors="none", label="A vs C  (weak)")
+ax0.set_xlabel("stream A return"); ax0.set_ylabel("other stream return")
+ax0.set_title("known structure: A·B strong, A·C weak", fontsize=11)
+ax0.legend(fontsize=9, frameon=False, loc="upper left"); despine(ax0)
+
+pairs = [r["pair"] for r in book_toy]
+xpos = np.arange(len(pairs))
+for off, key, c, lab in [(-0.27, "pearson", INK, "Pearson"),
+                         (-0.09, "spearman", COOL, "Spearman"),
+                         (+0.09, "distance", WARM, "dCor"),
+                         (+0.27, "info_r", CRASH, "info R (Linfoot)")]:
+    ax1.bar(xpos + off, [r[key] for r in book_toy], width=0.18, color=c, label=lab)
+ax1.set_xticks(xpos); ax1.set_xticklabels(pairs)
+ax1.set_title("every pair × every measure", fontsize=11)
+ax1.legend(fontsize=8.5, frameon=False, ncol=2); despine(ax1)
+fig.tight_layout(); plt.show()
+```
+
+---
+
+## 🎭 Rung 2 · Toy-Real — A Stylized Market
+
+Plain Gaussian streams never happen in markets.  What *does* happen is **joint
+crashes** (assets diving together) and **convex payoffs** (positions like options
+that pay off the same way whether the market moves sharply up *or* down, giving a
+U- or V-shaped relationship) — exactly the structure the four-lens book is built
+to separate.  We keep the **exact** `measure_book` routine and feed it a made-up
+panel with known structure built in: two banks that crash together
+(`datasets.two_banks`, monotone with a heavy joint tail) and a convex option-like
+leg (`datasets.convex_payoff`, non-monotone V-shape).
+
+```{python}
+a_bank: Float[Array, "n"]
+b_bank: Float[Array, "n"]
+a_bank, b_bank, crash = datasets.two_banks(n=2000, seed=0)   # co-crash, heavy lower tail
+
+u_opt: Float[Array, "n"]
+v_opt: Float[Array, "n"]
+u_opt, v_opt = datasets.convex_payoff(n=2000, seed=0)        # V-shape: v = |u| + noise
+
+# stack three legs into one panel
+X_styl: Float[Array, "n 3"] = einx.rearrange("n, n, n -> n (1 + 1 + 1)",   # (2000, 3) stylized panel
+                                             a_bank, b_bank, v_opt)
+names_styl = ["bankA", "bankB", "optV"]
+print(f"panel: {X_styl.shape}   {names_styl}")
+print(f"built-in structure:")
+print(f"  bankA/bankB → monotone co-crash ({crash.mean():.0%} crash days, heavy P−S tail)")
+print(f"  *  /optV    → V-shape vs the bank legs (non-monotone, dCor > |Spearman|)")
+
+book_styl = measure_book(X_styl, names_styl)
+show_book(book_styl)
+```
+
+The book reports exactly what we built in.  `bankA/bankB` carries a clearly
+positive `P−S` gap: the crash days are a few huge moves where both banks fell
+together, and because Pearson reacts to the *size* of a move it gets pulled up by
+them, while Spearman — which only looks at the *order* of the days — caps them.
+That gap is the **heavy-joint-tail** fingerprint, the same one Tool 1's
+`two_banks` rung opened.  The `optV` pairs instead carry near-zero Pearson **and**
+Spearman yet a sizeable dCor, so their `d−S` column lights up — the
+**non-monotone** fingerprint of the V-shape, which only the distance lens can see.
+Two different dangers, two different columns; the report separates them
+automatically.
+
+```{python}
+#| label: fig-styl-book
+#| fig-cap: "The stylized panel. Left: the bank pair's calm cloud (blue) plus its co-crash outliers (red) in the lower-left — a heavy joint tail. Centre: the convex V-shape against a bank leg — strong dependence, but symmetric, so the linear lenses read ≈0. Right: the two gap columns. P−S (tail) fires on the bank pair; d−S (non-monotone) fires on the option legs. The book routes each pair to a different danger."
+fig, (ax0, ax1, ax2) = plt.subplots(1, 3, figsize=(13.5, 4.2))
+
+ax0.scatter(a_bank[~crash], b_bank[~crash], s=10, c=COOL, alpha=0.4,
+            edgecolors="none", label="calm days")
+ax0.scatter(a_bank[crash], b_bank[crash], s=22, c=CRASH, alpha=0.9,
+            edgecolors="none", label="crash days")
+ax0.set_xlabel("bank A"); ax0.set_ylabel("bank B")
+ax0.set_title("co-crash: heavy joint tail", fontsize=10.5)
+ax0.legend(fontsize=8.5, frameon=False, loc="upper left"); despine(ax0)
+
+ax1.scatter(a_bank, v_opt, s=10, c=WARM, alpha=0.4, edgecolors="none")
+ax1.set_xlabel("bank A"); ax1.set_ylabel("option leg V")
+ax1.set_title("convex V: non-monotone", fontsize=10.5); despine(ax1)
+
+pairs = [r["pair"] for r in book_styl]
+xpos = np.arange(len(pairs))
+ax2.bar(xpos - 0.18, [r["tail"] for r in book_styl], width=0.34,
+        color=CRASH, label="P−S  (heavy tail → Job C)")
+ax2.bar(xpos + 0.18, [r["nonlin"] for r in book_styl], width=0.34,
+        color=WARM, label="d−S  (non-monotone)")
+ax2.axhline(0, color=INK, lw=0.8)
+ax2.set_xticks(xpos); ax2.set_xticklabels(pairs, fontsize=9)
+ax2.set_title("the two gap columns", fontsize=10.5)
+ax2.legend(fontsize=8, frameon=False); despine(ax2)
+fig.tight_layout(); plt.show()
+```
+
+The routine did not change — only the data did, and the same six columns now read
+a richer story.  The toy taught us the **format**; the stylized market taught us
+the two **flags** the format raises.  Now the full book.
+
+---
+
+## 📈 Rung 3 · Real — The Full Basket
+
+Now the real panel.  **What we are looking for here:** which of the 91 stock
+pairs are genuinely linked, and through which lens — so we can hand the strongest,
+cleanest pairs to one follow-up job and the tail-risky ones to another.  We
+**reload** the prepared daily returns — there is no cleaning here; the pipeline
+that turns prices into log-returns lives in
+[the data primer](../../data/01-downloading-and-parsing.qmd) — show a corner of
+the table, and run the *same* `measure_book` on all $\binom{14}{2}=91$ pairs.
+
+```{python}
+R = datasets.load_returns()                       # prepared 14-name daily panel
 META = datasets.load_basket_meta()
-label = dict(zip(META["ticker"], META["label"]))
+label  = dict(zip(META["ticker"], META["label"]))
 sector = dict(zip(META["ticker"], META["sector"]))
 tickers = list(R.columns)
-print(f"Book: {len(tickers)} stocks, {len(R)} trading days")
-print(f"Sectors: {sorted(set(sector.values()))}")
+print(f"{len(R)} trading days × {len(tickers)} stocks   "
+      f"({R.index.min().date()} → {R.index.max().date()})")
+R.iloc[:3, :6].round(4)
 ```
 
----
+::: {.callout-note icon=false}
+## Where This Data Comes From
+The panel, its sectors, and the co-crash structure these pairs ride on are laid
+bare in the data primer —
+[From Raw Prices to a Clean Panel](../../data/01-downloading-and-parsing.qmd) and
+[Co-Movement & Co-Crashes](../../data/04-co-movement-and-co-crashes.qmd).  This
+lab reloads that panel and never re-derives it.
+:::
 
-## 1 · Compute the Full Measure Table
+Distance correlation builds an $n \times n$ matrix per pair, which gets expensive,
+so we take **one** lab-local step: thin the data down to a random ~600 days just
+for those costly measures (the order of the days does not matter for measuring how
+two stocks move together).  Then we run the unchanged routine:
 
 ```{python}
-def mi_hist(x, y, bins=25):
-    H, _, _ = np.histogram2d(x, y, bins=bins)
-    return mutual_information_bits(H)
+panel: Float[Array, "n_days n_assets"] = R.to_numpy()                                  # full series
+panel_sub: Float[Array, "m n_assets"] = R.sample(600, random_state=0).to_numpy()      # thinned — only for the O(n²) dCor
 
-rows = []
-for a, b in itertools.combinations(tickers, 2):
-    x, y = R[a].values, R[b].values
-    t = measure_trio(x, y)
-    mi = mi_hist(x, y)
-    mi_nats = mi / np.log2(np.e)
-    R_lf = linfoot_r(mi_nats)
-    same_sec = sector.get(a) == sector.get(b)
-    rows.append(dict(
-        pair=f"{a}/{b}",
-        pair_label=f"{label.get(a,a)} / {label.get(b,b)}",
-        sector_a=sector.get(a, "?"),
-        sector_b=sector.get(b, "?"),
-        same_sector=same_sec,
-        pearson=t["pearson"],
-        spearman=t["spearman"],
-        distance=t["distance"],
-        mi_bits=mi,
-        linfoot_R=R_lf,
-        excess_mi=mi - nats_to_bits(-0.5 * np.log(1 - t["pearson"]**2)),
-    ))
-
-rows.sort(key=lambda r: r["mi_bits"], reverse=True)
-print(f"{'Pair':<12s}  {'Pearson':>8s}  {'Spearman':>9s}  {'distance':>9s}  {'MI(bits)':>9s}  {'excess':>8s}")
-print("-" * 68)
-for r in rows[:12]:
-    print(f"  {r['pair']:<10s}  {r['pearson']:+8.3f}  {r['spearman']:+9.3f}  "
-          f"{r['distance']:9.3f}  {r['mi_bits']:9.3f}  {r['excess_mi']:+8.3f}")
+book = measure_book(panel, tickers, sub=panel_sub)    # same routine, escalated data
+print(f"{len(book)} pairs ranked by distance correlation  —  top of the book:\n")
+show_book(book, head=10)
 ```
 
----
+The same four columns now describe the real basket.  `d−S` (non-monotone) is
+**near zero everywhere** — for daily stocks, when one moves the other tends to
+move the same way, so the curved V-shape problem of Rung 2 simply does not arise
+on this book.  `P−S` (heavy tail) is the column that actually varies here.  The
+key thing to notice: a *large* `P−S` gap flags a pair that looks mild most of the
+time but lurches together in extreme moves.  And this gap does **not** simply
+follow overall strength — the strongest pairs at the top carry only a modest gap,
+because both their numbers are already high.  The largest tail gaps instead belong
+to weaker pairs from *different* sectors further down the list — pairs that look
+like good diversification in calm times yet crash together, the very illusions the
+deliverable below ranks out.
 
-## 2 · Heatmaps — Pearson Vs. MI Side by Side
+```{python}
+#| label: fig-heatmaps-compute
+# Re-assemble the book's pair rows into two symmetric n×n matrices, one per lens.
+n = len(tickers)
+col = {t: i for i, t in enumerate(tickers)}
+
+P_mat: Float[Array, "n_assets n_assets"] = np.eye(n)               # diagonal Pearson ρ(x,x) = 1
+R_mat: Float[Array, "n_assets n_assets"] = np.zeros((n, n))        # diagonal info R left at 0
+
+for r in book:                                        # fill from the book we already built
+    a, b = r["pair"].split("/")
+    i, j = col[a], col[b]
+    P_mat[i, j] = P_mat[j, i] = r["pearson"]          # ρ symmetric: ρ(i,j) = ρ(j,i)
+    R_mat[i, j] = R_mat[j, i] = r["info_r"]           # info R(i;j) symmetric  [0,1]
+```
 
 ```{python}
 #| label: fig-heatmaps
-#| fig-cap: "Pearson (left) and MI in bits (right). Within-sector blocks are visible in both; the MI map reveals additional non-Gaussian structure."
-n = len(tickers)
-P_mat = np.zeros((n, n))
-MI_mat = np.zeros((n, n))
-
-for i, a in enumerate(tickers):
-    for j, b in enumerate(tickers):
-        if i == j:
-            P_mat[i, j] = 1.0
-            MI_mat[i, j] = 0.0
-        elif i < j:
-            x, y = R[a].values, R[b].values
-            P_mat[i, j] = P_mat[j, i] = pearsonr(x, y)[0]
-            MI_mat[i, j] = MI_mat[j, i] = mi_hist(x, y)
-
+#| fig-cap: "The book as two matrices over all 14 names. Left: Pearson — the linear lens, with within-sector blocks (banks, energy) glowing on the diagonal. Right: the information lens — mutual information rescaled to Linfoot R, on the same 0-to-1 scale as a correlation — which lights up the same blocks plus extra off-block structure the linear map misses. Reading both at once is the point of a measure book: where they disagree is where a single number would mislead."
 labs = [label.get(t, t) for t in tickers]
-fig, (axL, axR) = plt.subplots(1, 2, figsize=(15, 6))
-
-for ax, mat, title, cmap in [
-    (axL, P_mat,  "Pearson correlation", "RdBu_r"),
-    (axR, MI_mat, "Mutual information (bits)", "YlOrRd"),
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(14.5, 6.0))
+for ax, mat, title, cmap, vmin in [
+    (axL, P_mat,  "Pearson correlation", "RdBu_r", -np.abs(P_mat).max()),
+    (axR, R_mat,  "Mutual information (Linfoot R)", "YlOrRd", 0.0),
 ]:
-    v = np.abs(mat).max()
-    im = ax.imshow(mat, cmap=cmap, aspect="auto",
-                   vmin=-v if cmap == "RdBu_r" else 0, vmax=v)
-    ax.set_xticks(range(n)); ax.set_xticklabels(labs, rotation=45, ha="right", fontsize=9)
-    ax.set_yticks(range(n)); ax.set_yticklabels(labs, fontsize=9)
-    plt.colorbar(im, ax=ax)
-    ax.set_title(title, fontsize=12, fontweight="bold")
-
-fig.tight_layout()
-plt.show()
+    im = ax.imshow(mat, cmap=cmap, vmin=vmin, vmax=np.abs(mat).max())
+    ax.set_xticks(range(n)); ax.set_xticklabels(labs, rotation=45, ha="right", fontsize=8.5)
+    ax.set_yticks(range(n)); ax.set_yticklabels(labs, fontsize=8.5)
+    plt.colorbar(im, ax=ax, fraction=0.046)
+    ax.set_title(title, fontsize=12)
+fig.tight_layout(); plt.show()
 ```
 
 ---
 
-## 3 · Sector Summary
+## 💰 Rung 4 · Application — The Measure Book
+
+The deliverable is the finished book: the ranked table plus a one-paragraph
+reading and the **routing** of each flagged pair to the next two jobs.  We tag
+every pair by whether its two stocks sit in the same sector or in different ones,
+rank by distance correlation (the lens that catches *any* dependence), and read
+off two routing columns — `P−S` for the heavy-joint-tail candidates that go to
+[Job C · Hidden Risk](lab-jobC-hidden-risk.qmd), and the strongest-and-cleanest
+pairs whose calibration we send to [Job A · Validate](lab-jobA-validate.qmd).
 
 ```{python}
-#| label: tbl-sector
-#| tbl-cap: "Average MI (bits) within vs. across sectors."
-within, across = [], []
-for r in rows:
-    (within if r["same_sector"] else across).append(r["mi_bits"])
+for r in book:                                        # tag sector relationship for routing
+    a, b = r["pair"].split("/")
+    r["same_sector"] = sector.get(a) == sector.get(b)
 
-print(f"Within-sector pairs:  n={len(within):3d}  avg MI = {np.mean(within):.3f} bits")
-print(f"Cross-sector pairs:   n={len(across):3d}  avg MI = {np.mean(across):.3f} bits")
-print(f"Ratio: {np.mean(within)/np.mean(across):.2f}×")
+to_jobC = sorted(book, key=lambda r: r["tail"], reverse=True)[:6]   # heaviest joint tails
+to_jobA = book[:6]                                                  # strongest & cleanest
+
+print("THE MEASURE BOOK  —  14-stock basket, 91 pairs, four lenses\n")
+print(f"strongest pairs (rank by dCor)  →  hand to Job A for estimator calibration")
+print(f"{'pair':<11s}{'Pears':>7s}{'Spear':>7s}{'dCor':>7s}{'infoR':>7s}  sector")
+print("-" * 48)
+for r in to_jobA:
+    print(f"{r['pair']:<11s}{r['pearson']:>+7.3f}{r['spearman']:>+7.3f}"
+          f"{r['distance']:>7.3f}{r['info_r']:>7.3f}  "
+          f"{'same' if r['same_sector'] else 'cross'}")
+
+print(f"\nheaviest joint tails (rank by P−S)  →  hand to Job C for the co-crash test")
+print(f"{'pair':<11s}{'Pearson':>9s}{'Spearman':>10s}{'P−S':>8s}  sector")
+print("-" * 46)
+for r in to_jobC:
+    print(f"{r['pair']:<11s}{r['pearson']:>+9.3f}{r['spearman']:>+10.3f}"
+          f"{r['tail']:>+8.3f}  {'same' if r['same_sector'] else 'cross'}")
 ```
 
----
+**How to read the book.**  Each row is one pair seen through four lenses, and the
+discipline is to read them *together*, not pick one.
 
-## 4 · Written Interpretation (Fill In)
+Rank by distance correlation to find the genuinely strongest links.  Here the
+pairs *within* a sector (banks, energy) top the list, with all four lenses high
+and in agreement.  That agreement is exactly why they are the clean pairs to hand
+to **Job A**: if our measuring tools are off, a pair whose true dependence is
+beyond doubt is where that error shows up first and is easiest to catch.
 
-Use the table and heatmap above to answer:
+Then read the `P−S` column *down the whole book*, not just the top.  A positive
+gap means a handful of extreme days, where both stocks lurched together, are
+pulling up the magnitude-sensitive Pearson while the rank-based Spearman barely
+notices them — a clean fingerprint of a **heavy joint tail** (two assets that
+crash together).  The surprise is that the largest gaps sit on weaker pairs from
+*different* sectors (utilities and energy against the rest) — pairs that look like
+good diversification in calm times yet get dragged down together in 2008 and 2020.
+Those are the diversification illusions, and they route straight to **Job C**,
+whose co-crash measure conditions on the bad days to test the tail rigorously —
+something none of the everyday-average lenses in this book can do.
 
-**Top-3 most dependent pairs:**
+```{python}
+#| label: fig-routing
+#| fig-cap: "The finished measure book as a routing chart. Each bar is a pair's Pearson − Spearman gap — the heavy-joint-tail score — for the twelve heaviest tails. Cross-sector pairs (red) dominate the top: the diversification illusions that couple only in the tail, routed to Job C. The strongly-coupled within-sector pairs (blue) carry a smaller gap and, with their clean four-lens agreement, route to Job A for calibration. One book, two queues."
+flagged = sorted(book, key=lambda r: r["tail"], reverse=True)[:12]
+top = flagged[::-1]
+fig, ax = plt.subplots(figsize=(7.8, 4.2))
+colors = [COOL if r["same_sector"] else CRASH for r in top]
+ax.barh([r["pair"] for r in top], [r["tail"] for r in top], color=colors)
+ax.set_xlabel("Pearson − Spearman  (heavy-joint-tail score)")
+ax.set_title("The measure book → routing queue", fontsize=12)
+annotate_box(ax, 0.62, 0.20, "cross-sector → Job C\n(illusory diversification)",
+             va="bottom", fontsize=9)
+despine(ax); fig.tight_layout(); plt.show()
+```
 
-1. `____` / `____` — MI = `____` bits, excess = `____` bits.
-   *Interpretation:* (e.g. "same sector, strong factor loading, but the excess
-   MI signals tail co-crash beyond what Pearson implies")
-
-2. (fill in)
-
-3. (fill in)
-
-**Most surprising pair (large excess MI):**
-
-`____` / `____` — Pearson = `____`, Linfoot R = `____`.
-*Why the gap?* (e.g. "cross-sector pair with occasional co-crash driven by
-macro shocks")
-
-**Pairs safe to treat with Pearson:**
-
-(List pairs where $|P - S| < 0.03$ and excess MI $< 0.05$ bits — the ones
-where the cheap tool is fine.)
-
-::: {.callout-note}
-## Deliverable Format
-A real measure book would export this table as a PDF or spreadsheet with
-interpretive notes for each flagged pair.  The key discipline: *always cite
-your estimator and its limitations* (here: histogram MI, 25 bins, underestimates
-in the tails).
-:::
+That is the measure book: one ranked, multi-lens table that turns "what is the
+dependence structure of our book?" into two concrete work queues — the clean,
+strongly-coupled pairs to [Job A](lab-jobA-validate.qmd) for estimator
+calibration, and the heavy-tailed cross-sector pairs to [Job C](lab-jobC-hidden-risk.qmd)
+for the conditional co-crash test that measures the tail in capital terms.

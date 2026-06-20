@@ -138,6 +138,12 @@ website:
             href: topics/uncertainty/04-regression-recipe.qmd
           - text: "Predictive Bands"
             href: topics/uncertainty/05-predictive-bands.qmd
+          - text: "Probabilistic NN Recipe"
+            href: topics/uncertainty/06-probabilistic-nn-recipe.qmd
+          - text: "Fair Learning with CKA"
+            href: topics/uncertainty/07-fair-learning-with-cka.qmd
+          - text: "Input Uncertainty"
+            href: topics/uncertainty/08-input-uncertainty-propagation.qmd
           - section: "Labs"
             contents:
               - text: "Overview"

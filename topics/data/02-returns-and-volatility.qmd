@@ -12,6 +12,10 @@ from lectures.plotting import INK, COOL, WARM, CRASH, BAND, despine
 plotting.set_style("notes")
 import numpy as np, matplotlib.pyplot as plt
 from scipy.stats import norm, kurtosis
+import einx                      # linear algebra with the axes spelled out
+from jaxtyping import Float      # shape annotations: Float[Array, "n_days"]
+
+Array = np.ndarray
 R = datasets.load_returns()
 ```
 
@@ -32,9 +36,9 @@ deviation is in its top fifth).
 ```{python}
 #| label: fig-return-series
 #| fig-cap: "JPM daily log-returns over nineteen years. Most days sit in a thin zero-centred band; volatility arrives in clusters (shaded), not evenly. The dense cluster in 2008–09 (the financial crisis) and the spike in 2020 (COVID) are the turbulent episodes the later pages name."
-r = R["JPM"]
-roll = r.rolling(21).std()
-hi = roll > roll.quantile(0.80)            # high-volatility days
+r = R["JPM"]                               # daily log-returns, one number per day
+σ_roll = r.rolling(21).std()               # σ(t): 21-day realised daily vol  (≈ 1 trading month)
+hi = σ_roll > σ_roll.quantile(0.80)        # high-volatility days: σ(t) in its top fifth
 fig, ax = plt.subplots(figsize=(9, 4.2))
 ax.plot(r.index, r, color=COOL, lw=0.6)
 ax.fill_between(r.index, r.min(), r.max(), where=hi.fillna(False),
@@ -53,29 +57,67 @@ despine(ax); fig.tight_layout(); plt.show()
 typically swing in a year?"
 :::
 
-## 2 · Who Wobbles Most?
+## 2 · From Returns to a Volatility Number
 
-Annualised volatility ranks the basket exactly as intuition predicts: banks swing
-hardest — the financial crisis is baked into their numbers — with tech and energy
-next; defensive utilities and staples are the calmest.
+Volatility is not handed to us — we *build* it from the returns, in two small
+steps.  First the **rolling realised vol**: slide a 21-day window (about one
+trading month) along the return series and take the standard deviation inside
+each window.  That gives a *daily* volatility series — its own object, one number
+per day, that rises and falls as the market calms and panics.  Then we
+**annualise** it: a daily std scales to a yearly one by $\times\sqrt{252}$ (the
+trading days in a year), so the numbers read as "swing per year".
+
+```{python}
+r = R["JPM"]                               # daily log-returns
+σ_daily = r.rolling(21).std()              # step 1: σ_daily(t) = 21-day realised daily vol
+σ_annual = σ_daily * np.sqrt(252)          # step 2: σ_ann = σ_daily·√252   (252 trading days/yr)
+print("JPM 21-day rolling vol — daily (raw) then annualised:")
+print(σ_annual.dropna().head().round(3).to_string())
+print(f"\ncalmest month: {σ_annual.min():.0%} · wildest month: {σ_annual.max():.0%}")
+```
+
+The single annualised *bar* below is just this series **averaged over the whole
+sample**.  Watching the intermediate series makes that obvious — and shows how
+much it moves: JPM's quietest month sits near 10% annualised, its wildest (autumn
+2008) blows past 150%.  A single bar hides all of that.
+
+```{python}
+#| label: fig-rolling-vol
+#| fig-cap: "JPM's 21-day rolling volatility, annualised — the intermediate object behind the bar. It is calm (10–20%) for years at a stretch, then erupts: the financial crisis pushes realised vol past 150% in late 2008, and COVID spikes it again in 2020. The dashed line marks the whole-sample average, the single number the bar chart reports — clearly a poor summary of a series this lumpy."
+fig, ax = plt.subplots(figsize=(9, 3.6))
+ax.plot(σ_annual.index, σ_annual, color=COOL, lw=0.8)
+ax.axhline(σ_annual.mean(), color=CRASH, lw=1.2, ls="--",
+           label=f"whole-sample average ({σ_annual.mean():.0%})")
+ax.set_ylabel("annualised rolling vol"); ax.set_xlabel("date")
+ax.set_title("Volatility is a moving series, not a single number", fontsize=12)
+ax.legend(fontsize=9, frameon=False, loc="upper right")
+despine(ax); fig.tight_layout(); plt.show()
+```
+
+## 3 · Who Wobbles Most?
+
+Collapse each name's rolling series to its average and you can rank the basket —
+exactly as intuition predicts: banks swing hardest (the financial crisis is baked
+into their numbers), with tech and energy next; defensive utilities and staples
+are the calmest.
 
 ```{python}
 #| label: fig-vol-bars
 #| fig-cap: "Annualised volatility by name. Banks (red) swing 35–50% a year — the 2008 crisis lives in those numbers; tech and energy (blue) sit near 27–31%; defensive staples and utilities (green) are the calmest at ~18–20%. The same ordering returns when we measure market beta."
 meta = datasets.load_basket_meta().set_index("ticker")
-vol = (R.std() * np.sqrt(252)).sort_values()
+σ_ann_by_name = (R.std() * np.sqrt(252)).sort_values()    # σ_ann = σ_daily·√252  per name
 colors = [CRASH if meta.loc[t, "sector"] == "Banks"
           else plotting.PALETTE["green"]
           if meta.loc[t, "sector"] in ("Utilities", "Staples")
-          else COOL for t in vol.index]
+          else COOL for t in σ_ann_by_name.index]
 fig, ax = plt.subplots(figsize=(8.5, 4.0))
-ax.barh(vol.index, vol.values, color=colors)
+ax.barh(σ_ann_by_name.index, σ_ann_by_name.values, color=colors)
 ax.set_xlabel("annualised volatility"); ax.set_title(
     "Banks swing hardest; staples stay calm", fontsize=12)
 despine(ax); fig.tight_layout(); plt.show()
 ```
 
-## 3 · The Tails Are Too Fat for a Bell Curve
+## 4 · The Tails Are Too Fat for a Bell Curve
 
 If returns were Gaussian, days far from the average would essentially never
 happen.  They happen all the time.  A **fat-tailed** distribution does two things
@@ -86,23 +128,24 @@ panels below show each in turn.
 ```{python}
 #| label: fig-fat-tails
 #| fig-cap: "Left: JPM's return histogram (zoomed to the centre) against a fitted bell curve — the real peak is twice as tall, because calm days pile up more than a bell allows. Right: a quantile–quantile plot. If returns were Gaussian the dots would lie on the dashed line; instead they peel away at both ends — down past −9 std for the crash days, up past +9 std for the rallies. That peeling-away is the fat tail."
-r = R["JPM"].to_numpy()
-mu, sd = r.mean(), r.std()
-n = len(r); z = (r - mu) / sd
+r: Float[Array, "n_days"] = R["JPM"].to_numpy()
+μ, σ = r.mean(), r.std()                    # fit r ~ 𝒩(μ, σ²) by moments
+n_days = len(r)
+z: Float[Array, "n_days"] = (r - μ) / σ     # z-score = (r − μ) / σ   (standardise to std devs)
 
 fig, (axL, axR) = plt.subplots(1, 2, figsize=(10, 4.0))
 
 # Left — the peak, on a plain linear axis, zoomed to the centre
-grid = np.linspace(-0.06, 0.06, 400)
+grid: Float[Array, "n_grid"] = np.linspace(-0.06, 0.06, 400)
 axL.hist(r, bins=200, density=True, color=BAND, alpha=0.85, label="JPM returns")
-axL.plot(grid, norm.pdf(grid, mu, sd), color=INK, lw=2, label="fitted bell curve")
+axL.plot(grid, norm.pdf(grid, μ, σ), color=INK, lw=2, label="fitted bell curve")  # 𝒩(μ, σ²) pdf
 axL.set_xlim(-0.06, 0.06)
 axL.set_xlabel("daily return"); axL.set_ylabel("density")
 axL.set_title("The peak is taller than the bell", fontsize=11)
 axL.legend(fontsize=9, frameon=False); despine(axL)
 
 # Right — the tails, as a quantile–quantile plot
-theo = norm.ppf((np.arange(1, n + 1) - 0.5) / n)
+theo: Float[Array, "n_days"] = norm.ppf((np.arange(1, n_days + 1) - 0.5) / n_days)  # Φ⁻¹ at plotting positions
 axR.scatter(theo, np.sort(z), s=5, c=COOL, alpha=0.5, edgecolors="none")
 axR.plot([-4, 4], [-4, 4], color=INK, lw=1.2, ls="--",
          label="what a bell curve would give")
@@ -123,9 +166,10 @@ in nineteen years.  **Excess kurtosis** is the one number that summarises this g
 (0 for a bell curve, **16.8** for JPM), and the heaviness varies a lot by name:
 
 ```{python}
-k = R.apply(kurtosis).sort_values(ascending=False)
+# excess kurtosis κ = E[(r−μ)⁴]/σ⁴ − 3   (0 for a Gaussian; large ⇒ fat tails)
+κ_by_name = R.apply(kurtosis).sort_values(ascending=False)
 print("excess kurtosis (0 = Gaussian):")
-print(k.round(1).to_string())
+print(κ_by_name.round(1).to_string())
 ```
 
 Notice this is **not** the volatility ranking.  Citigroup (≈38) and Bank of
@@ -143,6 +187,49 @@ A Gaussian model of returns *understates* extreme losses — exactly the failure
 [uncertainty](../uncertainty/index.qmd) chapter exploits when Gaussian Monte-Carlo
 produces tails that are too thin, and that
 [gaussianization](../gaussianization/index.qmd) fixes by learning the true shape.
+:::
+
+---
+
+## What the Labs Reload From Here
+
+The uncertainty labs don't predict the *return* — its mean is essentially
+unpredictable.  They predict the **noise**: tomorrow's volatility, which clusters
+and so *is* forecastable.  The target they learn against is the **realised
+annualised volatility** series we built in §2 — and this chapter is its single
+home.  One recipe builds it; the labs reload that and go straight to modelling.
+
+```{python}
+#| label: fig-target-realised-vol
+#| fig-cap: "The handoff target: JPM's realised annualised volatility, built by `R['JPM'].rolling(21).std() * √252`. The first 20 days are NaN (the window has not filled yet) and are dropped. Shaded spans mark the high-volatility regimes — its top fifth — which are exactly where a constant error bar fails and the labs must do better."
+R = datasets.load_returns()                       # prepared 14-name daily panel
+σ = R["JPM"].rolling(21).std() * np.sqrt(252)     # σ(t) = σ_daily·√252   realised annualised vol
+σ = σ.dropna()                                    # drop the 20-day warm-up NaNs
+
+print("realised-vol target  ·  shape:", σ.shape)
+print(σ.head().round(3).to_string())
+
+hi = σ > σ.quantile(0.80)                          # high-volatility regime: σ(t) in its top fifth
+fig, ax = plt.subplots(figsize=(9, 3.4))
+ax.plot(σ.index, σ, color=INK, lw=0.8, label="realised vol σ(t)")
+ax.fill_between(σ.index, 0, σ.max(), where=hi.to_numpy(),
+                color=CRASH, alpha=0.12, label="high-volatility regime")
+ax.set_ylabel("annualised σ"); ax.set_xlabel("date")
+ax.set_title("The realised-volatility target the labs reload", fontsize=12)
+ax.legend(fontsize=9, frameon=False, loc="upper right")
+despine(ax); fig.tight_layout(); plt.show()
+```
+
+::: {.callout-note icon=false}
+## The Lab Contract
+This chapter **owns** the realised-volatility target.  The uncertainty labs —
+[Tool 3 · Predictive Bands](../uncertainty/labs/lab-tool3-bands.qmd) and
+[Job C · Predict From Noise](../uncertainty/labs/lab-jobC-predict-from-noise.qmd) —
+**reload** this series with the one-liner above and predict it; they do **not**
+re-derive volatility from scratch.  The only step left to the lab is the
+modelling choice on top of the target: picking the **window length** (21 days
+here, or an EWMA half-life), or forming the **regression pairs** $(x,\,\sigma(x))$
+that the band model trains on.  The preprocessing stops here.
 :::
 
 ---

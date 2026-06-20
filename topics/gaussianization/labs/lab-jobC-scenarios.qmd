@@ -9,80 +9,390 @@ import sys, pathlib
 sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
 from lectures import plotting, datasets
 from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
-from rbig import AnnealedRBIG
 from lectures.measures import cocrash_fraction
 plotting.set_style("notes")
 import numpy as np, matplotlib.pyplot as plt
+import einx                      # linear algebra with the axes spelled out
+from jaxtyping import Float      # shape annotations: Float[Array, "n_days"]
+
+Array = np.ndarray
 ```
 
-*Do-the-job track · Job C of 3.*
+*Apply-the-tool track · Job C.*
 
-Fit RBIG to real returns and run it **backward** to generate scenarios.  The
-deliverable is a synthetic scenario set whose **joint tail** matches the real
-data — the input every risk calculation needs.  (This is the bridge to
-[Uncertainty](../../uncertainty/index.qmd).)
+A risk model is only as good as the scenarios you feed it, and the dangerous
+scenarios are the **joint** ones — the days when many holdings crash at the same
+time.  This lab runs Gaussianization in **reverse** as a scenario generator: fit
+RBIG forward so the data becomes a standard Gaussian (a tidy bell-shaped cloud),
+then draw fresh Gaussian points and push them back through the *inverse* map to
+get new return-like draws.  The single fit-then-sample recipe is fixed on Rung 1
+and reused unchanged as the data grows up under it — from a 2-D pair whose answer
+we know, to a real basket of stocks.
+
+**What you will produce:** a stress set — a batch of made-up joint scenarios whose
+co-crash structure (how often names crash together) matches the real book — ready
+to hand to the uncertainty module's risk calculations.
 
 ---
 
-## 1 · Fit on a Real Sub-Basket
+## 🧪 Rung 1 · Toy — Known Answer
+
+Start where the truth is not in doubt.  `datasets.correlated_returns(rho=0.7)`
+draws a **known** 2-D Gaussian pair: the two assets move together with correlation
+$\rho = 0.7$, and each asset on its own (its *marginal*, the single-asset
+distribution) has variance one.  Both numbers are baked into the generator, so we
+know them exactly.  A scenario generator that is working must reproduce *both* —
+get the same correlation back and the same single-asset shapes — and here we can
+check each by hand.
 
 ```{python}
-R = datasets.load_returns()
-assets = ["JPM", "BAC", "XOM"]
-X = R[assets].to_numpy()
-X = (X - X.mean(0)) / X.std(0)
-print(f"fitting RBIG on {assets}, {len(X)} days")
+def correlation(z: Float[Array, "n 2"]) -> float:
+    """Pearson correlation of two standardized columns.
 
-rbig = AnnealedRBIG(n_layers=30, random_state=0).fit(X)
-gen = rbig.sample(4000)
+    ρ = (1/n) Σₜ zₜ₀·zₜ₁  / (σ₀·σ₁)     [dimensionless]
+    For z-scored columns σ ≈ 1, so this is just the normalized gram entry.
+    """
+    n: int = z.shape[0]
+    zc: Float[Array, "n 2"] = z - z.mean(0)                  # mean-center each column
+    gram: Float[Array, "2 2"] = einx.dot("n i, n j -> i j", zc, zc) / n   # Σₜ zₜᵢ·zₜⱼ / n
+    return float(gram[0, 1] / np.sqrt(gram[0, 0] * gram[1, 1]))           # off-diagonal / √(σ₀²·σ₁²)
+
+
+x_toy, y_toy = datasets.correlated_returns(n=3000, rho=0.7, seed=0)
+
+X_toy: Float[Array, "n 2"] = np.column_stack([x_toy, y_toy])
+X_toy = (X_toy - X_toy.mean(0)) / X_toy.std(0)        # standardize → z-scores
+
+rho_true: float = correlation(X_toy)                  # ρ read straight off the generator
+print(f"X_toy: {X_toy.shape}    known correlation ρ ≈ {rho_true:.3f}")
 ```
 
-## 2 · Do the Scenarios Match the Real Tail?
+**The algorithm — fit forward, sample backward.**  Gaussianization learns an
+invertible map $T$ with $T(\text{data}) \approx \mathcal{N}(0, I)$.  Generating
+new data is then just the inverse map applied to fresh Gaussian noise:
+
+```
+fit       T : data → z ~ N(0, I)        # RBIG, forward
+sample    z ~ N(0, I)                   # draw in the easy space
+generate  x = T⁻¹(z) ~ data             # inverse map → new data-like draws
+```
+
+`AnnealedRBIG.fit` learns $T$; `.sample(n)` does the draw-then-invert in one
+call.  This is the *entire* generator — defined once here, reused on every rung:
 
 ```{python}
-print(f"{'pair':<10}{'real co-crash':>14}{'generated':>11}")
-print("-" * 35)
-pairs = [(0, 1), (0, 2), (1, 2)]
-for i, j in pairs:
-    cr = cocrash_fraction(X[:, i], X[:, j])
-    cg = cocrash_fraction(gen[:, i], gen[:, j])
-    print(f"{assets[i]}/{assets[j]:<6}{cr:>14.0%}{cg:>11.0%}")
+from rbig import AnnealedRBIG
+
+
+def fit_generate(data: Float[Array, "n d"], n_gen: int, seed: int = 0) -> Float[Array, "n_gen d"]:
+    """Fit RBIG forward (data → Gaussian), then sample its INVERSE map.
+
+    T : data → z ~ N(0, I)      learned by .fit         (forward Gaussianization)
+    x = T⁻¹(z),  z ~ N(0, I)    produced by .sample(n)  (backward → new draws)
+    """
+    model = AnnealedRBIG(n_layers=30, rotation="pca", random_state=seed).fit(data)
+    return model.sample(n_gen)                          # (n_gen, d) fresh scenarios
+
+
+gen_toy: Float[Array, "n_gen 2"] = fit_generate(X_toy, n_gen=3000, seed=0)
+print(f"generated {gen_toy.shape[0]} scenarios with the same fit-then-sample recipe")
+```
+
+Now read the generated draws against what we *know* is there — the correlation
+and the marginals:
+
+```{python}
+rho_gen: float = correlation(gen_toy)                 # ρ of the inverse-map draws
+print(f"correlation   true {rho_true:+.3f}   generated {rho_gen:+.3f}")
+print(f"marginal std  true {X_toy.std(0).round(2)}   generated {gen_toy.std(0).round(2)}")
+print(f"marginal mean true {X_toy.mean(0).round(2)}   generated {gen_toy.mean(0).round(2)}")
 ```
 
 ```{python}
-#| label: fig-jobC-scenarios
-#| fig-cap: "Real returns (left) and RBIG-generated scenarios (right) for the JPM/BAC pair — same bulk and same lower-tail co-crash."
-fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.4), sharex=True, sharey=True)
-for ax, data, col, title in [
-    (axL, X, COOL, f"real · co-crash {cocrash_fraction(X[:,0], X[:,1]):.0%}"),
-    (axR, gen, WARM, f"generated · co-crash {cocrash_fraction(gen[:,0], gen[:,1]):.0%}"),
-]:
-    ax.scatter(data[:, 0], data[:, 1], s=7, c=col, alpha=0.3, edgecolors="none")
-    ax.axvspan(-8, np.quantile(data[:, 0], 0.1), color=CRASH, alpha=0.06)
-    ax.axhspan(-8, np.quantile(data[:, 1], 0.1), color=CRASH, alpha=0.06)
-    ax.set_title(title, fontsize=11)
-    ax.set_xlim(-6, 5); ax.set_ylim(-6, 5)
-    ax.set_xlabel("JPM (z)"); ax.set_ylabel("BAC (z)")
+#| label: fig-toy-roundtrip
+#| fig-cap: "The known-answer round-trip. Left: the real ρ=0.7 cloud. Middle: RBIG-generated scenarios from the inverse map — same tilt, same spread. Right: the two marginal histograms of asset 1 overlaid; the generated marginal (orange) lands on the real one (blue). The generator reproduces both the correlation and the marginal shapes it was never told directly."
+fig, (ax0, ax1, ax2) = plt.subplots(1, 3, figsize=(13, 4.2))
+for ax, data, col, ttl in [(ax0, X_toy, COOL, f"real · ρ = {rho_true:.2f}"),
+                           (ax1, gen_toy, WARM, f"generated · ρ = {rho_gen:.2f}")]:
+    ax.scatter(data[:, 0], data[:, 1], s=8, c=col, alpha=0.3, edgecolors="none")
+    ax.set_xlim(-4, 4)
+    ax.set_ylim(-4, 4)
+    ax.set_xlabel("asset 1 (z)")
+    ax.set_ylabel("asset 2 (z)")
+    ax.set_title(ttl, fontsize=11)
     despine(ax)
+
+bins = np.linspace(-4, 4, 40)
+ax2.hist(X_toy[:, 0], bins=bins, density=True, color=COOL, alpha=0.55, label="real")
+ax2.hist(gen_toy[:, 0], bins=bins, density=True, color=WARM, alpha=0.55, label="generated")
+ax2.set_title("asset 1 marginal", fontsize=11)
+ax2.legend(fontsize=9, frameon=False)
+despine(ax2)
+
 fig.tight_layout()
 plt.show()
 ```
 
-::: {.callout-tip}
-## The Deliverable
-A scenario matrix you can feed to any portfolio function.  Unlike independent
-resampling (which destroys the co-crash) or a Gaussian Monte-Carlo (which thins
-the tail), these scenarios carry the *real* joint extremes — see
-[Uncertainty · noise and propagation](../../uncertainty/03-noise-and-propagation.qmd).
-:::
+The known answer holds: the inverse map hands back the same $\rho \approx 0.7$ and
+the same Gaussian marginals.  The recipe is correct — now we let the data get
+harder.
 
 ---
 
-## Your Turn
+## 🎭 Rung 2 · Toy-Real — A Stylized Market
 
-- Generate 10 000 scenarios and estimate a 1% portfolio VaR for an equal-weight
-  JPM/BAC/XOM book; compare to a Gaussian Monte-Carlo VaR on the same covariance.
-- Add a fourth asset from another sector — does RBIG still match every pairwise
-  co-crash?
+A clean Gaussian pair never happens in markets.  What *does* is a **co-crash**:
+two names that drift together on calm days and plunge together on the bad ones,
+with heavy tails (big losses happen more often than a Gaussian would predict) that
+a Gaussian sampler would shave off.  `datasets.tail_dependent_pair()` is a
+simplified stand-in for that — a shared shock built from a fat-tailed Student-*t*
+distribution, so both assets get fat tails and tend to hit their worst days
+together.  We run the **exact same** `fit_generate` and ask the question that
+matters: does the inverse map reproduce the lower-left corner where both assets
+crash at once — the structure a plain Gaussian simulation (a Monte-Carlo, meaning
+draws from random noise) would miss?
 
-Back to the chapter: [Gaussianization overview](../index.qmd).
+```{python}
+a, b = datasets.tail_dependent_pair(n=2000, df=3, seed=0)
+
+X_pair: Float[Array, "n 2"] = np.column_stack([a, b])         # already standardized
+cc_real: float = cocrash_fraction(X_pair[:, 0], X_pair[:, 1])  # P(both in worst 10%)
+print(f"stylized co-crashing pair: {X_pair.shape}   real co-crash = {cc_real:.0%}")
+
+gen_pair: Float[Array, "n_gen 2"] = fit_generate(X_pair, n_gen=2000, seed=0)   # same recipe
+cc_gen: float = cocrash_fraction(gen_pair[:, 0], gen_pair[:, 1])
+```
+
+A Gaussian fit to the same correlation is the benchmark to beat — it keeps the
+tilt but thins the tail, so its co-crash falls short of the real one:
+
+```{python}
+rho_pair: float = correlation(X_pair)                 # ρ of the fat-tailed pair
+rng = np.random.default_rng(0)
+
+g_pair: Float[Array, "n 2"] = rng.multivariate_normal(   # Gaussian MC, same ρ
+    [0, 0], [[1, rho_pair], [rho_pair, 1]], size=2000)
+cc_gauss: float = cocrash_fraction(g_pair[:, 0], g_pair[:, 1])
+
+print(f"{'source':<22}{'co-crash':>10}")
+print("-" * 32)
+print(f"{'real pair':<22}{cc_real:>10.0%}")
+print(f"{'RBIG scenarios':<22}{cc_gen:>10.0%}   ← inverse map keeps the joint tail")
+print(f"{'Gaussian MC (same ρ)':<22}{cc_gauss:>10.0%}   ← thins it")
+```
+
+```{python}
+#| label: fig-pair-cocrash
+#| fig-cap: "Regenerating the co-crash. Left: the real fat-tailed pair, lower-left co-crash quadrant shaded. Middle: RBIG-generated scenarios — the inverse map repacks the same lower-left corner, so its co-crash matches the real one. Right: a Gaussian Monte-Carlo with the identical correlation keeps the tilt but empties the corner, understating the joint tail. The fat-tail structure survives the backward map; it does not survive the Gaussian."
+fig, axes = plt.subplots(1, 3, figsize=(13.5, 4.6), sharex=True, sharey=True)
+panels = [(X_pair, COOL, f"real · co-crash {cc_real:.0%}"),
+          (gen_pair, WARM, f"RBIG scenarios · co-crash {cc_gen:.0%}"),
+          (g_pair, "0.5", f"Gaussian MC · co-crash {cc_gauss:.0%}")]
+for ax, (data, col, ttl) in zip(axes, panels):
+    qx, qy = np.quantile(data[:, 0], 0.10), np.quantile(data[:, 1], 0.10)  # 10% crash lines
+    box: Float[Array, "n"] = (data[:, 0] <= qx) & (data[:, 1] <= qy)       # co-crash quadrant
+    ax.axvspan(-8, qx, color=CRASH, alpha=0.06)
+    ax.axhspan(-8, qy, color=CRASH, alpha=0.06)
+    ax.scatter(data[~box, 0], data[~box, 1], s=6, c=col, alpha=0.25, edgecolors="none")
+    ax.scatter(data[box, 0], data[box, 1], s=14, c=CRASH, alpha=0.7, edgecolors="none")
+    ax.set_xlim(-6, 5)
+    ax.set_ylim(-6, 5)
+    ax.set_xlabel("asset A (z)")
+    ax.set_ylabel("asset B (z)")
+    ax.set_title(ttl, fontsize=11)
+    despine(ax)
+
+fig.tight_layout()
+plt.show()
+```
+
+Two readings.  First, the RBIG scenarios land on the real co-crash while the
+Gaussian undershoots it — the inverse map carried the fat joint tail across, which
+is the whole point of generating *through* a learned density rather than a
+covariance.  Second, no new code did this: the same `fit_generate` from Rung 1,
+the same `cocrash_fraction`.  Only the data got market-shaped.  Now the real book.
+
+---
+
+## 📈 Rung 3 · Real — The Full Basket
+
+Now the real panel.  We **reload** the prepared returns — there is no cleaning
+here.  The full pipeline (turning prices into daily log-returns) and the co-crash
+structure these names ride on are worked out in
+[Co-Movement & Co-Crashes](../../data/04-co-movement-and-co-crashes.qmd); this lab
+just picks up that finished panel.  We take a real sub-basket that spans two
+sectors — two banks and a big energy company, so there is a genuine cross-sector
+crash pattern to reproduce — and run the *same* `fit_generate`.
+
+**What we are looking for:** for each pair of names, the *co-crash fraction* — how
+often both names land in their worst 10% of days at the same time.  We want the
+generated scenarios to show the same co-crash fractions as the real returns, which
+would mean the inverse map carried over the days when these names crash together.
+
+```{python}
+R = datasets.load_returns()                       # prepared 14-name daily panel
+assets = ["JPM", "BAC", "XOM"]                    # two banks + one energy → cross-sector tail
+
+X_real: Float[Array, "n_days 3"] = R[assets].to_numpy()
+X_real = (X_real - X_real.mean(0)) / X_real.std(0)   # z = (r − μ)/σ   standardize each column
+
+print(f"{len(X_real)} trading days × {len(assets)} names "
+      f"({R.index.min().date()} → {R.index.max().date()})   assets = {assets}")
+R[assets].head(3).round(4)
+```
+
+::: {.callout-note icon=false}
+## Where This Data Comes From
+The panel, its sectors, and the co-crash structure these scenarios must reproduce
+are laid bare in the data primer —
+[Co-Movement & Co-Crashes](../../data/04-co-movement-and-co-crashes.qmd).  This
+lab reloads that panel and never re-derives it.
+:::
+
+Fitting RBIG takes a little time, so we keep the count modest — a few thousand
+generated scenarios is plenty for the tail statistics below.  Same recipe, real
+data:
+
+```{python}
+gen_real: Float[Array, "n_gen 3"] = fit_generate(X_real, n_gen=4000, seed=0)
+print(f"generated {gen_real.shape[0]} three-asset scenarios from the real fit\n")
+
+print(f"{'pair':<12}{'real co-crash':>14}{'generated':>12}")
+print("-" * 38)
+for i, j in [(0, 1), (0, 2), (1, 2)]:
+    cr = cocrash_fraction(X_real[:, i], X_real[:, j])
+    cg = cocrash_fraction(gen_real[:, i], gen_real[:, j])
+    print(f"{assets[i] + '/' + assets[j]:<12}{cr:>14.0%}{cg:>12.0%}")
+```
+
+```{python}
+#| label: fig-real-scenarios
+#| fig-cap: "Real returns (left) and RBIG-generated scenarios (right) for the JPM/BAC pair from the three-asset fit. The bulk cloud and the shaded lower-left co-crash quadrant match — the within-bank joint crash the basket is famous for survives the backward map. The generator was fit on all three names jointly, so the cross-sector XOM tail is preserved too (see the table above)."
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.6), sharex=True, sharey=True)
+for ax, data, col, ttl in [
+    (axL, X_real, COOL, f"real · co-crash {cocrash_fraction(X_real[:, 0], X_real[:, 1]):.0%}"),
+    (axR, gen_real, WARM, f"generated · co-crash {cocrash_fraction(gen_real[:, 0], gen_real[:, 1]):.0%}"),
+]:
+    qx, qy = np.quantile(data[:, 0], 0.10), np.quantile(data[:, 1], 0.10)   # 10% crash lines
+    ax.axvspan(-8, qx, color=CRASH, alpha=0.06)
+    ax.axhspan(-8, qy, color=CRASH, alpha=0.06)
+    ax.scatter(data[:, 0], data[:, 1], s=7, c=col, alpha=0.3, edgecolors="none")
+    ax.set_xlim(-6, 5)
+    ax.set_ylim(-6, 5)
+    ax.set_xlabel("JPM (z)")
+    ax.set_ylabel("BAC (z)")
+    ax.set_title(ttl, fontsize=11)
+    despine(ax)
+
+fig.tight_layout()
+plt.show()
+```
+
+The real basket behaves like the simplified pair, only messier: every pairwise
+co-crash in the generated set tracks the real one, including the cross-sector
+JPM/XOM tail — a bank and an energy name crashing together — that a simple
+correlation model would smooth away.  The generator preserves the dangerous
+structure on data it was never told the structure of.
+
+---
+
+## 💰 Rung 4 · Application — The Stress Set
+
+The deliverable is a **stress set**: a batch of generated joint scenarios shipped
+with the tail statistics that justify trusting it.  A stress set is only useful if
+it carries the *dangerous* structure, so we score it on exactly that and compare it
+to the real book using two numbers.  The first is the **average pairwise co-crash
+fraction** — averaged over every pair of names, how often the two crash together.
+The second is the **worst-case joint loss** — imagine an equal-weight portfolio
+(the same amount in each name) and look at its single worst day; this is how deep
+that worst day goes.  If the generator preserved the joint tail, both numbers
+should match the real data, and both should be larger than what a plain Gaussian
+simulation produces.
+
+```{python}
+def worst_joint_loss(data: Float[Array, "n d"]) -> float:
+    """Most negative equal-weight portfolio return — the worst single day.
+
+    p_t = (1/d) Σⱼ data[t, j]     equal-weight book           [z-score units]
+    loss = min_t p_t              the worst joint draw (a co-crash day)
+    """
+    port: Float[Array, "n"] = einx.mean("t d -> t", data)     # equal-weight daily return
+    return float(port.min())
+
+
+def mean_cocrash(data: Float[Array, "n d"]) -> float:
+    """Average pairwise co-crash fraction over all asset pairs.
+
+    mean_cocrash = (1 / |pairs|) Σ_(i<j) P(both asset i,j in worst 10%)
+    """
+    d: int = data.shape[1]
+    pairs = [(i, j) for i in range(d) for j in range(i + 1, d)]
+    return float(np.mean([cocrash_fraction(data[:, i], data[:, j]) for i, j in pairs]))
+
+
+# Gaussian Monte-Carlo on the real covariance — the thin-tailed benchmark.
+# Σ = Cov(X_real); draw g ~ N(0, Σ) so the benchmark shares the real correlations.
+cov_real: Float[Array, "3 3"] = np.cov(X_real, rowvar=False)
+g_real: Float[Array, "n_gen 3"] = np.random.default_rng(0).multivariate_normal(
+    np.zeros(3), cov_real, size=4000)
+
+print(f"{'source':<22}{'mean co-crash':>14}{'worst joint loss':>18}")
+print("-" * 54)
+for name, data in [("real book", X_real), ("RBIG stress set", gen_real),
+                   ("Gaussian MC", g_real)]:
+    print(f"{name:<22}{mean_cocrash(data):>14.0%}{worst_joint_loss(data):>18.2f}")
+```
+
+```{python}
+#| label: fig-stress-set-compute
+# Score each source on its danger: mean pairwise co-crash and the equal-weight loss tail.
+sources = [X_real, gen_real, g_real]
+
+# mean_cocrash = (1/|pairs|) Σ_(i<j) P(both in worst 10%)   — one number per source
+ccs: Float[Array, "n_sources"] = np.array([mean_cocrash(s) for s in sources])
+
+# pₜ = (1/d) Σⱼ data[t, j]   equal-weight portfolio return per day, per source   [z-score units]
+ports: list[Float[Array, "n"]] = [einx.mean("t d -> t", s) for s in sources]
+```
+
+```{python}
+#| label: fig-stress-set
+#| fig-cap: "The stress set, scored on its danger. Left: average pairwise co-crash — the RBIG scenarios (orange) sit on the real book (blue) while the Gaussian Monte-Carlo (grey) falls short. Right: the distribution of equal-weight portfolio returns, left tail in focus; the RBIG tail reaches the real worst-case losses (dashed lines), the Gaussian tail stops short. The generator preserves the joint extremes a covariance-based sampler structurally misses."
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(12, 4.6))
+
+# Left: mean pairwise co-crash, three sources.
+names = ["real book", "RBIG\nstress set", "Gaussian\nMC"]
+cols = [COOL, WARM, "0.6"]
+axL.bar(names, [c * 100 for c in ccs], color=cols)
+axL.axhline(10, color=INK, lw=1.1, ls="--", label="independent baseline (10%)")
+axL.set_ylabel("mean pairwise co-crash (%)")
+axL.set_title("RBIG keeps the joint tail; the Gaussian thins it", fontsize=11)
+axL.legend(fontsize=9, frameon=False)
+despine(axL)
+
+# Right: equal-weight portfolio-return distributions, tail in focus.
+bins = np.linspace(-5, 3, 60)
+for port, col, name in zip(ports, cols, ["real", "RBIG", "Gaussian"]):
+    axR.hist(port, bins=bins, density=True, histtype="step", lw=1.8, color=col, label=name)
+    axR.axvline(port.min(), color=col, lw=1.0, ls="--", alpha=0.8)   # worst joint loss
+axR.set_xlim(-5, 3)
+axR.set_xlabel("equal-weight portfolio return (z)")
+axR.set_ylabel("density")
+axR.set_title("Portfolio loss tail — RBIG reaches the real worst case", fontsize=11)
+axR.legend(fontsize=9, frameon=False)
+despine(axR)
+
+fig.tight_layout()
+plt.show()
+```
+
+The stress set passes its own test: its average co-crash and worst-case joint loss
+sit on the real book, while the Gaussian simulation — given the *exact* same
+correlations — understates both, because the joint extremes live in a fat tail that
+correlations alone cannot capture.  These scenarios are the deliverable: a made-up
+batch that carries the real dangerous structure, ready to feed any portfolio risk
+function.
+
+Where this hands off: the uncertainty module takes a stress set like this one and
+turns it into risk figures — how much money the book could lose — see
+[Uncertainty · noise and propagation](../../uncertainty/03-noise-and-propagation.qmd).

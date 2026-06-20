@@ -9,217 +9,370 @@ import sys, pathlib
 sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
 from lectures import plotting, datasets
 from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
-from lectures.measures import mutual_information_bits, linfoot_r, nats_to_bits
+from lectures.measures import cocrash_fraction
 plotting.set_style("notes")
 import numpy as np, matplotlib.pyplot as plt
 from scipy.stats import pearsonr, spearmanr
-import itertools
+import einx                      # linear algebra with the axes spelled out
+from jaxtyping import Float      # shape annotations: Float[Array, "n_days"]
+
+Array = np.ndarray
 ```
 
-*Do-the-job track · deliverable.*
+*Apply-the-tool track · Job C.*
 
-::: {.callout-note appearance="simple" icon=false}
-**See the data first** — [Co-Movement &
-Co-Crashes](../../data/04-co-movement-and-co-crashes.qmd) shows the correlation
-block and the co-crash statistic in the real basket this job reports on.
-:::
+This job hunts the one kind of dependence that Pearson correlation **structurally
+cannot see**: the rate at which two stocks crash *together*.  We climb the same
+ladder — a toy whose answer is beyond dispute, a stylized bank pair where we can
+count the co-crash by hand, then the real basket — but the **method** stays fixed
+throughout: a single co-crash measure, introduced once and reused unchanged as the
+data grows up. ("Co-crash" just means both names have a very bad day at the same
+time.)
 
-The lecture opened with a bad morning: a "diversified" book fell all at once.
-This job finds out *why* and *for which pairs* — by measuring the dependence
-that Pearson correlation structurally cannot see: the tail co-crash rate.
-
-**Deliverable:** a tail-risk report flagging pairs whose tail dependence exceeds
-what their linear correlation implies, with an estimate of how much more often
-they fall together than independence would predict.
+**What you will produce:** a tail-risk report ranking the real pairs that crash
+together far more often than chance would predict — the diversification illusions a
+trading desk would act on.
 
 ---
 
-## Setup
+## 🧪 Rung 1 · Toy — Known Answer
+
+Start where the truth is not in doubt, and recall *why* a single correlation number
+is the wrong tool for tail risk.  `datasets.nonlinear_dependence()` draws
+$y = x^2 + \text{noise}$ on a symmetric range: **$y$ is (almost) fixed once you know
+$x$** — about as much dependence as you can have — yet the relationship is symmetric,
+so *Pearson must read $\approx 0$*.  Pearson lies.  The lesson for this job: a single
+number that averages over *all* values of $X$ can be blind to a dependence that only
+lives in one *region* of the data.  Tail risk is exactly such a region — the worst
+days — so an averaged-over-everything correlation will miss it.
 
 ```{python}
-R = datasets.load_returns()
+x_toy: Float[Array, "n"]
+y_toy: Float[Array, "n"]
+x_toy, y_toy = datasets.nonlinear_dependence(n=1000, noise=0.05, seed=0)   # y = x² + ε
+
+pear = pearsonr(x_toy, y_toy)[0]      # ρ(x,y)   — linear, averaged over all x
+spear = spearmanr(x_toy, y_toy)[0]    # ρ_s(x,y) — monotone, also averaged over all x
+
+print(f"x: {x_toy.shape}    y = x² + noise   (y is ~determined by x)")
+print(f"Pearson  = {pear:+.3f}   (linear — reads almost nothing)")
+print(f"Spearman = {spear:+.3f}   (monotone — also blind to the symmetry)")
+```
+
+```{python}
+#| label: fig-toy-pearson-lies
+#| fig-cap: "Pearson lies. y = x² + noise is an almost-deterministic dependence, yet Pearson ≈ 0 because the up-arm and down-arm cancel in the average. Conditioning on a *region* of x (the left arm, shaded) reveals a strong local relationship the unconditional number erased. Tail risk lives in exactly such a region — the worst days — which is why this job conditions instead of averaging."
+left: Float[Array, "n"] = x_toy < 0                  # condition on a region of x (left arm)
+
+fig, ax = plt.subplots(figsize=(6.6, 5.0))
+ax.scatter(x_toy[~left], y_toy[~left], s=12, c="0.78", alpha=0.5, edgecolors="none",
+           label="right arm (x ≥ 0)")
+ax.scatter(x_toy[left], y_toy[left], s=14, c=WARM, alpha=0.8, edgecolors="none",
+           label="left arm (x < 0) — strongly downward")
+ax.axvline(0, color=INK, lw=0.8, ls="--")
+ax.set_xlabel("x"); ax.set_ylabel("y = x² + noise")
+ax.set_title(f"Pearson over all x = {pear:+.2f}, yet each arm is steep",
+             fontsize=11.5)
+ax.legend(fontsize=9, frameon=False, loc="upper center"); despine(ax)
+fig.tight_layout(); plt.show()
+```
+
+The known answer holds: the dependence is real and strong, but every averaged-over-everything
+correlation reads $\approx 0$ because it cancels a region that bends one way against a
+region that bends the other.  **The fix is to zoom in on a single region**
+instead of averaging over all of $X$ — and the region a portfolio fears is the tail,
+its worst days.  That is the move the next rung turns into the co-crash measure.
+
+---
+
+## 🎭 Rung 2 · Toy-Real — A Stylized Market
+
+$y = x^2$ never happens in markets.  What *does* happen is **joint crashes**: two banks
+that drift together on calm days and plunge together on the bad ones.
+`datasets.two_banks()` is a stylized version of that — a shared driver plus a known
+~10% set of days where both names crater (the `crash_mask`).  Here the answer is
+again known: we built the crash days ourselves, so we can count the co-crash off the
+mask by hand *and* check our estimate against that ground truth.
+
+**The method — zoom in on the tail.**  Replace "average over all $X$" with
+"look only at $X$'s worst days."  The co-crash fraction is a conditional
+probability — the chance of one event *given* that another has already happened:
+
+$$
+\text{co-crash}(X, Y) \;=\; P\bigl(Y \le Q_q(Y) \,\big|\, X \le Q_q(X)\bigr)
+\qquad q = 0.10,
+$$
+
+the chance that $Y$ is in *its* worst 10% of days, given that $X$ is in *its* worst
+10% of days.  A pair that moves **independently** scores $\approx q = 10\%$ — that is
+the baseline you compare against; a pair that crashes together scores far higher.
+Spelled out, with the quadrant masks made visible:
+
+```{python}
+def cocrash_by_hand(x: Float[Array, "n"], y: Float[Array, "n"], q: float = 0.10) -> float:
+    """The co-crash measure, axes spelled out — P(Y in worst-q | X in worst-q).
+
+    qˣ = Q_q(x),  qʸ = Q_q(y)               [crash lines, return units]
+    co-crash = |{ xₜ ≤ qˣ  AND  yₜ ≤ qʸ }| / |{ xₜ ≤ qˣ }|
+    """
+    qˣ, qʸ = np.quantile(x, q), np.quantile(y, q)   # qˣ = Q_q(x), qʸ = Q_q(y)   [return units]
+    x_crash: Float[Array, "n"] = x <= qˣ            # condition: X in its worst q
+    joint:   Float[Array, "n"] = einx.logical_and("n, n -> n", x_crash, y <= qʸ)   # xₜ≤qˣ ∧ yₜ≤qʸ
+    return float(joint.sum() / x_crash.sum())       # P(Y crashes | X crashes)
+
+
+a: Float[Array, "n"]
+b: Float[Array, "n"]
+a, b, crash = datasets.two_banks(n=1500, seed=0)
+print(f"{int(crash.sum())} built-in crash days of {crash.size}  ({crash.mean():.0%})\n")
+
+INDEP_BASELINE = 0.10                              # an independent pair scores ≈ q
+cc_hand = cocrash_by_hand(a, b)                    # our spelled-out version
+cc_lib  = cocrash_fraction(a, b, q=0.10)           # the library measure — must agree
+print(f"co-crash (by hand)   = {cc_hand:.1%}")
+print(f"co-crash (library)   = {cc_lib:.1%}   ← same number, reused everywhere above")
+print(f"independence baseline= {INDEP_BASELINE:.1%}")
+print(f"lift over baseline   = {cc_lib / INDEP_BASELINE:.1f}×")
+```
+
+```{python}
+#| label: fig-twobanks-cocrash
+#| fig-cap: "The stylized bank pair, with the co-crash quadrant shaded. The condition is the 10% of days bank A falls hardest (left band); the co-crash fraction is the share of those days on which B also breaks its crash line (red) versus shrugs it off (blue). The built-in crash days (the shared shock) pile into the lower-left corner, lifting co-crash far above the 10% independence baseline — exactly the tail an unconditional Pearson under-reads."
+qᵃ, qᵇ = np.quantile(a, 0.10), np.quantile(b, 0.10)   # qᵃ = Q₀.₁₀(a), qᵇ = Q₀.₁₀(b)   [return units]
+band: Float[Array, "n"] = a <= qᵃ                      # condition: A in its worst 10%
+co:   Float[Array, "n"] = band & (b <= qᵇ)             # aₜ≤qᵃ ∧ bₜ≤qᵇ → a co-crash
+hold: Float[Array, "n"] = band & (b > qᵇ)              # aₜ≤qᵃ ∧ bₜ>qᵇ → B held up
+
+fig, ax = plt.subplots(figsize=(6.8, 5.2))
+ax.axvspan(a.min(), qᵃ, color=CRASH, alpha=0.06)
+ax.axhline(qᵇ, color=INK, lw=0.8, ls=":")
+ax.scatter(a[~band], b[~band], s=8, c="0.78", alpha=0.3, edgecolors="none")
+ax.scatter(a[hold], b[hold], s=26, c=COOL, alpha=0.8, edgecolors="none",
+           label=f"A crashes, B holds  ({int(hold.sum())})")
+ax.scatter(a[co], b[co], s=30, c=CRASH, alpha=0.9, edgecolors="none",
+           label=f"both crash — a co-crash  ({int(co.sum())})")
+ax.text(qᵃ, ax.get_ylim()[1], "  condition: A in its worst 10%",
+        color=CRASH, fontsize=9, va="top", ha="left")
+ax.set_xlabel("bank A return"); ax.set_ylabel("bank B return")
+ax.set_title(f"Of A's {int(band.sum())} worst days, B also craters on "
+             f"{int(co.sum())}  →  co-crash {cc_lib:.0%}", fontsize=11.5)
+ax.legend(fontsize=9, frameon=False, loc="upper left"); despine(ax)
+fig.tight_layout(); plt.show()
+```
+
+There are two things to take away here.  First, the measure is **correct**: the
+by-hand quadrant count and `cocrash_fraction` return the same number, and it sits far
+above the 10% baseline — the co-crash is real, because we built it in.  Second, this
+is *exactly* the tail that a correlation number under-reports: Pearson averages the
+calm cloud and the crash corner together, while the co-crash measure keeps only the
+corner.  We now carry this same measure, unchanged, onto the real book of stocks.
+
+---
+
+## 📈 Rung 3 · Real — The Full Basket
+
+**What we are looking for on real data:** pairs of stocks that look safely
+unrelated in calm times yet fall together when markets break.  The co-crash number
+tells us, for each pair, how often the second name has one of its worst days on the
+same day the first name does — high means dangerous, near 10% means genuinely
+independent.
+
+**Receiving Tool 1's handoff.**  [Tool 1's
+watchlist](lab-tool1-ladder.qmd) ranked real pairs by their `Pearson − Spearman`
+gap — a cheap, quick clue that some cross-sector pairs only move together on extreme
+days.  The flagged names were the **diversification illusions**: utilities and
+energy against the rest (e.g. `CVX/DUK`, `XOM/DUK`, `GS/DUK`).  Tool 1 could only
+*flag* them; this job runs the co-crash test that confirms the tail coupling
+rigorously — something no averaged-over-everything measure on that road can do.
+
+We **reload** the already-prepared returns — there is no cleaning here; the
+prices → log-returns pipeline and the crash-mask setting live in the data primer —
+display a corner of the table, and run the *same* `cocrash_fraction` from Rung 2.
+
+```{python}
+R = datasets.load_returns()                       # prepared 14-name daily panel
 META = datasets.load_basket_meta()
-label = dict(zip(META["ticker"], META["label"]))
+label  = dict(zip(META["ticker"], META["label"]))
 sector = dict(zip(META["ticker"], META["sector"]))
 tickers = list(R.columns)
+print(f"{len(R)} trading days × {len(tickers)} stocks   "
+      f"({R.index.min().date()} → {R.index.max().date()})")
+R[["JPM", "BAC", "GS", "XOM", "CVX", "DUK"]].iloc[:3].round(4)
 ```
 
----
-
-## 1 · The Benchmark — Tail Frequency Under Independence
-
-If two assets were truly independent with marginal tail probability $p$, the
-probability of a *joint* tail event would be $p^2$.  We use $p = 0.10$
-(bottom decile).
-
-```{python}
-P_TAIL = 0.10   # tail threshold (bottom decile of each series)
-p_joint_indep = P_TAIL ** 2
-print(f"Expected joint tail frequency (if independent): {p_joint_indep:.4f} = {100*p_joint_indep:.2f}%")
-print(f"That is: once every {1/p_joint_indep:.0f} days ≈ {1/(p_joint_indep*252):.1f} years")
-```
-
----
-
-## 2 · Actual Tail Co-Crash Frequencies
-
-```{python}
-results = []
-for a, b in itertools.combinations(tickers, 2):
-    x, y = R[a].values, R[b].values
-    q_a = np.percentile(x, 100 * P_TAIL)
-    q_b = np.percentile(y, 100 * P_TAIL)
-    crash_mask = (x <= q_a) & (y <= q_b)
-    p_joint = crash_mask.mean()
-    lift = p_joint / p_joint_indep   # how many times more often than independent
-    pearson = pearsonr(x, y)[0]
-    same_sec = sector.get(a) == sector.get(b)
-    results.append(dict(
-        pair=f"{a}/{b}",
-        pearson=pearson,
-        p_joint=p_joint,
-        lift=lift,
-        n_crash=crash_mask.sum(),
-        same_sector=same_sec,
-    ))
-
-results.sort(key=lambda r: r["lift"], reverse=True)
-
-print(f"{'Pair':<12s}  {'Pearson':>8s}  {'joint tail%':>11s}  {'lift':>6s}  {'N crashes':>10s}")
-print("-" * 58)
-for r in results[:10]:
-    print(f"  {r['pair']:<10s}  {r['pearson']:+8.3f}  {100*r['p_joint']:10.2f}%  "
-          f"{r['lift']:6.1f}×  {r['n_crash']:10d}")
-```
-
----
-
-## 3 · The Scorecard — Lift Vs. Pearson
-
-```{python}
-#| label: fig-lift-vs-pearson
-#| fig-cap: "Tail co-crash lift vs. Pearson correlation. Points far above the expected curve have hidden tail risk — more crashes together than their correlation implies."
-pearson_vals = [r["pearson"] for r in results]
-lift_vals = [r["lift"] for r in results]
-same_sec = [r["same_sector"] for r in results]
-
-# Expected lift for a Gaussian pair with given correlation
-rho_grid = np.linspace(0, 0.95, 200)
-from scipy.stats import multivariate_normal
-
-def gaussian_tail_lift(rho, p=P_TAIL):
-    # P(X < q, Y < q) for a bivariate Gaussian with correlation rho
-    cov = [[1, rho], [rho, 1]]
-    q = multivariate_normal.ppf(p) if hasattr(multivariate_normal, "ppf") else -1.28
-    # Use 2-D Gaussian CDF
-    from scipy.stats import multivariate_normal as mvn
-    z = mvn(mean=[0, 0], cov=cov)
-    return z.cdf([q, q]) / p**2
-
-from scipy.stats import norm
-q_thresh = norm.ppf(P_TAIL)
-
-gauss_lift = []
-for rho in rho_grid:
-    cov = [[1, rho], [rho, 1]]
-    from scipy.stats import multivariate_normal as mvn2
-    p_joint_g = mvn2(mean=[0, 0], cov=cov).cdf([q_thresh, q_thresh])
-    gauss_lift.append(p_joint_g / p_joint_indep)
-
-fig, ax = plt.subplots(figsize=(9, 5.5))
-colors = [CRASH if s else COOL for s in same_sec]
-ax.scatter(pearson_vals, lift_vals, s=35, c=colors, alpha=0.75,
-           label=None, zorder=5)
-ax.plot(rho_grid, gauss_lift, color=INK, lw=1.6, ls="--",
-        label="Gaussian prediction")
-ax.axhline(1, color=WARM, lw=1.0, ls=":", label="independence")
-
-# Label the top outliers
-top_pairs = [(r["pair"], r["pearson"], r["lift"]) for r in results[:5]]
-for pair, p, lf in top_pairs:
-    ax.annotate(pair, xy=(p, lf), fontsize=8, color=INK,
-                xytext=(p + 0.01, lf + 0.3))
-
-from matplotlib.patches import Patch
-legend_els = [
-    Patch(fc=CRASH, label="same-sector pair"),
-    Patch(fc=COOL, label="cross-sector pair"),
-    plt.Line2D([0], [0], color=INK, ls="--", label="Gaussian prediction"),
-]
-ax.legend(handles=legend_els, fontsize=9, frameon=False)
-ax.set_xlabel("Pearson correlation  r")
-ax.set_ylabel("Tail lift  (× more crashes than independent)")
-ax.set_title("Hidden tail risk: pairs whose crashes exceed the Gaussian prediction",
-             fontsize=11, fontweight="bold")
-despine(ax)
-plt.tight_layout()
-plt.show()
-```
-
----
-
-## 4 · The Banks — The Lecture's Central Character
-
-```{python}
-#| label: fig-bank-crash-zoom
-#| fig-cap: "JPM / BAC daily returns. Crash days (both below 10th percentile) highlighted in red — far more than independence predicts."
-x = R["JPM"].values
-y = R["BAC"].values
-q_x = np.percentile(x, 10)
-q_y = np.percentile(y, 10)
-crash = (x <= q_x) & (y <= q_y)
-
-p_crash = crash.mean()
-pearson = pearsonr(x, y)[0]
-lift = p_crash / p_joint_indep
-
-fig, ax = plt.subplots(figsize=(7, 5.5))
-ax.scatter(x[~crash], y[~crash], s=10, c=COOL, alpha=0.35, edgecolors="none",
-           label=f"bulk ({(~crash).sum()} days)")
-ax.scatter(x[crash], y[crash], s=30, c=CRASH, alpha=0.9, edgecolors="none",
-           label=f"co-crash ({crash.sum()} days)")
-
-ax.axvline(q_x, color=INK, lw=0.8, ls="--")
-ax.axhline(q_y, color=INK, lw=0.8, ls="--")
-
-ax.set_xlabel(f"JPM daily return"); ax.set_ylabel(f"BAC daily return")
-ax.set_title(f"JPMorgan / Bank of America\n"
-             f"Pearson={pearson:+.3f}   "
-             f"tail co-crash rate={100*p_crash:.1f}%   "
-             f"lift={lift:.1f}×",
-             fontsize=11)
-ax.legend(fontsize=9, frameon=False)
-despine(ax)
-plt.tight_layout()
-plt.show()
-
-print(f"\nKey numbers:")
-print(f"  Pearson correlation:              {pearson:.4f}")
-print(f"  Observed joint tail frequency:    {p_crash:.4f} ({100*p_crash:.2f}%)")
-print(f"  Expected under independence:      {p_joint_indep:.4f} ({100*p_joint_indep:.2f}%)")
-print(f"  Lift (observed / expected):       {lift:.1f}×")
-```
-
----
-
-## 5 · Deliverable — Tail-Risk Report
-
-Based on the analysis above, write a short memo (3–5 bullet points):
-
-1. **Top-3 pairs by tail-lift** — name them, give the lift, explain the
-   economic relationship.
-2. **Any cross-sector surprises** — pairs whose tail-lift substantially exceeds
-   their within-sector peers.
-3. **Pearson blind spots** — pairs where Pearson $< 0.4$ but lift $> 5×$.
-4. **Portfolio implication** — which cluster of stocks would a simple
-   correlation-based risk model most severely understate as diversification
-   benefit?
-5. **Recommended next step** — which pairs warrant a full Gaussianization /
-   flow-based analysis (Lecture 3) to quantify the tail risk precisely?
-
-::: {.callout-warning}
-## Limitation of This Analysis
-The histogram MI estimator and the empirical tail frequency are both noisy with
-5 years of daily data.  A practitioner would bootstrap confidence intervals
-around the lift estimates before making capital allocation decisions.
+::: {.callout-note icon=false}
+## Where This Data Comes From
+The panel, the crash-day mask, and the co-crash statistic this job rides on are laid
+bare in the data primer —
+[Crashes & Drawdowns](../../data/03-crashes-and-drawdowns.qmd) defines the
+percentile crash dial, and [Co-Movement &
+Co-Crashes](../../data/04-co-movement-and-co-crashes.qmd) builds the co-crash
+fraction on the real basket.  This lab reloads that panel and never re-derives the
+masks or the sectors.
 :::
+
+First, settle Tool 1's handoff directly: run the conditional co-crash test on those
+exact flagged pairs, against the independence baseline.
+
+```{python}
+WATCHLIST = [("CVX", "DUK"), ("XOM", "DUK"), ("GS", "DUK")]   # Tool 1's flagged pairs
+
+print("Tool 1's diversification-illusion pairs, under the conditional test:\n")
+print(f"{'pair':<10s}{'Pearson':>9s}{'co-crash':>10s}{'lift':>7s}  sectors")
+print("-" * 50)
+for u, v in WATCHLIST:
+    xu: Float[Array, "n_days"] = R[u].values
+    xv: Float[Array, "n_days"] = R[v].values
+
+    pe = pearsonr(xu, xv)[0]                        # ρ(u,v) — what Tool 1 could see
+    cc = cocrash_fraction(xu, xv, q=0.10)           # P(v crash | u crash) — conditional tail test
+    lift = cc / INDEP_BASELINE                      # lift = co-crash / q
+
+    print(f"{u + '/' + v:<10s}{pe:>+9.3f}{cc:>9.0%}{lift:>6.1f}×"
+          f"  {sector[u]}/{sector[v]}")
+```
+
+The handoff is confirmed: these cross-sector pairs have only a **modest Pearson
+correlation** (they look diversified in calm times) yet crash together several times
+more often than the 10% baseline — the tail coupling Tool 1 could flag but not
+measure.  Now the full-basket sweep: run the same measure on every pair and assemble
+the co-crash matrix.
+
+```{python}
+import itertools
+
+rows = []
+for u, v in itertools.combinations(tickers, 2):
+    xu: Float[Array, "n_days"] = R[u].values
+    xv: Float[Array, "n_days"] = R[v].values
+
+    cc = cocrash_fraction(xu, xv, q=0.10)          # P(v crash | u crash) — the Rung-2 measure, unchanged
+    rows.append(dict(pair=f"{u}/{v}", u=u, v=v,
+                     same_sector=(sector[u] == sector[v]),
+                     pearson=pearsonr(xu, xv)[0],  # ρ(u,v)
+                     cocrash=cc,
+                     lift=cc / INDEP_BASELINE))     # lift = co-crash / q
+rows.sort(key=lambda r: r["cocrash"], reverse=True)
+print(f"{len(rows)} pairs measured.  strongest co-crashes:\n")
+print(f"{'pair':<10s}{'Pearson':>9s}{'co-crash':>10s}{'lift':>7s}  sector")
+print("-" * 48)
+for r in rows[:8]:
+    print(f"{r['pair']:<10s}{r['pearson']:>+9.3f}{r['cocrash']:>9.0%}"
+          f"{r['lift']:>6.1f}×  {'same' if r['same_sector'] else 'cross'}")
+```
+
+```{python}
+#| label: fig-cocrash-matrix-compute
+order = sorted(tickers, key=lambda t: (sector[t], t))   # group columns by sector
+n = len(order)
+
+CC: Float[Array, "n_assets n_assets"] = np.eye(n)       # CC[i,j] = P(i crash | j crash); diag = 1
+for i, u in enumerate(order):
+    for j, v in enumerate(order):
+        if i != j:
+            xu: Float[Array, "n_days"] = R[u].values
+            xv: Float[Array, "n_days"] = R[v].values
+            CC[i, j] = cocrash_fraction(xv, xu, q=0.10)  # P(u crash | v crash) — condition on column v
+
+secs = [sector[t] for t in order]                       # sector label per column
+bounds = [i for i in range(1, n) if secs[i] != secs[i - 1]]   # indices where the sector changes
+```
+
+```{python}
+#| label: fig-cocrash-matrix
+#| fig-cap: "The full-basket co-crash matrix, ordered by sector. Each cell is P(row crashes | column crashes) at the 10% tail; the diagonal is 1 by construction. The bank block (top-left) glows — when one bank has a worst-decile day, the others crater with it ~65–70% of the time — but the off-diagonal cross-sector cells are far from the 10% baseline too, the systemic coupling that surfaces only in the tail. This is the conditional structure Pearson averages away."
+fig, ax = plt.subplots(figsize=(7.4, 6.4))
+im = ax.imshow(CC, cmap="inferno", vmin=0.10, vmax=1.0)
+ax.set_xticks(range(n)); ax.set_xticklabels(order, rotation=90, fontsize=8)
+ax.set_yticks(range(n)); ax.set_yticklabels(order, fontsize=8)
+for b in bounds:                                        # draw the sector dividers
+    ax.axhline(b - 0.5, color="white", lw=1.0); ax.axvline(b - 0.5, color="white", lw=1.0)
+fig.colorbar(im, ax=ax, fraction=0.046, label="co-crash  P(row | column)")
+ax.set_title("Co-crash matrix — coupling that only shows in the tail", fontsize=12)
+fig.tight_layout(); plt.show()
+```
+
+Read the matrix: the bank block is the obvious hot square, but the cross-sector cells
+away from the diagonal sit well above the 10% floor too — the market-wide drag that
+makes a "diversified" book fall as one.  The ranking below turns this into the
+deliverable.
+
+---
+
+## 💰 Rung 4 · Application — The Tail-Risk Flag
+
+The deliverable is a **tail-risk report**, and it has two lists.  The raw co-crash
+ranking is topped by the obvious same-sector pairs (the banks crash together, the
+energy majors crash together — everyone already knows that), so the report ranks the
+two groups *separately*: a within-sector list (the already-known coupling, useful for
+position sizing) and a **cross-sector** list — the diversification illusions.  For
+that second group, a correlation-based risk model sets aside too little capital,
+because Pearson sees only the calm-time relationship and misses the joint crash.
+That second list is what Tool 1 handed off and what a trading desk would actually act
+on.
+
+```{python}
+#| label: fig-tailrisk-flag
+#| fig-cap: "The tail-risk flag, split into the two queues a desk reads differently. Within-sector pairs (blue, bottom) are the already-known coupling — the bank and energy blocks crash as one. The cross-sector pairs (red, top) are the report's payload: the diversification illusions, loosely correlated in calm times yet dragged together in 2008 and 2020, far above the 10% independence baseline (dashed). These are the pairs Tool 1 flagged and a covariance-based risk model under-reserves."
+within = [r for r in rows if r["same_sector"]][:8]      # known coupling — for sizing
+cross  = [r for r in rows if not r["same_sector"]][:8]  # the diversification illusions
+
+for title, queue in [("within-sector  (known coupling)", within),
+                     ("cross-sector  (diversification illusions → act on these)", cross)]:
+    print(f"\n{title}\n{'pair':<10s}{'Pearson':>9s}{'co-crash':>10s}{'lift':>7s}")
+    print("-" * 36)
+    for r in queue:
+        print(f"{r['pair']:<10s}{r['pearson']:>+9.3f}{r['cocrash']:>9.0%}{r['lift']:>6.1f}×")
+
+fig, ax = plt.subplots(figsize=(7.8, 4.6))
+queue = within[::-1] + cross[::-1]                      # barh: within fills the bottom, cross the top
+colors = [COOL] * len(within) + [CRASH] * len(cross)
+ax.barh([r["pair"] for r in queue], [100 * r["cocrash"] for r in queue], color=colors)
+ax.axvline(100 * INDEP_BASELINE, color=INK, lw=1.2, ls="--",
+           label="independence baseline (10%)")
+ax.axhline(len(within) - 0.5, color=INK, lw=0.8)        # divider between the two queues
+ax.text(0.99, len(within) - 0.5, "within-sector ", transform=ax.get_yaxis_transform(),
+        ha="right", va="top", fontsize=9, color=COOL, fontweight="bold")
+ax.text(0.99, len(within) + len(cross) - 0.5, "cross-sector ", transform=ax.get_yaxis_transform(),
+        ha="right", va="top", fontsize=9, color=CRASH, fontweight="bold")
+ax.set_xlabel("co-crash  (% of one name's worst days the other also crashes)")
+ax.set_title("Tail-risk flag — two queues a desk reads differently", fontsize=12)
+ax.legend(fontsize=9, frameon=False, loc="lower right")
+despine(ax); fig.tight_layout(); plt.show()
+```
+
+Read the cross-sector list as the triage queue: these are the pairs whose joint
+crashes a covariance matrix most badly understates, by counting them as a
+diversification benefit that is not really there.  They look diversified to Pearson
+and are not, in the only situation that matters — the bad days — and they crash
+together two to three times more often than the baseline despite modest correlation,
+exactly the illusion Tool 1 flagged and this test confirms.
+
+---
+
+## How Deep Is the Illusion? Sweep the Tail
+
+The co-crash setting `q` controls how bad a day has to be to count as a "crash" — a
+smaller `q` means a deeper, rarer loss.  The diversification illusion is not fixed: it
+gets **worse** the further into the tail you look.  Sweep `q` for the flagged
+cross-sector pairs:
+
+```{python}
+print(f"{'pair':<10s}{'q=20%':>8s}{'q=10%':>8s}{'q=5%':>8s}   (co-crash lift over baseline)")
+for pair in ["CVX/DUK", "XOM/DUK", "GS/DUK"]:
+    a, b = pair.split("/")
+    x: Float[Array, "n_days"] = R[a].to_numpy()
+    y: Float[Array, "n_days"] = R[b].to_numpy()
+
+    lift = [cocrash_fraction(x, y, q=q) / q for q in (0.20, 0.10, 0.05)]   # lift = P(y crash|x crash) / q
+    print(f"{pair:<10s}{lift[0]:>7.1f}x{lift[1]:>7.1f}x{lift[2]:>7.1f}x")
+```
+
+The pattern is the warning.  At a mild 20% threshold these pairs crash together under
+twice as often as the baseline — easy to wave away — but zoom in on the *worst 5%* of
+days and that multiple roughly triples, to about 6×.  The tail dependence a covariance
+matrix misses is worst exactly where it hurts most: in the deepest losses.  This is the
+flag a desk acts on, and the reason the [uncertainty](../../uncertainty/index.qmd)
+chapter refuses to model the joint tail with a Gaussian, and the
+[gaussianization](../../gaussianization/index.qmd) chapter learns the true joint shape
+instead.

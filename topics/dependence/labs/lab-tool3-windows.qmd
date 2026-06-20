@@ -1,6 +1,6 @@
 ---
 title: "Tool 3 — Windows and Total Correlation"
-subtitle: "Scalar → Vector → Block"
+subtitle: "Scalar → Vector → Block · the Information Venn"
 ---
 
 ```{python}
@@ -9,167 +9,315 @@ import sys, pathlib
 sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
 from lectures import plotting, datasets
 from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
-from lectures.measures import mutual_information_bits, nats_to_bits
+from lectures.gaussianization import gaussianize_1d
 plotting.set_style("notes")
 import numpy as np, matplotlib.pyplot as plt
-from scipy.stats import pearsonr
+import einx                      # linear algebra with the axes spelled out
+from jaxtyping import Float      # shape annotations: Float[Array, "n_days d"]
+
+Array = np.ndarray
+LN2 = np.log(2)                  # 1 bit = ln 2 nats
 ```
 
 *Learn-the-tool track · Lab 3 of 3.*
 
-Real portfolios are not scalar pairs — each stock is a *time series*, and the
-dependence between two windows of 5, 10, or 20 days is a different question
-from day-by-day correlation.
+Mutual information — MI, the shared information between two things (Tool 2) — measured
+what two blocks share *between* them.  This lab adds the other half of the picture:
+how much a block repeats itself *within* (its **redundancy**).  The two halves turn out
+to be pieces of **one** quantity, **total correlation**.  Together with MI it gives the
+full **information Venn** of a system with many columns: $T(x)$, $T(y)$, $I(x;y)$, and
+the whole $T([x,y])$.  These four pieces add up exactly, like areas in a Venn diagram.
 
-This lab climbs the data-shape ladder:
-
-| Data shape | Manipulation | Measure |
-|------------|-------------|---------|
-| Two scalar columns | day-by-day comparison | Pearson / MI |
-| One series, $w$-day windows | redundancy within each window | Total correlation |
-| Two series, $w$-day patches | shared info between the two blocks | $I(X; Y)$ |
-
-**What you will produce:** rolling dependence curves and a picture of whether
-dependence is stable or regime-switching.
+**What you will produce:** the four Venn regions estimated and checked against a
+closed form, then a redundancy report for the real basket — within a sector, across
+sectors, and across time.
 
 ---
 
-## Setup
+## 🧪 Rung 1 · Toy — Known Answer
+
+`datasets.info_blocks()` again gives the closed-form truth for every region.  **The
+algorithm:** total correlation is the multi-variable mutual information,
+
+$$
+T(X) = \sum_i H(X_i) - H(X) \;=\; -\tfrac{1}{2}\ln\det R \quad\text{(nats, Gaussian copula)},
+$$
+
+with $R$ the correlation matrix of the Gaussianized columns; MI is the
+two-block version from Tool 2.  Spelled out:
+
+```{python}
+def gaussianize_cols(X: Float[Array, "n d"]) -> Float[Array, "n d"]:
+    """Rank → standard normal, column by column (the Gaussian-copula transform)."""
+    cols = [gaussianize_1d(X[:, j]) for j in range(X.shape[1])]
+    return np.column_stack(cols)
+
+
+def tc_bits(X: Float[Array, "n d"]) -> float:
+    """Total correlation T(X) = Σ H(Xᵢ) − H(X), Gaussian-copula estimator   [bits].
+
+    T(X) = −½·ln det R   [nats]   with R the correlation of the normal scores.
+    """
+    Z: Float[Array, "n d"] = gaussianize_cols(X)
+    Zc: Float[Array, "n d"] = Z - Z.mean(0)                  # centre each column
+
+    R: Float[Array, "d d"] = einx.dot("n i, n j -> i j", Zc, Zc) / len(Z)   # R = (1/n)·ZᵀZ  (unit-var ⇒ corr)
+    _, logdet = np.linalg.slogdet(np.atleast_2d(R))
+
+    return -0.5 * logdet / LN2                               # T(X) = −½·ln det R   [nats] → bits
+
+
+def block_mi_bits(x: Float[Array, "n dx"], y: Float[Array, "n dy"]) -> float:
+    """I(x; y) = ½·ln( |Σx|·|Σy| / |Σ| )   [bits], Gaussian-copula estimator."""
+    dx = x.shape[1]
+    Z: Float[Array, "n d"] = gaussianize_cols(np.column_stack([x, y]))
+    Zc: Float[Array, "n d"] = Z - Z.mean(0)                  # centre each column
+
+    Σ: Float[Array, "d d"] = einx.dot("n i, n j -> i j", Zc, Zc) / len(Z)   # Σ = (1/n)·ZᵀZ
+    _, ld = np.linalg.slogdet(Σ)                             # ln|Σ|
+    _, ldx = np.linalg.slogdet(np.atleast_2d(Σ[:dx, :dx]))   # ln|Σx|
+    _, ldy = np.linalg.slogdet(np.atleast_2d(Σ[dx:, dx:]))   # ln|Σy|
+
+    return 0.5 * (ldx + ldy - ld) / LN2                      # I(x;y) = ½·ln(|Σx||Σy|/|Σ|)   [nats] → bits
+```
+
+**One dial, four readings.**  The block width is the dial.  At width 1 each block is
+a single column with no internal redundancy, so $T(x)=T(y)=0$ and the whole system is
+just the scalar MI.  Widen the blocks and within-block redundancy appears — and the
+four regions always satisfy the **decomposition** $T([x,y]) = T(x) + T(y) + I(x;y)$.
+
+```{python}
+#| label: fig-venn-compute
+b = datasets.info_blocks(n=4000, dx=2, dy=2, within=0.7, between=0.4, seed=1)
+truth = b["truth"]
+
+# the four Venn regions, Gaussian-copula estimates   [bits]
+est = {
+    "T(x)": tc_bits(b["x"]),                  # within-block redundancy, block x
+    "T(y)": tc_bits(b["y"]),                  # within-block redundancy, block y
+    "I(x;y)": block_mi_bits(b["x"], b["y"]),  # between-block information
+    "T([x,y])": tc_bits(b["xy"]),             # the whole 4-vector
+}
+
+print(f"{'region':<10s}{'truth':>9s}{'estimate':>10s}   (bits)")
+for k, key in [("T(x)", "T_x"), ("T(y)", "T_y"), ("I(x;y)", "I_xy"), ("T([x,y])", "T_xy")]:
+    print(f"{k:<10s}{truth[key] / LN2:>9.3f}{est[k]:>10.3f}")
+
+# Watanabe decomposition: T([x,y]) = T(x) + T(y) + I(x;y)
+decomp = est["T(x)"] + est["T(y)"] + est["I(x;y)"]
+print(f"\nT(x)+T(y)+I(x;y) = {decomp:.3f}  vs  T([x,y]) = {est['T([x,y])']:.3f}   (identity ✓)")
+```
+
+```{python}
+#| label: fig-venn
+#| fig-cap: "The information Venn on a known answer (info_blocks, dx=dy=2). The whole-system total correlation T([x,y]) splits exactly into within-block redundancy T(x), T(y) and between-block information I(x;y). Estimated bars (filled) sit on the closed-form truth (black ticks); the stacked pieces sum to the whole, the Watanabe decomposition holding to the bit."
+fig, ax = plt.subplots(figsize=(8.4, 3.6))
+parts = [("T(x)", est["T(x)"], COOL), ("T(y)", est["T(y)"], WARM),
+         ("I(x;y)", est["I(x;y)"], CRASH)]
+left = 0.0
+for name, val, c in parts:                                    # stack the three pieces
+    ax.barh(0, val, left=left, color=c, edgecolor="white", label=f"{name} = {val:.2f}")
+    left += val
+ax.barh(1, est["T([x,y])"], color="0.8", edgecolor="white", label=f"T([x,y]) = {est['T([x,y])']:.2f}")
+ax.axvline(truth["T_xy"] / LN2, color=INK, lw=1.4, ls="--")
+ax.set_yticks([0, 1]); ax.set_yticklabels(["T(x) + T(y) + I(x;y)", "T([x,y])"])
+ax.set_xlabel("information  (bits)")
+ax.set_title("The whole = the parts: T([x,y]) = T(x) + T(y) + I(x;y)", fontsize=12)
+ax.legend(fontsize=8.5, frameon=False, ncol=2, loc="upper right"); despine(ax)
+fig.tight_layout(); plt.show()
+```
+
+### Time's Arrow Doesn't Matter
+
+Total correlation is a function of the *set* of components — invariant to their order
+and to the direction of time.  Take a stationary AR(1) series, cut a 3-day window, and
+compare its total correlation forwards, time-reversed, and shuffled:
+
+```{python}
+def windows(series: Float[Array, "n_days"], w: int) -> Float[Array, "n_windows w"]:
+    """Sliding w-day patches: row i is (sᵢ, …, sᵢ₊w₋₁)."""
+    return np.lib.stride_tricks.sliding_window_view(np.asarray(series, float), w)
+
+
+rng = np.random.default_rng(0)
+s: Float[Array, "n_days"] = np.zeros(4000)
+for t in range(1, s.size):
+    s[t] = 0.6 * s[t - 1] + rng.standard_normal()   # AR(1): sₜ = φ·sₜ₋₁ + εₜ,  φ = 0.6, stationary
+
+W: Float[Array, "n_windows w"] = windows(s, 3)       # [sₜ₋₂, sₜ₋₁, sₜ]  causal triples
+print(f"T(window)            = {tc_bits(W):.3f} bits   [sₜ₋₂, sₜ₋₁, sₜ]")
+print(f"T(time-reversed)     = {tc_bits(W[:, ::-1]):.3f} bits   [sₜ, sₜ₋₁, sₜ₋₂]")
+print(f"T(positions shuffled)= {tc_bits(W[:, [1, 2, 0]]):.3f} bits   any permutation")
+```
+
+All three give the same number.  **Total correlation sees redundancy, not flow** — it
+cannot tell past from future.  A measure that does care about direction (transfer
+entropy, or Granger causality) would tell these three apart; total correlation treats
+every ordering the same.  That is exactly why it answers "how much do these move
+together," not "what causes what."
+
+---
+
+## 🎭 Rung 2 · Toy-Real — A Stylized Market
+
+The *same* four estimators, now on the real block from Tool 2 — two banks and two
+energy majors — where there is no formula to check against.  The toy made a prediction
+we can now test on real data: **two stocks in the same sector should repeat each other
+more than the two sectors share across to each other.**  In symbols, the within-bank
+redundancy should be larger than the bank–energy mutual information,
+$T(\text{banks}) > I(\text{banks};\text{energy})$ — so watch those two numbers below.
 
 ```{python}
 R = datasets.load_returns()
+banks2: Float[Array, "n_days 2"] = R[["JPM", "BAC"]].to_numpy()    # block x
+energy2: Float[Array, "n_days 2"] = R[["XOM", "CVX"]].to_numpy()   # block y
+whole: Float[Array, "n_days 4"] = np.column_stack([banks2, energy2])   # the 4-vector
+
+T_b = tc_bits(banks2)                                  # redundancy within the banks
+T_e = tc_bits(energy2)                                 # redundancy within energy
+I_be = block_mi_bits(banks2, energy2)                  # banks ↔ energy information
+T_all = tc_bits(whole)                                 # the whole system
+
+print(f"T(banks)            = {T_b:.3f} bits")
+print(f"T(energy)           = {T_e:.3f} bits")
+print(f"I(banks; energy)    = {I_be:.3f} bits   ← cross-sector, the smallest region")
+print(f"T([banks, energy])  = {T_all:.3f} bits")
+print(f"  decomposition: {T_b:.3f} + {T_e:.3f} + {I_be:.3f} = {T_b + T_e + I_be:.3f}")
+print(f"\nordering holds?  T(banks) {T_b:.2f} > I(banks;energy) {I_be:.2f}  →  {T_b > I_be}")
+```
+
+::: {.callout-note icon=false}
+## Where This Block Comes From
+The `[JPM, BAC]` and `[XOM, CVX]` blocks and the sector grouping are the data
+primer's —
+[Co-Movement & Co-Crashes](../../data/04-co-movement-and-co-crashes.qmd).  This lab
+reloads them and never re-derives them.
+:::
+
+The ordering the toy predicted survives the jump to real data: each sector repeats
+itself far more *within* than it shares *across* to the other.  Most of the system's
+total correlation (about 1.7 of 2.0 bits) is within-sector; only a small slice is the
+link between sectors.  That is the numbers behind the advice "diversify across sectors,
+not within."
+
+---
+
+## 📈 Rung 3 · Real — The Full Basket
+
+The full table of stocks exposes two kinds of redundancy.  **Across names**: how much a
+whole sector repeats itself when we look at all its stocks at once.  **Across time**:
+how much one stock repeats itself from day to day, inside a short window.  In both cases
+the number we compute is the total correlation in bits — bigger means more repetition,
+so less genuinely new information.
+
+```{python}
+#| label: fig-group-tc-compute
 META = datasets.load_basket_meta()
-label = dict(zip(META["ticker"], META["label"]))
+sector_of = dict(zip(META["ticker"], META["sector"]))
+sectors = ["Banks", "Tech", "Energy", "Utilities", "Staples"]
+blocks = {s: R[[t for t in R.columns if sector_of[t] == s]].to_numpy() for s in sectors}
+
+tc_sector = {s: tc_bits(blocks[s]) for s in sectors}   # T(sector)   [bits], redundancy per block
+tc_all = tc_bits(R.to_numpy())                          # T(all 14)   [bits], the whole basket
+
+for s in sectors:
+    print(f"  T({s:<10s}) = {tc_sector[s]:.3f} bits   ({blocks[s].shape[1]} names)")
+print(f"  T(all 14)       = {tc_all:.3f} bits")
 ```
+
+```{python}
+#| label: fig-group-tc
+#| fig-cap: "Total correlation within each sector block (Gaussian-copula), and the whole 14-name basket. The banks carry by far the most internal redundancy — five names moving as one — while the two-name defensive sectors carry little. The whole-basket bar is large but far below the sum of the sector bars: cross-sector links are weak, which is the diversification the previous lab measured."
+order = sorted(sectors, key=tc_sector.get)
+fig, ax = plt.subplots(figsize=(8.0, 4.0))
+ax.barh(order, [tc_sector[s] for s in order], color=COOL)
+ax.barh("all 14", tc_all, color=CRASH)
+ax.set_xlabel("total correlation within the block  (bits)")
+ax.set_title("Redundancy lives inside the bank block", fontsize=12)
+despine(ax); fig.tight_layout(); plt.show()
+```
+
+Across time: take one stock's **volatility** — the size of its daily move, written
+$|\text{return}|$ — and cut it into overlapping $w$-day windows, then measure the
+redundancy among the days in a window.  We use the size of the move, not the move
+itself, because the direction of tomorrow's return is nearly impossible to predict from
+today's, but its *size* is not: calm days follow calm days and wild days follow wild
+days (volatility "clusters").
+
+```{python}
+#| label: fig-temporal-tc-compute
+vol: Float[Array, "n_days"] = np.abs(R["JPM"].to_numpy())   # |return| — clusters in time
+widths = [2, 3, 5, 8, 12]
+
+# T over the positions of each w-day volatility window   [bits]
+tc_time = [tc_bits(windows(vol, w)) for w in widths]
+
+for w, tc in zip(widths, tc_time):
+    print(f"  w = {w:>2d} days   T = {tc:.3f} bits")
+```
+
+```{python}
+#| label: fig-temporal-tc
+#| fig-cap: "Temporal redundancy: total correlation among the positions of a w-day window of JPM's |returns|, as the window grows. It climbs with w — volatility on one day predicts the next, so longer windows pack in more redundancy — but with diminishing returns, the autocorrelation fading with lag. (Overlapping windows can inflate this; the data primer's windowing page covers the non-overlapping check.)"
+fig, ax = plt.subplots(figsize=(7.4, 4.0))
+ax.plot(widths, tc_time, color=WARM, lw=2, marker="o")
+ax.set_xlabel("window length  w  (days)"); ax.set_ylabel("total correlation  (bits)")
+ax.set_title("Volatility windows: redundancy grows with length, then saturates", fontsize=12)
+despine(ax); fig.tight_layout(); plt.show()
+```
+
+::: {.callout-note icon=false}
+## Where Windowing Comes From
+The sliding-window construction, the overlap caveat, and the non-overlapping check are
+the data primer's —
+[Patching & Windowing](../../data/07-patching-and-windowing.qmd).  This lab reuses the
+same `windows()` recipe.
+:::
 
 ---
 
-## 1 · Rolling Pearson — A Baseline
+## 💰 Rung 4 · Application — The Redundancy Report
 
-Dependence changes over time.  Start with the simplest diagnostic.
-
-```{python}
-#| label: fig-rolling-pearson
-#| fig-cap: "60-day rolling Pearson correlation between JPM and BAC. Dependence is not constant."
-window = 60
-r_roll = R["JPM"].rolling(window).corr(R["BAC"]).dropna()
-
-fig, ax = plt.subplots(figsize=(12, 3.8))
-ax.plot(r_roll.index, r_roll.values, color=COOL, lw=1.2)
-ax.axhline(r_roll.mean(), color=INK, lw=1, ls="--",
-           label=f"mean = {r_roll.mean():.3f}")
-ax.set_title("60-day rolling Pearson: JPM / BAC", fontsize=12)
-ax.set_ylabel("Pearson r"); ax.set_xlabel("")
-ax.legend(frameon=False)
-despine(ax)
-plt.tight_layout()
-plt.show()
-```
-
----
-
-## 2 · Windowed MI — Does the Tail Co-Move?
-
-Rolling Pearson misses non-linear time-varying dependence.  Chunked MI does
-not.  For each 60-day window, compute MI from the joint histogram.
+The deliverable answers a portfolio manager's two questions at once.  **Which group is
+most redundant?** — if a sector's stocks already repeat each other, buying one more of
+them adds the least genuinely new exposure.  **How much redundancy sits within sectors
+versus across them?** — that tells you where real diversification (holding things that
+do *not* move together) actually comes from.  The number behind both is total
+correlation in bits: higher means more overlap.
 
 ```{python}
-def mi_histogram_bits(x, y, bins=12):
-    H, _, _ = np.histogram2d(x, y, bins=bins)
-    return mutual_information_bits(H)
+#| label: fig-report-compute
+within_sum = sum(tc_sector.values())              # Σ T(sector)   [bits], within-sector redundancy
+cross = tc_all - within_sum                        # T(all) − Σ T(sector)   [bits], cross-sector remainder
+per_name = {s: tc_sector[s] / blocks[s].shape[1] for s in sectors}   # T(sector)/n_names   [bits/name]
 
-x = R["JPM"].values
-y = R["BAC"].values
-
-win = 60
-idx = R.index[win - 1:]
-mi_roll = []
-for i in range(len(x) - win + 1):
-    xi, yi = x[i:i+win], y[i:i+win]
-    mi_roll.append(mi_histogram_bits(xi, yi))
-
-mi_roll = np.array(mi_roll)
+print("redundancy per name (bits / name):")
+for s in sorted(per_name, key=per_name.get, reverse=True):
+    print(f"  {s:<10s} {per_name[s]:.3f}")
+print(f"\nwithin-sector total = {within_sum:.2f} bits   cross-sector = {cross:.2f} bits")
 ```
 
 ```{python}
-#| label: fig-rolling-mi
-#| fig-cap: "60-day rolling MI (bits) vs rolling Pearson. Spikes in MI not matched by Pearson signal non-linear co-movement."
-fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 6), sharex=True)
-
-ax1.plot(idx, mi_roll, color=WARM, lw=1.2)
-ax1.set_ylabel("MI  (bits)")
-ax1.set_title("Rolling MI: JPM / BAC — spikes = tail co-movement", fontsize=12)
-despine(ax1)
-
-r_roll_aligned = R["JPM"].rolling(win).corr(R["BAC"]).values[win-1:]
-ax2.plot(idx, r_roll_aligned, color=COOL, lw=1.2)
-ax2.set_ylabel("Pearson r"); ax2.set_xlabel("")
-ax2.set_title("Rolling Pearson (same window)", fontsize=12)
-despine(ax2)
-
-fig.tight_layout()
-plt.show()
+#| label: fig-report
+#| fig-cap: "The redundancy report. Left: total correlation per name within each sector — the banks are the most redundant holding in the book, so a sixth bank adds the least new information. Right: the system's total correlation split into within-sector (the sum of the sector T's) vs the cross-sector remainder — the overwhelming majority of redundancy is within sectors, so diversification is a cross-sector move, not a within-sector one."
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.0), gridspec_kw={"width_ratios": [1.4, 1]})
+o = sorted(sectors, key=per_name.get)
+axL.barh(o, [per_name[s] for s in o], color=COOL)
+axL.set_xlabel("T per name  (bits)"); axL.set_title("Most redundant holding", fontsize=11)
+despine(axL)
+axR.bar(["within\nsectors", "cross\nsectors"], [within_sum, cross], color=[COOL, CRASH])
+axR.set_ylabel("total correlation  (bits)")
+axR.set_title("Where redundancy lives", fontsize=11); despine(axR)
+fig.tight_layout(); plt.show()
 ```
 
----
+The report is unambiguous: redundancy concentrates *inside* sectors — the banks worst
+of all — and the cross-sector slice is comparatively thin.  A portfolio that wants
+genuinely new information from each position diversifies **across** the sector blocks,
+never by stacking another name into one.
 
-## 3 · Multi-Variate: Total Correlation of the Full Basket
-
-Total correlation $T(\mathbf{X})$ extends MI to many variables at once:
-
-$$
-T(X_1,\ldots,X_d) = \sum_i H(X_i) - H(X_1,\ldots,X_d)
-$$
-
-It measures the redundancy shared across the *whole* basket.  We approximate
-it by summing pairwise MIs (a lower bound, not exact).
-
-```{python}
-import itertools
-
-tickers = list(R.columns)
-sector = dict(zip(META["ticker"], META["sector"]))
-
-# Pairwise MI matrix
-n_t = len(tickers)
-MI_mat = np.zeros((n_t, n_t))
-for i, a in enumerate(tickers):
-    for j, b in enumerate(tickers):
-        if i < j:
-            mi = mi_histogram_bits(R[a].values, R[b].values)
-            MI_mat[i, j] = MI_mat[j, i] = mi
-
-# Approximate total correlation: sum of upper triangle
-tc_approx = MI_mat[np.triu_indices(n_t, k=1)].sum()
-print(f"Approx total correlation (pairwise sum): {tc_approx:.2f} bits")
-print(f"Average pairwise MI:                     {tc_approx / (n_t*(n_t-1)/2):.3f} bits")
-```
-
-```{python}
-#| label: fig-mi-heatmap
-#| fig-cap: "Pairwise MI heatmap for the full basket. Within-sector blocks stand out."
-labs = [label.get(t, t) for t in tickers]
-fig, ax = plt.subplots(figsize=(9, 7))
-im = ax.imshow(MI_mat, cmap="YlOrRd", aspect="auto")
-ax.set_xticks(range(n_t)); ax.set_xticklabels(labs, rotation=45, ha="right", fontsize=9)
-ax.set_yticks(range(n_t)); ax.set_yticklabels(labs, fontsize=9)
-plt.colorbar(im, ax=ax, label="MI (bits)")
-ax.set_title("Pairwise mutual information — 14-stock basket", fontsize=12)
-plt.tight_layout()
-plt.show()
-```
-
----
-
-## 4 · Your Turn — Does Windowed MI Add Information?
-
-1. Find a window length (try 30, 60, 120 days) where rolling MI and rolling
-   Pearson *disagree* most strongly.  What was happening in the market at
-   that time?
-
-2. Which sector block in the heatmap has the highest average pairwise MI?
-   Does this match your intuition?
-
-3. Is the approximate total correlation higher in 2008–2009 than in
-   calmer periods?  (Hint: compute `MI_mat` on the first 500 and last 500
-   rows of `R` separately.)
+That completes both roads — the one that avoids estimating a density and the one that
+goes through information.  The dependence we have only *measured* here is the same
+dependence the [gaussianization](../../gaussianization/index.qmd) chapter learns to
+*remove*: it drives every region of the information Venn down to zero, leaving columns
+that no longer move together, so each one can be modelled on its own.

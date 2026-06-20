@@ -1,6 +1,6 @@
 ---
 title: "Job B — Neutralize an Income Model"
-subtitle: "Fairness on real US Census income data"
+subtitle: "Drop the attribute, watch it leak, neutralize the outcome — from toy to real Census data"
 ---
 
 ```{python}
@@ -13,131 +13,412 @@ from lectures.measures import cka_rbf
 from lectures.neutralize import fair_fit
 plotting.set_style("notes")
 import numpy as np, pandas as pd, matplotlib.pyplot as plt
+from scipy.stats import pearsonr
+import einx                      # linear algebra with the axes spelled out
+from jaxtyping import Float      # shape annotations: Float[Array, "n_rows"]
+
+Array = np.ndarray
 ```
 
-*Do-the-job track · Job B of 3.*
+*Apply-the-tool track · Job B.*
 
-::: {.callout-note appearance="simple" icon=false}
-**See the data first** — [The Income & Fairness
-Dataset](../../data/06-the-credit-dataset.qmd) shows this table's group gap and the
-proxy channels (above all `occupation`) that leak `sex` even when it's dropped.
-:::
+A compliance desk asks one question: *we never fed the model the protected
+attribute — is it fair?*  The honest answer is "dropping it is not enough," and
+this lab makes that answer concrete.
 
-The real deliverable: take an income-scoring model that *drops* the protected
-attribute, show it still leaks, then neutralize it and report the group gap before
-and after.  The data is real — the US Census **ACSIncome** table (`sex` protected,
-`income_high` target, real proxy features).
+We use one **neutralization routine** the whole way through — `fair_fit`.  It
+re-fits the target, then removes the part of the prediction that a sensitive
+variable (here `sex`) can explain.  ("Ridge-removing" just means it subtracts
+that part smoothly, controlled by a single knob.)  We write the routine once on
+a toy panel whose right answer we already know, then reuse it unchanged as the
+data gets harder: first a stylized market where merely *dropping the obvious
+linear effect* fails, and finally the real US Census **ACSIncome** table where
+`sex` leaks through the `occupation` column.  The routine never changes; only
+the data escalates.
+
+**What you will produce:** a neutralized income scorecard with the **group gap
+before and after** and the accuracy it costs — the single operating point a
+compliance desk reports.
 
 ---
 
-## 1 · The Gap, and the Proxy Channels
+## 🧪 Rung 1 · Toy — Known Answer
+
+Start where the truth is not in doubt.  `datasets.credit_scores_by_group()`
+draws a toy credit panel with a **built-in** group effect: a hidden
+creditworthiness that is shifted by `gap` for one group, squeezed into a
+`score` between 0 and 1, with a repaid-or-not label drawn from it.  Because we
+built the gap in ourselves, we know exactly what a fair model must remove — and
+we can check the answer by eye.
+
+What we are looking for on this rung: the score should *not* depend on the
+group, yet by construction it does.  The key number is the **group gap** — the
+difference in average score between the two groups.
 
 ```{python}
-credit = datasets.load_credit()
-print(f"loaded {len(credit):,} rows")
-m, f = credit[credit.sex == 1], credit[credit.sex == 0]
-print(f"P(high income | male)   = {m.income_high.mean():.2f}")
-print(f"P(high income | female) = {f.income_high.mean():.2f}   "
-      f"← gap {m.income_high.mean() - f.income_high.mean():+.2f}")
-print()
-for c in ["age", "education_years", "hours_per_week"]:
-    print(f"corr({c:<16}, sex) = {credit[c].corr(credit.sex):+.2f}   (numeric proxy)")
-print("occupation               : categorical — the strong channel (see the data page)")
+toy = datasets.credit_scores_by_group(n=600, gap=0.8, seed=0)
+score: Float[Array, "n"] = toy["score"]                  # the model's raw score   [0,1]
+group: Float[Array, "n"] = toy["group"].astype(float)    # protected attribute     {0,1}
+repaid: Float[Array, "n"] = toy["repaid"].astype(float)  # ground-truth label      {0,1}
+
+# Δ = E[score | group 1] − E[score | group 0]   — the dependence we built in
+raw_gap = score[group == 1].mean() - score[group == 0].mean()
+
+print(f"panel: {score.shape}   built-in group gap = {0.8} (latent shift)")
+print(f"raw score group gap = {raw_gap:+.3f}   ← the model hands group 1 a higher score")
 ```
 
-The numeric features barely correlate with `sex`.  The leak rides mostly on
-**`occupation`**, which the data page showed is heavily sex-segregated.
-
-## 2 · Drop `sex`, and Watch It Leak
-
-Build a score from the proxy features only — numeric features plus a one-hot of
-`occupation`, with `sex` never an input — then measure the **group gap** in the
-score (the difference in mean score between men and women).
-
-::: {.callout-note icon=false}
-We work on a representative 2 000-row sample (the kernel measure below builds an
-$n \times n$ matrix).  We report the **group gap** rather than CKA: with a single
-**binary** protected column, CKA barely registers the mean shift (it stays near
-0.02 throughout).  The group gap is the sharper read here — CKA earns its keep when
-$S$ is multivariate or continuous (see [Dependence](../../dependence/index.qmd)).
-:::
+The model never has to *see* the group to favour it: the score already carries
+the gap.  Now the engine behind our deliverable — the **neutralization
+routine**, written **once** here and reused unchanged on every rung above.
+`fair_fit` re-fits the label from the score, then steadily strips out whatever a
+flexible (polynomial) function of the group can explain about the prediction.
+A single knob $\mu$ controls how hard it strips: at $\mu = 0$ it is the plain
+fit (free to ride the group signal); as $\mu$ grows it removes the
+group-explainable part, driving the gap to zero.
 
 ```{python}
-sample = credit.sample(n=2000, random_state=0).reset_index(drop=True)
-num = ["age", "education_years", "hours_per_week"]
-Xn = sample[num].to_numpy(dtype=float)
-Xn = (Xn - Xn.mean(0)) / Xn.std(0)
-Xocc = pd.get_dummies(sample["occupation"]).to_numpy(dtype=float)   # the proxy
-X = np.column_stack([Xn, Xocc])
-y = sample["income_high"].to_numpy(dtype=float)
-S = sample["sex"].to_numpy(dtype=float)
+def group_gap(pred: Float[Array, "n"], s: Float[Array, "n"]) -> float:
+    """E[pred | s=1] − E[pred | s=0]  — the mean-score difference between groups."""
+    # Δ = E[pred | s=1] − E[pred | s=0]
+    return float(pred[s == 1].mean() - pred[s == 0].mean())
 
-# Composite baseline score from the legitimate features (sex excluded).
-Xa = np.column_stack([X, np.ones(len(X))])
-w, *_ = np.linalg.lstsq(Xa, y, rcond=None)
-score = Xa @ w
 
-gap = score[S == 1].mean() - score[S == 0].mean()
-data_gap = m.income_high.mean() - f.income_high.mean()
-print(f"score group gap (sex dropped) = {gap:+.3f}")
-print(f"  → about {gap / data_gap:.0%} of the data's {data_gap:+.2f} income gap, "
-      f"leaked through proxies")
+def utility(pred: Float[Array, "n"], target: Float[Array, "n"]) -> float:
+    """How well the (possibly neutralized) prediction still tracks the label."""
+    # ρ = Cov(pred, y) / (σ_pred · σ_y)   — Pearson correlation, axes spelled out
+    pc: Float[Array, "n"] = pred - pred.mean()      # centered prediction
+    tc: Float[Array, "n"] = target - target.mean()  # centered target
+    cov = einx.dot("n, n ->", pc, tc)                # Σₙ pcₙ·tcₙ
+    norm = np.sqrt(einx.dot("n, n ->", pc, pc) * einx.dot("n, n ->", tc, tc))
+    return float(cov / norm)                          # ρ ∈ [−1, 1]
+
+
+def neutralize_sweep(
+    x: Float[Array, "n"],
+    y: Float[Array, "n"],
+    s: Float[Array, "n"],
+    mus: list[float],
+) -> list[dict]:
+    """fair_fit across a μ ladder: gap, CKA(pred, s), and utility at each weight.
+
+    fair_fit(x, y, s, μ) :  fit y from x, then ridge-remove the part of ŷ that a
+                            polynomial basis of s explains  (μ=0 → none, μ↑ → all)
+    """
+    out = []
+    for mu in mus:
+        p: Float[Array, "n"] = fair_fit(x, y, s, mu=mu)  # neutralized prediction
+        out.append(dict(mu=mu, pred=p,
+                        gap=group_gap(p, s),             # the number a desk reports
+                        cka=cka_rbf(p, s),               # kernel dependence on s   [0,1]
+                        util=utility(p, y)))             # accuracy kept
+    return out
+
+
+mus = [0.0, 0.5, 2.0, 8.0, 20.0]
+toy_sweep = neutralize_sweep(score, repaid, group, mus)
+
+print(f"{'μ':>6}{'group gap':>12}{'CKA':>9}{'utility':>10}")
+print("-" * 37)
+for r in toy_sweep:
+    print(f"{r['mu']:>6g}{r['gap']:>+12.3f}{r['cka']:>9.3f}{r['util']:>10.3f}")
 ```
 
-Even with `sex` dropped, men get a systematically higher score — the proxies
-carried it through.
+Read it against what we built in.  At $\mu = 0$ the fitted prediction still
+carries the gap (the score's group dependence rides straight through); as $\mu$
+climbs the gap collapses from $\approx +0.20$ to $\approx 0$.  `CKA(pred, group)`
+— a measure of how much the prediction and the group still move together, on a
+0-to-1 scale — follows it down, and **utility barely moves**.  Utility here is
+just how well the prediction still tracks the repaid/not label, and it holds up
+because the group signal carried almost no information about who actually
+repays, so throwing it away costs little.  The known answer holds: the routine
+drives the built-in gap to zero.
 
 ```{python}
-#| label: fig-jobB-leak
-#| fig-cap: "Baseline score distribution by group (sex dropped). The dashed group means are offset: despite never seeing sex, the score hands men a higher value, reproducing a large share of the income gap through occupation and hours."
-fig, ax = plt.subplots(figsize=(7.5, 4.0))
-for g, col, name in [(0, WARM, "women"), (1, COOL, "men")]:
-    ax.hist(score[S == g], bins=30, density=True, alpha=0.55, color=col, label=name)
-    ax.axvline(score[S == g].mean(), color=col, lw=2, ls="--")
-ax.set_xlabel("baseline score"); ax.set_ylabel("density")
-ax.set_title(f"Score leaks the dropped attribute · group gap = {gap:+.3f}",
-             fontsize=12)
-ax.legend(fontsize=9, frameon=False); despine(ax)
+#| label: fig-toy-neutralize
+#| fig-cap: "The toy panel, before and after neutralization. Left: the raw score by group — the dashed group means are offset, the gap we built in. Centre: the μ=8 neutralized prediction — the two group distributions snap into alignment, the dashed means coincide. Right: the sweep — the group gap (red) collapses as μ grows while utility (blue) holds nearly flat. Neutralizing the outcome is, here, almost free."
+p_mu8: Float[Array, "n"] = next(r["pred"] for r in toy_sweep if r["mu"] == 8.0)
+gaps: Float[Array, "n_mu"] = np.abs([r["gap"] for r in toy_sweep])
+utils = [r["util"] for r in toy_sweep]
+
+fig, (ax0, ax1, ax2) = plt.subplots(1, 3, figsize=(14.0, 4.2))
+
+for g, col, name in [(0, WARM, "group 0"), (1, COOL, "group 1")]:
+    ax0.hist(score[group == g], bins=24, density=True, alpha=0.55, color=col, label=name)
+    ax0.axvline(score[group == g].mean(), color=col, lw=2, ls="--")
+ax0.set_xlabel("raw score")
+ax0.set_ylabel("density")
+ax0.set_title(f"raw score — gap {raw_gap:+.2f}", fontsize=10.5)
+ax0.legend(fontsize=9, frameon=False)
+despine(ax0)
+
+for g, col, name in [(0, WARM, "group 0"), (1, COOL, "group 1")]:
+    ax1.hist(p_mu8[group == g], bins=24, density=True, alpha=0.55, color=col, label=name)
+    ax1.axvline(p_mu8[group == g].mean(), color=col, lw=2, ls="--")
+ax1.set_xlabel("neutralized prediction (μ=8)")
+ax1.set_title(f"neutralized — gap {group_gap(p_mu8, group):+.2f}", fontsize=10.5)
+ax1.legend(fontsize=9, frameon=False)
+despine(ax1)
+
+ax2.plot(mus, gaps, "-o", c=CRASH, lw=2.2, label="|group gap|")
+ax2.plot(mus, utils, "-o", c=COOL, lw=2.2, label="utility")
+ax2.set_xlabel("neutrality weight μ")
+ax2.set_title("gap closes, utility holds", fontsize=10.5)
+ax2.legend(fontsize=9, frameon=False)
+despine(ax2)
+
 fig.tight_layout()
 plt.show()
 ```
 
-## 3 · Neutralize, and Sweep the Trade-Off
+---
 
-`fair_fit` re-fits `income_high` from the score while penalizing dependence on
-`sex`: at $\mu = 0$ it is free to use the sex-aligned signal (the worst case); as
-$\mu$ grows it ridge-removes that component, driving the group gap to zero.
+## 🎭 Rung 2 · Toy-Real — A Stylized Market
+
+A built-in straight-line gap is the easy case.  What *actually* defeats a
+careless team is a target that depends on the protected variable in **two ways
+at once**: a straight-line effect *and* a curved one.
+`datasets.fair_regression()` is that stylization — $y = 0.6\,x + 0.7\,S +
+0.7\,(S^2 - 1) + \text{noise}$ — so removing only the **straight-line** effect of
+$S$ is not enough: the curved $S^2$ part survives.  We keep the **exact** same
+neutralization routine and show the trap first.  "Dropping `S`" the careless way
+— removing only its straight-line effect — kills the correlation but leaves the
+curve; the full `fair_fit` (which also fits the curve) closes both.
 
 ```{python}
-def group_gap(pred):
-    return pred[S == 1].mean() - pred[S == 0].mean()
+fr = datasets.fair_regression(n=600, seed=0)
+x_fr: Float[Array, "n"] = fr["x"]   # legitimate feature
+s_fr: Float[Array, "n"] = fr["s"]   # protected variable
+y_fr: Float[Array, "n"] = fr["y"]   # target — depends on S linearly AND curvily
 
-def utility(pred):
-    return float(np.corrcoef(pred, y)[0, 1])  # correlation with the target
+print("built-in:  y = 0.6 x + 0.7 S + 0.7 (S² − 1) + noise   "
+      "(the S² term is the trap)\n")
 
-sweep = [0.0, 0.5, 2.0, 8.0, 20.0]
-print(f"{'μ':>6}{'group gap':>12}{'CKA':>9}{'utility':>10}")
-print("-" * 37)
-gaps, ckas, utils = [], [], []
-for mu in sweep:
-    p = fair_fit(score, y, S, mu=mu)
-    g, c, u = group_gap(p), cka_rbf(p, S), utility(p)
-    gaps.append(g); ckas.append(c); utils.append(u)
-    print(f"{mu:>6g}{g:>+12.3f}{c:>9.3f}{u:>10.3f}")
+
+def drop_the_line(
+    x: Float[Array, "n"],
+    y: Float[Array, "n"],
+    s: Float[Array, "n"],
+) -> Float[Array, "n"]:
+    """The careless fix: fit y using s, then residualize only the LINEAR part of s.
+
+    This is what 'just remove the correlation with S' does — it zeroes
+    corr(pred, S) but cannot touch the S² curve, which rides straight through.
+    """
+    p_full: Float[Array, "n"] = fair_fit(x, y, s, mu=0.0)  # baseline fit (uses S)
+    s_c: Float[Array, "n"] = (s - s.mean()) / s.std()      # standardized S — the line only
+
+    # β = ⟨s_c, ŷ⟩ / ⟨s_c, s_c⟩   — least-squares slope of ŷ on the line in S
+    coef = (s_c @ p_full) / (s_c @ s_c)
+
+    return p_full - coef * s_c   # ŷ − β·s_c : remove the line, keep the curve
+
+
+pred_line: Float[Array, "n"] = drop_the_line(x_fr, y_fr, s_fr)   # linear drop — the trap
+pred_fair: Float[Array, "n"] = fair_fit(x_fr, y_fr, s_fr, mu=8.0)  # full neutralization — degree-3
+
+print(f"{'':<22}{'corr(pred,S)':>14}{'corr(pred,S²)':>15}{'CKA(pred,S)':>13}{'util':>8}")
+print("-" * 72)
+for name, p in [("drop the line (deg 1)", pred_line), ("fair_fit (deg 3)", pred_fair)]:
+    print(f"{name:<22}{np.corrcoef(p, s_fr)[0, 1]:>+14.3f}"
+          f"{np.corrcoef(p, s_fr ** 2)[0, 1]:>+15.3f}"
+          f"{cka_rbf(p, s_fr):>13.3f}{utility(p, y_fr):>8.3f}")
+```
+
+There is the trap, in one row.  Dropping the line drives `corr(pred, S)` to zero
+— so if you only check for a straight-line relationship, the model looks clean.
+Yet `corr(pred, S²)` stays near $+0.86$, and `CKA(pred, S)` — which catches
+curved dependence too, not just straight lines — is still large: the $S^2$ curve
+leaked through the linear fix untouched.  The **same** `fair_fit` routine, which
+also fits the curve, sees it too — `CKA(pred, S)` drops by almost a factor of ten
+(and shrinks further as $\mu$ grows), pulling the leftover correlation with $S$
+*and* $S^2$ down with it.  The lesson the toy taught — neutralize the outcome,
+not just the one obvious channel — is exactly why it pays to penalize curves and
+not only lines.
+
+```{python}
+#| label: fig-styl-curve-compute
+# Bin the prediction by deciles of S, so the binned mean traces E[pred | S].
+bins: Float[Array, "n_edges"] = np.quantile(s_fr, np.linspace(0, 1, 11))   # 10 decile edges
+centers: Float[Array, "n_bins"] = 0.5 * (bins[:-1] + bins[1:])             # bin midpoints
+idx: Float[Array, "n"] = np.clip(np.digitize(s_fr, bins) - 1, 0, len(centers) - 1)  # bin of each point
+
+# E[pred | S in binₖ]  — the conditional mean that exposes the S² curve
+means_line: Float[Array, "n_bins"] = np.array(
+    [pred_line[idx == b].mean() for b in range(len(centers))]
+)
+means_fair: Float[Array, "n_bins"] = np.array(
+    [pred_fair[idx == b].mean() for b in range(len(centers))]
+)
 ```
 
 ```{python}
-#| label: fig-jobB-neutralize
-#| fig-cap: "Left: the group gap collapses as the neutrality weight μ grows. Right: the frontier — utility (correlation with income) versus the group gap. Neutralisation here is nearly free: the gap falls almost to zero while utility barely moves."
+#| label: fig-styl-curve
+#| fig-cap: "Why dropping the line fails. Left: the prediction after removing only the linear part of S — flat against S on average, but the binned means (red) trace a clear U: the S² curve survives, and any group defined by |S| is still treated differently. Right: the same plot after full fair_fit — the binned means are flat, the curve is gone. Removing the correlation is not removing the dependence."
+fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(11.5, 4.4), sharey=True)
+
+for ax, p, means, ttl in [(ax0, pred_line, means_line, "drop the line — S² curve survives"),
+                          (ax1, pred_fair, means_fair, "fair_fit — curve removed")]:
+    ax.scatter(s_fr, p, s=10, c=COOL, alpha=0.30, edgecolors="none")
+    ax.plot(centers, means, "-o", c=CRASH, lw=2.2, label="binned mean prediction")
+    ax.set_xlabel("protected variable S")
+    ax.set_title(ttl, fontsize=10.5)
+    ax.legend(fontsize=9, frameon=False)
+    despine(ax)
+
+ax0.set_ylabel("prediction")
+fig.tight_layout()
+plt.show()
+```
+
+The routine did not change — only the data did.  The toy taught us the routine
+*works*; the stylized market taught us *why dropping only the straight-line
+effect is not enough*.  Now the real table, where the leak is neither a clean
+line nor a clean curve but a real, sex-segregated `occupation` column.
+
+---
+
+## 📈 Rung 3 · Real — The Full Basket
+
+Now the real data.  We **reload** the prepared `(X, y, s)` — there is no decoding
+or filtering here.  The work of turning raw Census codes into readable columns
+(and dropping `sex` from `X`) already lives in [the income & fairness
+dataset](../../data/06-the-credit-dataset.qmd) and its *What the Labs Reload From
+Here* handoff.  We reload that exact prepared table, turn the text categories
+into numbers (the one step this lab is allowed to do itself), and train the
+scorecard with `sex` never given as an input.
+
+What we are looking for here: does a scorecard that *never sees* `sex` still
+score men and women differently?  The key number is again the **group gap** —
+the average score for men minus the average score for women.  If dropping `sex`
+were enough, this gap would be near zero.
+
+::: {.callout-note appearance="simple" icon=false}
+**See the data first** — [The Income & Fairness
+Dataset](../../data/06-the-credit-dataset.qmd) owns the prepared `(X, y, s)` with
+`sex` dropped, shows this table's 12-point group gap, and traces the proxy
+channels (above all `occupation`) that leak `sex`.  This lab reloads that frame
+and never re-derives the decode.
+:::
+
+```{python}
+credit = datasets.load_credit()
+y_all = credit["income_high"]                         # target: 1 if income > $50k
+s_all = credit["sex"]                                 # protected: 1 = male
+X_all = credit.drop(columns=["income_high", "sex"])   # proxies — sex DROPPED (the handoff)
+print(f"loaded {len(credit):,} rows   ·   X proxies (sex dropped): {list(X_all.columns)}")
+
+m, f = credit[credit.sex == 1], credit[credit.sex == 0]
+
+# Δ_data = P(high | male) − P(high | female)   — the gap baked into the labels
+data_gap = m.income_high.mean() - f.income_high.mean()
+
+print(f"data group gap  P(high|male) − P(high|female) = {data_gap:+.2f}   (the real 12-pt gap)")
+```
+
+The `CKA` dependence measure below builds an $n \times n$ matrix (one entry per
+pair of rows), which gets expensive fast, so we take **one** lab-local step — a
+representative 2,000-row sample.  Then we build a baseline score from the proxy
+features only (numeric features rescaled to a common scale, `occupation` turned
+into one column per job), with `sex` never an input.
+
+```{python}
+sample = credit.sample(n=2000, random_state=0).reset_index(drop=True)
+num = ["age", "education_years", "hours_per_week"]
+
+Xn: Float[Array, "n d_num"] = sample[num].to_numpy(dtype=float)
+Xn = (Xn - Xn.mean(0)) / Xn.std(0)                                 # z = (x − μ)/σ : standardize numerics
+Xocc: Float[Array, "n d_occ"] = pd.get_dummies(sample["occupation"]).to_numpy(dtype=float)  # strong proxy channel
+X: Float[Array, "n d"] = np.column_stack([Xn, Xocc])
+
+y: Float[Array, "n"] = sample["income_high"].to_numpy(dtype=float)
+S: Float[Array, "n"] = sample["sex"].to_numpy(dtype=float)
+
+# Composite baseline scorecard from the legitimate features (sex excluded).
+Xa: Float[Array, "n d1"] = np.column_stack([X, np.ones(len(X))])   # design matrix + intercept column
+w: Float[Array, "d1"]
+w, *_ = np.linalg.lstsq(Xa, y, rcond=None)                         # ŵ = argmin ‖Xa·w − y‖²
+score: Float[Array, "n"] = einx.dot("n d, d -> n", Xa, w)          # ŷₙ = Σ_d Xaₙ_d·w_d : the scorecard
+
+leak_gap = group_gap(score, S)
+
+print(f"scorecard group gap (sex dropped) = {leak_gap:+.3f}")
+print(f"  → about {leak_gap / data_gap:.0%} of the data's {data_gap:+.2f} gap, "
+      f"leaked through the proxies")
+```
+
+Even with `sex` dropped, men get a systematically higher score — `occupation`
+carried it through, exactly as the data page warned.  This is the real version of
+the Rung 1 leak: no built-in latent shift, just a sex-segregated job column doing
+the same work.
+
+```{python}
+#| label: fig-real-leak
+#| fig-cap: "The real scorecard's group gap (sex dropped). The dashed group means are offset: despite never seeing sex, the score hands men a higher value, reproducing a large share of the income gap through occupation and hours. Same leak as the toy's built-in gap — now carried by a real proxy column."
+fig, ax = plt.subplots(figsize=(7.5, 4.0))
+for g, col, name in [(0, WARM, "women"), (1, COOL, "men")]:
+    ax.hist(score[S == g], bins=30, density=True, alpha=0.55, color=col, label=name)
+    ax.axvline(score[S == g].mean(), color=col, lw=2, ls="--")
+ax.set_xlabel("baseline score")
+ax.set_ylabel("density")
+ax.set_title(f"Score leaks the dropped attribute · group gap = {leak_gap:+.3f}", fontsize=12)
+ax.legend(fontsize=9, frameon=False)
+despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+---
+
+## 💰 Rung 4 · Application — The Neutralized Scorecard
+
+The deliverable: take the leaking scorecard from Rung 3 and run the **same**
+neutralization routine, then report the group gap **before vs after** and the
+accuracy it costs — the single setting a compliance desk signs off on.  We try a
+range of $\mu$ values, look at the trade-off between fairness and accuracy each
+one buys, and pick the point where the gap is gone.
+
+What we are looking for here: as we turn the neutrality knob $\mu$ up, the group
+gap should shrink toward zero.  The key numbers are how far the gap falls and how
+much accuracy (utility) we give up to get there.
+
+```{python}
+real_sweep = neutralize_sweep(score, y, S, mus)       # same routine, real scorecard
+print(f"{'μ':>6}{'group gap':>12}{'CKA':>9}{'utility':>10}")
+print("-" * 37)
+for r in real_sweep:
+    print(f"{r['mu']:>6g}{r['gap']:>+12.3f}{r['cka']:>9.3f}{r['util']:>10.3f}")
+
+before = real_sweep[0]                                 # μ = 0  — the leaking baseline
+after = next(r for r in real_sweep if r["mu"] == 8.0)  # the reported operating point
+
+# fraction removed = 1 − |gap_after| / |gap_before|   [%]
+gap_drop = 100 * (1 - abs(after["gap"]) / abs(before["gap"]))
+# accuracy given up = 1 − util_after / util_before     [%]
+util_cost = 100 * (1 - after["util"] / before["util"])
+print(f"\nOPERATING POINT (μ = 8):")
+print(f"  group gap   {before['gap']:+.3f}  →  {after['gap']:+.3f}   "
+      f"({gap_drop:.0f}% of the gap removed)")
+print(f"  utility     {before['util']:.3f}  →  {after['util']:.3f}   "
+      f"({util_cost:.0f}% accuracy cost)")
+```
+
+```{python}
+#| label: fig-real-neutralize
+#| fig-cap: "The neutralized scorecard. Left: the group gap collapses as the neutrality weight μ grows — from the leaking baseline to ≈0. Right: the frontier — utility (correlation with income) against the group gap, each point a μ. Neutralization here is nearly free: the gap falls to zero while utility gives up only a couple of percent. The labelled operating point is the number the desk reports."
+gaps: Float[Array, "n_mu"] = np.abs([r["gap"] for r in real_sweep])
+utils = [r["util"] for r in real_sweep]
+
 fig, (axL, axR) = plt.subplots(1, 2, figsize=(11.5, 4.3))
 
-axL.plot(sweep, np.abs(gaps), "-o", c=CRASH, lw=2.2)
-axL.set_xlabel("neutrality weight μ"); axL.set_ylabel("|group gap| in mean score")
+axL.plot(mus, gaps, "-o", c=CRASH, lw=2.2)
+axL.set_xlabel("neutrality weight μ")
+axL.set_ylabel("|group gap| in mean score")
 axL.set_title("The group gap closes", fontsize=12)
 despine(axL)
 
-axR.plot(np.abs(gaps), utils, "-o", c=COOL, lw=2.2)
-for mu, gx, uy in zip(sweep, np.abs(gaps), utils):
+axR.plot(gaps, utils, "-o", c=COOL, lw=2.2)
+for mu, gx, uy in zip(mus, gaps, utils):
     axR.annotate(f"μ={mu:g}", (gx, uy), textcoords="offset points",
                  xytext=(6, 5), fontsize=9, color=INK)
 axR.set_xlabel("|group gap|  →  less fair")
@@ -151,23 +432,20 @@ plt.show()
 
 ::: {.callout-tip}
 ## The Deliverable
-Report the *operating point*, not a single model: "at μ = … we cut the group gap
-from … to …, keeping … of baseline utility."  Here the gap falls to near zero —
-below even the +0.05 left by *naively dropping* `sex` — while utility drops only a
-couple of percent.  Neutralising the outcome beats whacking proxies: the choice of
-μ is a policy decision, and the maths only gives you the frontier.
+Report the *operating point* — the one chosen setting — not a single model: "at
+$\mu = 8$ we cut the group gap from $+0.105$ to $\approx 0.004$ — $96\%$ of it
+removed — at a $\sim 2\%$ accuracy cost."  The gap falls well below what *simply
+dropping* `sex` left behind, while utility barely moves — because, as Rung 2
+showed, the leak is spread across many proxies and curves, so **neutralizing the
+outcome beats chasing down proxies one at a time**.  Which $\mu$ to pick is a
+policy decision; the maths only hands you the menu of fairness-vs-accuracy
+trade-offs to choose from.
 :::
 
----
-
-## Your Turn
-
-- Add a hard-threshold view: approve where `score >= 0.5`, and tabulate approval
-  and false-decline rates per group at μ = 0 vs μ = 8.
-- Which channel leaks most?  Drop the `occupation` one-hot and re-fit the baseline
-  — the gap shrinks but does **not** vanish (hours-worked still carries some sex).
-  The leak is distributed, which is why neutralising the *outcome* beats whacking
-  proxies one by one.
-
-Next: the same operation, other name — [Job C,
+That is the neutralized scorecard, climbed from a toy whose gap we built in, to a
+stylized market where dropping the straight-line effect failed, to the real
+ACSIncome table — one routine the whole way up, only the data getting harder.
+The same operation shows up under another name in finance: removing a portfolio's
+exposure to the overall market (its market *beta* — how much it moves with the
+market) instead of a person's protected attribute.  That is [Job C ·
 beta-neutrality](lab-jobC-beta-neutral.qmd).

@@ -1,0 +1,579 @@
+---
+title: "A Probabilistic Neural Network Recipe"
+subtitle: "Make the net output a distribution, not a point"
+---
+
+```{python}
+#| echo: false
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
+from lectures import plotting, datasets
+from lectures.plotting import INK, COOL, WARM, CRASH, BAND, despine, annotate_box  # noqa: F401
+plotting.set_style("notes")
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import einx                      # linear algebra with the axes spelled out
+from jaxtyping import Float      # shape annotations: Float[Array, "n_obs"]
+
+Array = np.ndarray
+GREEN = plotting.PALETTE["green"]
+```
+
+```{python}
+#| echo: false
+import os
+os.environ["KERAS_BACKEND"] = "jax"          # set BEFORE importing keras — Keras 3 on the CPU JAX backend
+import keras
+from keras import layers
+import keras.ops as ops
+```
+
+A trained network hands you one number: $\hat y = f(x)$.  It is silent about
+everything it does not know — how noisy the world is right here, and whether
+it has ever seen data shaped like this $x$ at all.  This note turns that one
+number into a **predictive distribution**: a center *and* a width, fitted by
+the network itself.  Everything below is one move applied four ways — change
+what the network's extra outputs mean and what loss reads them — and then a
+committee on top for the doubt a single net cannot see.
+
+**What this gives you:** a recipe to make any regression network report an
+honest band — $\mu(x)$ plus the noise it predicts $\sigma(x)$ plus the
+ignorance a committee confesses — and a card telling you which head to reach
+for when.
+
+## Two Doubts, One Predictive Variance
+
+A point prediction collapses two genuinely different uncertainties into
+nothing.  Pull them apart:
+
+- **Aleatoric** — *how noisy is the world here?*  Irreducible scatter in the
+  data: more data will **not** shrink it.  The response is to **predict it** —
+  a network can output its own noise level $\sigma(x)$, large where the data
+  is loud, small where it is calm.
+- **Epistemic** — *has the model even seen data here?*  The model's own
+  ignorance: large where data is sparse, and it **shrinks** as data grows.  A
+  single network cannot see this — it cannot grade its own homework — so we
+  ask a committee.
+
+They are independent sources of variance, so they add, and the honest band is
+built from their sum:
+
+$$
+\sigma_{\text{total}}^2(x) =
+\underbrace{\sigma_{\text{aleatoric}}^2(x)}_{\text{the world's noise}} +
+\underbrace{\sigma_{\text{epistemic}}^2(x)}_{\text{the model's doubt}} ,
+\qquad
+\text{band} = \mu(x) \pm 2\,\sigma_{\text{total}}(x) .
+$$
+
+The litmus test that tells them apart: **would more data shrink it?**  Yes →
+epistemic.  No → aleatoric.  The three recipes below build $\mu$ and
+$\sigma_{\text{aleatoric}}$; the ensemble builds $\sigma_{\text{epistemic}}$;
+the last step adds them.
+
+Every network is the same small multilayer perceptron — only the number of
+outputs and the loss change:
+
+```{python}
+#| label: toolkit
+def make_mlp(n_out: int = 1, seed: int = 0) -> keras.Model:
+    """x → Dense(48, tanh) → Dense(48, tanh) → Dense(n_out) — the recipe's net."""
+    keras.utils.set_random_seed(seed)            # reproducible weight init
+    return keras.Sequential([
+        layers.Dense(48, activation="tanh"),
+        layers.Dense(48, activation="tanh"),
+        layers.Dense(n_out),
+    ])
+```
+
+## Recipe 1 — The Gaussian Head
+
+Give the network **two outputs per input** instead of one: the mean $\mu(x)$
+and the log-variance $\log\sigma^2(x)$.  Predicting $\log\sigma^2$ rather than
+$\sigma^2$ keeps the variance positive for free — $\sigma^2 = e^{\log\sigma^2}$
+is positive whatever the layer emits.  The model it fits is
+
+$$
+y = \mu(x) + \sigma(x)\,\varepsilon, \qquad \varepsilon \sim \mathcal N(0, 1).
+$$
+
+The loss is the **Gaussian negative log-likelihood** — minimizing
+$-\log\mathcal N(y; \mu, \sigma^2)$ over the data:
+
+```{python}
+#| label: gaussian-nll
+def gaussian_nll(y_true, y_pred):
+    """−log 𝒩(y; μ, σ²) up to a constant,  head = [μ, log σ²].
+
+    L = ½·(log σ² + (y−μ)²/σ²).  A big error is forgiven where the net declares
+    σ² large — but declaring σ² large everywhere is taxed by the log σ² term, so
+    the doubt lands where the noise actually lives.  The loss *is* the noise model.
+    """
+    mu = y_pred[:, :1]                           # μ(x)            [y units]
+    log_var = y_pred[:, 1:2]                      # log σ²(x)       [log y² units]
+
+    nll = 0.5 * (log_var + (y_true - mu) ** 2 / ops.exp(log_var))
+
+    return ops.mean(nll)
+```
+
+Train it on `datasets.heteroscedastic_noise()`, whose true noise $\sigma(x)$
+*ramps* from quiet on the left to loud on the right — the structure real
+volatility has.  A single global error bar is wrong everywhere on this data;
+the Gaussian head should learn the ramp.
+
+```{python}
+#| label: gaussian-fit
+xr: Float[Array, "n"]
+yr: Float[Array, "n"]
+xr, yr = datasets.heteroscedastic_noise(n=250, seed=0)   # y = sin(1.3·x) + σ(x)·ε, σ(x) ramps up
+
+order: Float[Array, "n"] = np.argsort(xr)
+xr, yr = xr[order], yr[order]
+
+sigma_true: Float[Array, "n"] = 0.05 + 0.45 * (xr + 3.0) / 6.0   # the generator's true σ(x), for reference
+
+gauss_net = make_mlp(n_out=2, seed=2)
+gauss_net.compile(optimizer=keras.optimizers.Adam(0.01), loss=gaussian_nll)
+gauss_net.fit(xr[:, None], yr[:, None], epochs=150, batch_size=64, verbose=0)
+
+pred_g: Float[Array, "n two"] = gauss_net.predict(xr[:, None], verbose=0)
+mu_g: Float[Array, "n"] = pred_g[:, 0]                          # μ(x)
+sigma_g: Float[Array, "n"] = np.exp(0.5 * pred_g[:, 1])         # σ(x) = exp(½·log σ²)
+
+cover_g = np.mean(np.abs(yr - mu_g) <= 2 * sigma_g)            # fraction inside μ ± 2σ
+print(f"predicted σ(x): {sigma_g.min():.2f} (calm left) .. {sigma_g.max():.2f} (loud right)")
+print(f"true      σ(x): {sigma_true.min():.2f} .. {sigma_true.max():.2f}")
+print(f"μ ± 2σ coverage: {cover_g:.2f}   (nominal ≈ 0.95)")
+```
+
+```{python}
+#| label: fig-gaussian-head
+#| fig-cap: "The Gaussian head on ramping noise. The blue band is μ(x) ± 2σ̂(x), the net's own predicted noise; the dashed red lines are the generator's true ±2σ(x). The band breathes — a thin ribbon on the calm left, fanning wide on the loud right — and σ̂(x) tracks the true ramp closely. A single global error bar (one width for every x) could match the headline coverage but would be far too wide on the left and far too tight on the right."
+fig, ax = plt.subplots(figsize=(9.5, 3.9))
+
+ax.fill_between(xr, mu_g - 2 * sigma_g, mu_g + 2 * sigma_g,
+                color=COOL, alpha=0.30, label="predicted μ ± 2σ̂(x)")
+ax.scatter(xr, yr, s=12, c=INK, alpha=0.6, label="data")
+ax.plot(xr, mu_g, c=INK, lw=2, label="μ(x)")
+ax.plot(xr, mu_g + 2 * sigma_true, c=CRASH, lw=1.3, ls="--", label="true ±2σ(x)")
+ax.plot(xr, mu_g - 2 * sigma_true, c=CRASH, lw=1.3, ls="--")
+
+ax.set_xlabel("x")
+ax.set_ylabel("y")
+ax.set_xticks([])
+ax.set_yticks([])
+ax.legend(fontsize=9, frameon=False, loc="upper left")
+despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+The predicted $\sigma(x)$ lands on the true ramp, and coverage sits near its
+$95\%$ nominal.  This is the **default recipe** — two outputs, a Gaussian NLL,
+and the band breathes with the noise.  But the Gaussian has thin tails, and it
+pays for them.
+
+## Recipe 2 — The Student-t Head, for Fat Tails
+
+The Gaussian NLL squares the residual: a single far-out point contributes
+$(y-\mu)^2$, so one outlier *shouts*.  The fit reacts by dragging $\mu$ toward
+the outlier and inflating $\sigma$ everywhere to forgive it — exactly the
+wrong response when the rare shock is a genuine fat tail, not the typical
+scatter.  Markets are fat-tailed (the [returns
+primer](../data/02-returns-and-volatility.qmd) finds JPM days past $9\sigma$
+that a Gaussian says never happen), so this is not a corner case.
+
+The fix is to swap the likelihood for one with **heavier tails**.  Keep the
+same two outputs $[\mu, \log\sigma^2]$, but read them through a **Student-t**
+with $\nu = 4$ degrees of freedom.  Its NLL grows like $\log(1 + z^2/\nu)$
+instead of $z^2$, so a far-out point is penalized *logarithmically*, not
+quadratically — the outlier is acknowledged, never allowed to shout:
+
+```{python}
+#| label: student-nll
+NU = 4.0                                         # ν = degrees of freedom (small ⇒ heavy tails)
+
+
+def student_t_nll(y_true, y_pred):
+    """−log t_ν(y; μ, σ) up to a constant,  ν=4,  head = [μ, log σ²].
+
+    L = log σ + ½·(ν+1)·log(1 + z²/ν),  z = (y−μ)/σ.  The penalty grows like
+    log(1 + z²) — far-out points are forgiven, so a fat-tailed shock cannot drag
+    μ or inflate σ the way the squared Gaussian penalty lets it.
+    """
+    mu = y_pred[:, :1]                           # μ(x)               [y units]
+    log_sig = 0.5 * y_pred[:, 1:2]               # log σ(x) = ½·log σ²   [log y units]
+
+    z = (y_true - mu) / ops.exp(log_sig)         # standardized residual  z = (y−μ)/σ
+
+    nll = log_sig + 0.5 * (NU + 1.0) * ops.log(1.0 + z ** 2 / NU)
+
+    return ops.mean(nll)
+```
+
+Demonstrate the win on data with a genuine fat tail: take the ramping dataset
+and **inject a handful of outliers** — rare, large jumps that no $\sigma(x)$
+ramp explains — then fit both heads on the *same* contaminated data.
+
+```{python}
+#| label: outlier-fit
+rng_out = np.random.default_rng(7)
+
+x_ct: Float[Array, "n"] = xr.copy()
+y_ct: Float[Array, "n"] = yr.copy()
+
+n_out = 8                                         # number of injected outliers
+idx_out: Float[Array, "k"] = rng_out.choice(x_ct.size, size=n_out, replace=False)
+y_ct[idx_out] += rng_out.choice([-1, 1], size=n_out) * rng_out.uniform(3.0, 5.0, size=n_out)   # rare ±3..5 jumps
+
+# Recipe 1 (Gaussian) and Recipe 2 (Student-t) on the SAME contaminated data
+gauss_ct = make_mlp(n_out=2, seed=3)
+gauss_ct.compile(optimizer=keras.optimizers.Adam(0.01), loss=gaussian_nll)
+gauss_ct.fit(x_ct[:, None], y_ct[:, None], epochs=150, batch_size=64, verbose=0)
+pred_gct: Float[Array, "n two"] = gauss_ct.predict(x_ct[:, None], verbose=0)
+mu_gct: Float[Array, "n"] = pred_gct[:, 0]
+sigma_gct: Float[Array, "n"] = np.exp(0.5 * pred_gct[:, 1])
+
+stud_ct = make_mlp(n_out=2, seed=3)
+stud_ct.compile(optimizer=keras.optimizers.Adam(0.01), loss=student_t_nll)
+stud_ct.fit(x_ct[:, None], y_ct[:, None], epochs=150, batch_size=64, verbose=0)
+pred_sct: Float[Array, "n two"] = stud_ct.predict(x_ct[:, None], verbose=0)
+mu_sct: Float[Array, "n"] = pred_sct[:, 0]
+sigma_sct: Float[Array, "n"] = np.exp(0.5 * pred_sct[:, 1])   # σ scale of the t, not its std
+
+clean: Float[Array, "n"] = np.ones(x_ct.size, dtype=bool)
+clean[idx_out] = False                            # the non-outlier points, to score fit on the bulk
+
+rmse_gauss = np.sqrt(np.mean((mu_gct[clean] - yr[clean]) ** 2))   # μ error vs clean signal
+rmse_stud = np.sqrt(np.mean((mu_sct[clean] - yr[clean]) ** 2))
+
+print(f"injected {n_out} outliers of ±3..5 into the ramping data")
+print(f"mean predicted σ over the bulk — Gaussian {sigma_gct[clean].mean():.2f}  vs  Student-t {sigma_sct[clean].mean():.2f}")
+print(f"μ error vs clean signal (RMSE) — Gaussian {rmse_gauss:.3f}  vs  Student-t {rmse_stud:.3f}   ← t stays steady")
+```
+
+```{python}
+#| label: fig-student-head
+#| fig-cap: "Two heads, same contaminated data. The eight injected outliers (red) are rare ±3–5 jumps. Left — the Gaussian head squares every residual, so the outliers drag μ off the signal and inflate σ̂ everywhere, blowing the band wide even over the clean bulk. Right — the Student-t head penalizes far-out points only logarithmically; μ stays on the true signal and σ̂ keeps the ramp it should, ignoring the shocks. Same outputs, heavier likelihood, robust fit."
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(12, 3.9), sharey=True)
+
+for ax, mu_h, sigma_h, name, col in [
+    (axL, mu_gct, sigma_gct, "Recipe 1 · Gaussian head — outliers shout", CRASH),
+    (axR, mu_sct, sigma_sct, "Recipe 2 · Student-t head — outliers shrugged", COOL),
+]:
+    ax.fill_between(xr, mu_h - 2 * sigma_h, mu_h + 2 * sigma_h, color=col, alpha=0.25)
+    ax.scatter(xr[clean], y_ct[clean], s=12, c=INK, alpha=0.55, label="data")
+    ax.scatter(xr[~clean], y_ct[~clean], s=40, c=CRASH, zorder=6, label="injected outlier")
+    ax.plot(xr, mu_h, c=INK, lw=2, label="μ(x)")
+    ax.plot(xr, np.sin(1.3 * xr), c=GREEN, lw=1.3, ls="--", label="true signal")
+    ax.set_title(name, fontsize=11)
+    ax.set_xlabel("x")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    despine(ax)
+
+axL.set_ylabel("y")
+axL.legend(fontsize=8.5, frameon=False, loc="upper left")
+fig.tight_layout()
+plt.show()
+```
+
+The Gaussian head pays for its thin tails: the outliers drag $\mu$ and balloon
+$\sigma$ across the whole range.  The Student-t head, reading the same two
+outputs through a heavier law, keeps $\mu$ on the signal and its width tracking
+the real ramp.  Reach for the **t head whenever a few extreme points should
+not be allowed to rewrite the whole noise model** — which, in finance, is most
+of the time.
+
+## Recipe 3 — A Deep Ensemble, for Ignorance
+
+The two heads above predict aleatoric noise from the residuals.  Epistemic
+doubt is invisible to them: a single net trained where there is no data will
+confidently invent a curve and report a *small* $\sigma$, because nothing in
+its loss penalizes a confident guess in a region it never saw.  A network
+cannot grade its own homework — so ask a **committee**.
+
+Train $M$ copies of the same net, each on a **bootstrap resample** of the data
+and from a fresh random initialization.  Where the members **agree**, the data
+pinned them down.  Where they **fan out**, they are each guessing — that spread
+is the epistemic uncertainty.  Give each member a Gaussian head so it also
+reports its own aleatoric $\sigma$; then combine, with the law of total
+variance:
+
+$$
+\mu_{\text{tot}}(x) = \frac1M\sum_m \mu_m(x),\quad
+\underbrace{\sigma_{\text{alea}}^2 = \tfrac1M\sum_m \sigma_m^2(x)}_{\text{mean of the members' noise}},\quad
+\underbrace{\sigma_{\text{epi}}^2 = \operatorname{Var}_m \mu_m(x)}_{\text{spread of the members' means}} .
+$$
+
+Use `datasets.heteroscedastic_gap()` — a *gap* in the inputs, data on the left
+and right with nothing in the middle — so the epistemic part has somewhere
+visible to grow:
+
+```{python}
+#| label: ensemble-fit
+xg: Float[Array, "n"]
+yg: Float[Array, "n"]
+xg, yg = datasets.heteroscedastic_gap(n=80, seed=0)   # y = sin(1.3·x), data on two clusters with an empty gap
+
+x_grid: Float[Array, "g"] = np.linspace(-4.0, 4.0, 300)   # dense grid to evaluate the band on
+
+
+def train_member(seed: int) -> tuple[Float[Array, "g"], Float[Array, "g"]]:
+    """One committee member: bootstrap the data, fresh init, Gaussian head.
+
+    Returns (μ_m, σ²_m) on the grid — its mean and its predicted noise variance.
+    """
+    rng_m = np.random.default_rng(seed)
+    idx = rng_m.integers(0, xg.size, xg.size)            # resample with replacement
+
+    net = make_mlp(n_out=2, seed=seed)                   # fresh random init
+    net.compile(optimizer=keras.optimizers.Adam(0.01), loss=gaussian_nll)
+    net.fit(xg[idx][:, None], yg[idx][:, None], epochs=150, batch_size=xg.size, verbose=0)
+
+    pred: Float[Array, "g two"] = net.predict(x_grid[:, None], verbose=0)
+    return pred[:, 0], np.exp(pred[:, 1])                # μ_m(x),  σ²_m(x)
+
+
+M = 3                                                    # committee size
+members = [train_member(seed) for seed in range(M)]
+
+mu_stack: Float[Array, "m g"] = np.stack([m[0] for m in members])      # each member's μ on the grid
+var_stack: Float[Array, "m g"] = np.stack([m[1] for m in members])     # each member's σ² on the grid
+
+mu_tot: Float[Array, "g"] = einx.mean("m g -> g", mu_stack)            # μ_tot = mean_m μ_m
+var_alea: Float[Array, "g"] = einx.mean("m g -> g", var_stack)         # aleatoric = mean_m σ²_m
+var_epi: Float[Array, "g"] = einx.var("m g -> g", mu_stack)            # epistemic = Var_m μ_m
+
+sigma_epi: Float[Array, "g"] = np.sqrt(var_epi)
+
+in_data: Float[Array, "g"] = (np.abs(x_grid) > 1.0) & (np.abs(x_grid) < 3.0)   # where members saw points
+in_gap: Float[Array, "g"] = np.abs(x_grid) < 1.0                                # the empty middle
+
+print(f"epistemic σ where data exists : {sigma_epi[in_data].mean():.3f}")
+print(f"epistemic σ over the gap      : {sigma_epi[in_gap].mean():.3f}   ← wider where data is sparse")
+```
+
+```{python}
+#| label: fig-ensemble
+#| fig-cap: "Five Gaussian-head nets, each on a bootstrap resample of the gappy data. The faint lines are the members' means μ_m(x): tight agreement where data is dense (left and right clusters), fanning into a balloon over the central gap where none of them saw a point. The green band is the ensemble mean ± 2·epistemic σ — the committee correctly widens exactly where there is no data, and that widening would shrink if you filled the gap with observations. This is the doubt a single net cannot show."
+fig, ax = plt.subplots(figsize=(9.5, 3.9))
+
+for mu_m in mu_stack:
+    ax.plot(x_grid, mu_m, c=GREEN, lw=0.8, alpha=0.5)
+
+ax.fill_between(x_grid, mu_tot - 2 * sigma_epi, mu_tot + 2 * sigma_epi,
+                color=GREEN, alpha=0.22, label="μ ± 2σ_epistemic")
+ax.plot(x_grid, mu_tot, c=INK, lw=2, label="ensemble mean μ(x)")
+ax.scatter(xg, yg, s=18, c=INK, zorder=5, label="training data")
+ax.axvspan(-1.0, 1.0, color=CRASH, alpha=0.07)         # the empty gap
+
+ax.set_ylim(-2.6, 2.6)
+ax.set_xlabel("x")
+ax.set_ylabel("y")
+ax.set_xticks([])
+ax.set_yticks([])
+ax.legend(fontsize=9, frameon=False, loc="upper left")
+despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+The epistemic $\sigma$ balloons several-fold over the gap and collapses where
+data is dense — and crucially, this is the band that *would shrink with more
+data*.
+Reach for an ensemble whenever you care about **extrapolation**: the model
+being asked about an $x$ unlike anything it trained on.
+
+::: {.callout-note}
+## Cheaper Cousins of the Committee
+A deep ensemble is the bluntest committee — one `for` loop, $M$ full retrains —
+and in practice one of the best-calibrated.  Cheaper: **MC dropout** — train
+one net with dropout and leave it *on* at prediction time, so each forward pass
+is a different sub-network.  More principled: a fully **Bayesian neural
+network** with a distribution over the weights (see
+[pyrox](https://github.com/jejjohnson/pyrox)).  All three approximate the same
+object — the spread of functions the data allows — and only the ensemble needs
+nothing but the recipe you already have.
+:::
+
+## Combine — The Full Predictive Band
+
+Now put both halves on the same gappy data.  The ensemble of Gaussian heads
+already gives all three pieces: $\mu_{\text{tot}}$, the aleatoric variance
+(mean of the members' $\sigma^2$), and the epistemic variance (spread of the
+members' $\mu$).  Add them in quadrature for the total band:
+
+```{python}
+#| label: combine-band
+sigma_alea: Float[Array, "g"] = np.sqrt(var_alea)                 # aleatoric σ = √(mean_m σ²_m)
+sigma_total: Float[Array, "g"] = np.sqrt(var_alea + var_epi)      # σ_total = √(σ_alea² + σ_epi²)  [y units]
+
+print(f"over the gap : aleatoric σ {sigma_alea[in_gap].mean():.2f}  ·  epistemic σ {sigma_epi[in_gap].mean():.2f}   → epistemic dominates")
+print(f"in the data  : aleatoric σ {sigma_alea[in_data].mean():.2f}  ·  epistemic σ {sigma_epi[in_data].mean():.2f}   → aleatoric dominates")
+```
+
+```{python}
+#| label: fig-total-band
+#| fig-cap: "The full predictive band on one curve. The blue band is the aleatoric part — the mean noise the committee predicts, the irreducible scatter of the data. The green band is the total, aleatoric plus epistemic added in quadrature: it fills the blue band where data is dense, then fans out far beyond it over the gap, where the committee's disagreement takes over. Two honest ingredients, labelled where each dominates — the noise that more data will not cure (blue) and the ignorance that it would (the green excess over the gap)."
+fig, ax = plt.subplots(figsize=(10, 3.9))
+
+ax.fill_between(x_grid, mu_tot - 2 * sigma_total, mu_tot + 2 * sigma_total,
+                color=GREEN, alpha=0.22, label="total = √(aleatoric² + epistemic²)")
+ax.fill_between(x_grid, mu_tot - 2 * sigma_alea, mu_tot + 2 * sigma_alea,
+                color=COOL, alpha=0.38, label="aleatoric σ(x)")
+ax.plot(x_grid, mu_tot, c=INK, lw=2)
+ax.scatter(xg, yg, s=18, c=INK, zorder=5)
+ax.axvspan(-1.0, 1.0, color=CRASH, alpha=0.05)
+
+ax.annotate("EPISTEMIC\nno data here\n(more data would cure it)",
+            (0, 2.0), ha="center", fontsize=10, color=GREEN, fontweight="bold")
+ax.annotate("ALEATORIC\nworld noise\n(more data won't help)",
+            (-2.5, -2.1), ha="center", fontsize=10, color=COOL, fontweight="bold")
+
+ax.set_ylim(-2.9, 2.9)
+ax.set_xlabel("x")
+ax.set_ylabel("y")
+ax.set_xticks([])
+ax.set_yticks([])
+ax.legend(fontsize=9, frameon=False, loc="lower right")
+despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+The band fans out for **two distinct reasons** and the figure labels which:
+high noise (blue, where the data is loud) and sparse data (green excess, over
+the gap).  This is the deliverable — a width you can defend point by point.
+
+## A Real Example — Banding Volatility
+
+Toy data lets you check the answer by eye; now a real one.  Markets are nearly
+unpredictable in their **mean** but not in their **noise**: volatility
+*clusters*, so tomorrow's volatility is forecastable where tomorrow's return
+is not.  We **reload** the realized-volatility target the [returns &
+volatility primer](../data/02-returns-and-volatility.qmd) builds and owns — its
+21-day rolling std, annualized by $\sqrt{252}$ — and form one regression:
+predict a name's **next-window** vol from its **current** one.
+
+```{python}
+#| label: real-target
+R = datasets.load_returns()                            # prepared 14-name daily panel
+sigma_series = R["JPM"].rolling(21).std().mul(np.sqrt(252)).dropna()   # σ(t) = σ_daily·√252  (primer's target)
+
+h = 5                                                  # forecast horizon — one trading week
+x_vol: Float[Array, "n_pairs"] = sigma_series.to_numpy()[:-h]   # σ(t)
+y_vol: Float[Array, "n_pairs"] = sigma_series.to_numpy()[h:]    # σ(t+h)
+
+print(f"realized-vol target · {sigma_series.shape[0]} days  "
+      f"({sigma_series.index.min().date()} → {sigma_series.index.max().date()})")
+print(f"{x_vol.size} regression pairs (σ_t → σ_{{t+{h}}})  ·  vol {sigma_series.min():.2f} (calm) .. {sigma_series.max():.2f} (crisis)")
+```
+
+::: {.callout-note icon=false}
+## Where This Data Comes From
+The realized-volatility series is built and owned **once** in
+[Returns, Volatility & Fat Tails](../data/02-returns-and-volatility.qmd).  This
+note reloads it with the one-liner above and never re-derives it; the only
+local step is lagging it into $(\sigma_t,\ \sigma_{t+h})$ pairs so the Gaussian
+head has something to predict.
+:::
+
+The map $\sigma_t \to \sigma_{t+h}$ is **heteroscedastic by level**: a calm
+today reliably means a calm next week (narrow spread), but a turbulent today
+could go anywhere (wide spread) — *volatility of volatility grows with
+volatility*.  That is exactly the aleatoric structure the Gaussian head reads.
+Standardize the input, split $70/30$ at random so both calm and crisis days
+land in the test set, and fit **Recipe 1**:
+
+```{python}
+#| label: real-fit
+xm, xs = x_vol.mean(), x_vol.std()                     # standardize: the net trains better on 𝒪(1) inputs
+xz: Float[Array, "n_pairs"] = (x_vol - xm) / xs        # z = (σ_t − μ) / σ
+
+rng_split = np.random.default_rng(0)
+perm: Float[Array, "n_pairs"] = rng_split.permutation(x_vol.size)   # random split → both regimes in test
+cut = int(0.7 * x_vol.size)
+tr, te = perm[:cut], perm[cut:]
+
+vol_net = make_mlp(n_out=2, seed=0)
+vol_net.compile(optimizer=keras.optimizers.Adam(0.01), loss=gaussian_nll)
+vol_net.fit(xz[tr][:, None], y_vol[tr][:, None], epochs=150, batch_size=128, verbose=0)
+
+pred_v: Float[Array, "n_te two"] = vol_net.predict(xz[te][:, None], verbose=0)
+mu_v: Float[Array, "n_te"] = pred_v[:, 0]                       # forecast μ(σ_t)
+sigma_v: Float[Array, "n_te"] = np.exp(0.5 * pred_v[:, 1])      # predicted σ(σ_t)
+
+y_te: Float[Array, "n_te"] = y_vol[te]
+vol_te: Float[Array, "n_te"] = x_vol[te]                        # un-standardized input level, for plotting
+
+calm: Float[Array, "n_te"] = vol_te <= np.median(vol_te)
+print(f"test set: {te.size} days  ·  realized vol {y_te.min():.2f} .. {y_te.max():.2f}")
+print(f"predicted aleatoric σ: {sigma_v[calm].mean():.2f} (calm days) .. {sigma_v[~calm].mean():.2f} (turbulent)   ← σ(x) breathes with the regime")
+```
+
+A $90\%$ band is only worth the name if $\approx 90\%$ of realized values land
+inside it.  Check that promise directly on the held-out test set:
+
+```{python}
+#| label: coverage-check
+from scipy.stats import norm
+
+nominal = 0.90                                          # the interval we want to sell
+z90 = norm.ppf(0.5 + nominal / 2)                      # z = Φ⁻¹(0.5 + p/2) ≈ 1.645 for a 90% band
+
+inside: Float[Array, "n_te"] = np.abs(y_te - mu_v) <= z90 * sigma_v   # |y − μ| ≤ z·σ → covered?
+cover_emp = inside.mean()
+
+print(f"nominal coverage   : {nominal:.0%}")
+print(f"empirical coverage : {cover_emp:.0%}   ({'within tolerance — band keeps its promise' if abs(cover_emp - nominal) < 0.05 else 'off — would rescale (see the lab)'})")
+```
+
+```{python}
+#| label: fig-real-band
+#| fig-cap: "The Gaussian-head recipe on real volatility forecasting, test set only, drawn against today's vol level σ_t. The shaded band is μ ± z·σ̂ for a 90% interval; it is a thin ribbon over calm days and fans out wide over turbulent ones — the volatility-of-volatility effect, learned from data. Ink dots are covered, red dots are the ~10% a 90% band is allowed to miss, and they sit across all vol levels rather than piling up in the turbulent regime — the band widened where it had to, so it fails evenly. Empirical coverage is printed against its 90% target above."
+o: Float[Array, "n_te"] = np.argsort(vol_te)           # sort test points by input vol level
+
+fig, ax = plt.subplots(figsize=(9.5, 3.9))
+
+ax.fill_between(vol_te[o], (mu_v - z90 * sigma_v)[o], (mu_v + z90 * sigma_v)[o],
+                color=BAND, alpha=0.55, label=f"predicted {nominal:.0%} band")
+ax.scatter(vol_te[inside], y_te[inside], s=14, c=INK, zorder=5, label="covered")
+ax.scatter(vol_te[~inside], y_te[~inside], s=28, c=CRASH, zorder=6,
+           label=f"missed ({(~inside).mean():.0%})")
+ax.plot(vol_te[o], mu_v[o], c=CRASH, lw=1.3, label="forecast μ")
+
+ax.set_xlabel("today's vol  σ(t)")
+ax.set_ylabel("next-week vol  σ(t+h)")
+ax.set_title(f"Volatility band — empirical coverage {cover_emp:.0%} vs {nominal:.0%} nominal", fontsize=11.5)
+ax.legend(fontsize=8.5, frameon=False, loc="upper left")
+despine(ax)
+fig.tight_layout()
+plt.show()
+```
+
+The same two-output recipe that breathed over a toy ramp now reads real market
+regimes: a thin band on calm days, a wide one on turbulent days, with coverage
+landing near its $90\%$ target.  When the raw band is slightly mis-sized, one
+global rescale snaps it onto the label — the calibration step the
+[predictive-bands lab](labs/lab-tool3-bands.qmd) carries out in full.
+
+## The Recipe Card
+
+| Head / likelihood | Outputs | What it captures | Reach for it when |
+|---|---|---|---|
+| **Gaussian NLL** | $[\mu,\ \log\sigma^2]$ | aleatoric noise $\sigma(x)$ | the **default** — heteroscedastic noise, well-behaved residuals |
+| **Student-t NLL** ($\nu{=}4$) | $[\mu,\ \log\sigma^2]$ | aleatoric noise, **robustly** | **fat tails / outliers** — a few extremes must not rewrite the fit |
+| **Deep ensemble** | $M$ nets, each a head | epistemic $\sigma$ (member spread) | **extrapolation** — $x$ unlike the training data |
+| **Combine** | ensemble of heads | aleatoric **+** epistemic | the **full honest band** — both doubts at once |
+
+Read it top to bottom as escalation: a Gaussian head is the default; swap to a
+Student-t head when the tails are fat; wrap either in an ensemble when the
+model may be asked to extrapolate; combine for the complete band, with each
+ingredient dominating where it should.
+
+The hands-on [predictive-bands lab](labs/lab-tool3-bands.qmd) climbs this same
+recipe one rung at a time and ends with a coverage-calibrated interval on real
+volatility — the deliverable this note's last figure previewed.

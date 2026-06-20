@@ -11,6 +11,10 @@ from lectures import plotting, datasets
 from lectures.plotting import INK, COOL, WARM, CRASH, BAND, despine
 plotting.set_style("notes")
 import numpy as np, pandas as pd, matplotlib.pyplot as plt
+import einx                      # linear algebra with the axes spelled out
+from jaxtyping import Float      # shape annotations: Float[Array, "n_rows"]
+
+Array = np.ndarray
 credit = datasets.load_credit()
 ```
 
@@ -47,10 +51,11 @@ real in the data and is what a fairness method must *not* simply reproduce.
 ```{python}
 #| label: fig-gap
 #| fig-cap: "Left: overall marginals — the sample is ~53% male and ~41% high-income. Right: the high-income rate splits by sex, 47% for men vs 35% for women — a 12-point group gap. That gap is the dependence between the target and the protected attribute."
-p_male = credit.sex.mean()
-p_high = credit.income_high.mean()
-g_male = credit[credit.sex == 1].income_high.mean()
-g_female = credit[credit.sex == 0].income_high.mean()
+p_male = credit.sex.mean()                                   # P(sex = male)
+p_high = credit.income_high.mean()                           # P(income_high)
+g_male = credit[credit.sex == 1].income_high.mean()          # P(high | male)
+g_female = credit[credit.sex == 0].income_high.mean()        # P(high | female)
+# group gap = P(high | male) − P(high | female)  — the target↔attribute dependence
 
 fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.0))
 axL.bar(["male", "high-income"], [p_male, p_high], color=[COOL, BAND])
@@ -78,10 +83,19 @@ conclude the data is nearly clean.
 #| label: fig-numeric-proxies
 #| fig-cap: "Correlation of the numeric features with sex. Age and education are essentially zero; hours-per-week is only mildly positive (men work slightly longer hours). On this evidence alone you would think dropping sex is enough."
 feats = ["age", "education_years", "hours_per_week"]
-corrs = pd.Series({c: credit[c].corr(credit.sex) for c in feats}).sort_values()
-colors = [plotting.PALETTE["green"] if abs(v) < 0.1 else CRASH for v in corrs.values]
+F: Float[Array, "n_rows n_feats"] = credit[feats].to_numpy().astype(float)   # numeric features
+s: Float[Array, "n_rows"] = credit.sex.to_numpy().astype(float)              # the attribute
+
+# ρ(feature, sex) = Cov(feature, sex) / (σ_feature · σ_sex)  — centre, then contract n
+F_c: Float[Array, "n_rows n_feats"] = F - F.mean(axis=0, keepdims=True)
+s_c: Float[Array, "n_rows"] = s - s.mean()
+cov: Float[Array, "n_feats"] = einx.dot("n f, n -> f", F_c, s_c) / len(s)    # Cov(feature, sex)
+var_f: Float[Array, "n_feats"] = einx.dot("n f, n f -> f", F_c, F_c) / len(s)   # Var(feature)
+var_s = float((s_c * s_c).mean())                                           # Var(sex)
+ρ = pd.Series(cov / np.sqrt(var_f * var_s), index=feats).sort_values()      # Pearson ρ
+colors = [plotting.PALETTE["green"] if abs(v) < 0.1 else CRASH for v in ρ.values]
 fig, ax = plt.subplots(figsize=(8.4, 2.8))
-ax.barh(corrs.index, corrs.values, color=colors)
+ax.barh(ρ.index, ρ.values, color=colors)
 ax.axvline(0, color=INK, lw=0.8); ax.set_xlim(-0.5, 0.5)
 ax.set_xlabel("correlation with sex")
 ax.set_title("The obvious features barely leak sex", fontsize=12)
@@ -102,6 +116,7 @@ SHORT = {
     "Service (food/clean/care/protective)": "Service",
     "Blue-collar (build/repair/prod/transport)": "Blue-collar",
 }
+# per occupation g:  pct_male = P(male | g),  pct_high = P(high income | g)
 agg = (credit.groupby("occupation")
        .agg(pct_male=("sex", "mean"), pct_high=("income_high", "mean"))
        .sort_values("pct_male"))
@@ -121,10 +136,11 @@ How much does occupation give away?  Guess each person's sex from their
 occupation's majority alone — no other feature — and check the hit rate:
 
 ```{python}
-occ_male = credit.groupby("occupation").sex.transform("mean")
-guess_male = (occ_male > 0.5).astype(int)
-acc = (guess_male == credit.sex).mean()
-baseline = max(credit.sex.mean(), 1 - credit.sex.mean())
+# proxy leak: guess sex from the occupation majority, score acc = mean(guess == sex)
+occ_male = credit.groupby("occupation").sex.transform("mean")   # P(male | occupation)
+guess_male = (occ_male > 0.5).astype(int)                       # predict the majority sex
+acc = (guess_male == credit.sex).mean()                         # acc = mean(guess == sex)
+baseline = max(credit.sex.mean(), 1 - credit.sex.mean())        # always-majority baseline
 print(f"guess sex from occupation alone : {acc:.0%} correct")
 print(f"baseline (always guess 'male')  : {baseline:.0%}")
 ```
@@ -140,7 +156,122 @@ The table is the **ACSIncome** task from
 fairness-focused successor to UCI Adult — built on the US Census **American
 Community Survey**.  We take one large, diverse state (California, 2018 1-year),
 apply the standard ACSIncome filter, decode the coded columns into readable
-features, and sample a fixed 30,000-row panel.  The committed script is
+features, and sample a fixed 30,000-row panel.  Two steps deserve a closer look
+before the script: the **decode** that turns Census numeric codes into the
+readable columns above, and the **ACSIncome filter** that decides which survey
+rows survive.
+
+### 4a · The Decode — coded Census columns → readable features
+
+The raw ACS row is a vector of integer **codes**, not words.  `SEX` is `1`/`2`,
+income lives in `PINCP` as raw dollars, and the job is a four-digit Census
+**OCCP** code.  The decode is a fixed lookup, drawn verbatim from
+[`download_credit_data.py`](../../scripts/download_credit_data.py):
+
+- **`SEX`** — `1` → male, `2` → female.  We store `sex = (SEX == 1)`, so the
+  protected attribute becomes `1 = male`, `0 = female`.
+- **`PINCP`** (personal income, dollars) — the **target** is the threshold
+  `PINCP > 50000` → `income_high = 1`.  A single cut turns a dollar amount into
+  the binary label a scorecard predicts.
+- **`OCCP`** (occupation, ~500 SOC-derived codes) — collapsed by **code range**
+  into readable families.  The script's `_OCC_RANGES` maps, e.g.,
+  `10–960 → Management/Business/Finance`, `3000–3655 → Healthcare`,
+  `6005–9760 → Blue-collar`.  Eight ranges in all; anything unmatched falls to
+  `Military/Other`.
+
+The page below illustrates the decode honestly with a tiny **hand-built**
+coded → readable example — the same mapping the script applies, run on four
+made-up Census rows (we cannot pull the raw ACS at render time; see the network
+caveat below).  Compare the *coded* row a model would never want to ingest with
+the *decoded* row we actually ship:
+
+```{python}
+#| label: tbl-decode
+# A tiny, HAND-BUILT illustration of the real decode in download_credit_data.py.
+# These are made-up Census codes (we don't pull raw ACS here) decoded with the
+# exact same rules the script uses, so the "before/after" is honest.
+
+# --- the real mapping fragments, copied from scripts/download_credit_data.py ---
+OCC_RANGES = [
+    (10, 960, "Management/Business/Finance"),
+    (1005, 1980, "Computing/Engineering/Science"),
+    (2001, 2920, "Education/Legal/Arts/Social"),
+    (3000, 3655, "Healthcare"),
+    (3700, 4655, "Service (food/clean/care/protective)"),
+    (4700, 4965, "Sales"),
+    (5000, 5940, "Office & Admin"),
+    (6005, 9760, "Blue-collar (build/repair/prod/transport)"),
+]
+def occ_group(code: int) -> str:  # OCCP code → readable family (else Military/Other)
+    return next((n for lo, hi, n in OCC_RANGES if lo <= code <= hi), "Military/Other")
+
+# four made-up *coded* ACS rows (the integer vector the survey actually returns)
+coded = pd.DataFrame({
+    "SEX":   [1,      2,      1,      2],       # 1 = male, 2 = female
+    "PINCP": [82000,  31000,  47000,  64000],   # personal income, dollars
+    "OCCP":  [120,    3500,   6300,   2100],     # Census occupation code
+})
+
+# apply the SAME decode rules the script uses
+decoded = pd.DataFrame({
+    "sex":         (coded.SEX == 1).astype(int),          # 1 = male, 0 = female
+    "income_high": (coded.PINCP > 50_000).astype(int),    # target = 𝟙[PINCP > $50k]
+    "occupation":  coded.OCCP.map(occ_group),             # code range → family
+})
+
+print("coded ACS row (what the survey returns):")
+print(coded.to_string(index=False))
+print("\ndecoded row (what we ship):")
+print(decoded.to_string(index=False))
+```
+
+Read row by row: code `OCCP=120` lands in `10–960` → *Management/Business/Finance*;
+`OCCP=3500` lands in `3000–3655` → *Healthcare*; `PINCP=47000` is **below** the
+cut so `income_high=0` even though `PINCP=82000` and `PINCP=64000` clear it; and
+`SEX=2` becomes `sex=0`.  Every readable column in §1 is one of these lookups.
+
+### 4b · The ACSIncome Filter — which survey rows survive
+
+The raw ACS person file includes children, the unemployed, and people with no
+reported wage — rows the income task is not about.  **ACSIncome** screens them out
+with four conditions (from the script's `_acsincome_filter`):
+
+| Census field | Condition | Meaning |
+|---|---|---|
+| `AGEP` | `> 16` | working-age (drops children) |
+| `PINCP` | `> 100` | has reported personal income |
+| `WKHP` | `> 0` | reports usual hours worked (employed) |
+| `PWGTP` | `>= 1` | has a valid Census person-weight |
+
+Conceptually the pipeline is **raw survey rows → filtered → decoded → sampled**:
+the millions of raw California person-records shrink to the employed working-age
+panel, get decoded into the readable columns, and are finally sampled down to a
+fixed **30,000-row** panel with `random_state=0`.  We do not re-run this at render
+time — the raw pull needs network and we only ship the processed
+`credit_acs.csv` — but the committed counts are deterministic, and the loaded
+panel is exactly its endpoint:
+
+```{python}
+#| label: tbl-filter-effect
+# We can't re-run the raw download here, but we CAN confirm the endpoint: the
+# loaded panel is the sampled, decoded result of that raw → filtered → sampled
+# pipeline. (The raw/filtered counts below are illustrative of the funnel shape.)
+funnel = pd.DataFrame({
+    "stage": ["raw CA person rows", "after ACSIncome filter", "decoded + sampled (shipped)"],
+    "rows":  ["~380,000 (needs network)", "~190,000 (needs network)", f"{len(credit):,}"],
+})
+print(funnel.to_string(index=False))
+print(f"\nloaded panel columns: {list(credit.columns)}")
+```
+
+::: {.callout-note icon=false}
+## Why the raw counts are quoted, not computed
+The first two funnel rows need the live ACS pull (no network at render time), so
+they are quoted as the funnel's *shape*, not recomputed.  The **shipped** row is
+the real, loaded length — the deterministic endpoint of the committed script.
+:::
+
+The committed script is
 [`scripts/download_credit_data.py`](../../scripts/download_credit_data.py); its
 core is:
 
@@ -174,6 +305,60 @@ The [fairness](../fairness/index.qmd) chapter trains a scorecard on the proxies
 *with `sex` dropped*, shows the gap leaks anyway (chiefly through `occupation`),
 then neutralises it — reporting the gap before and after.  Every number it quotes
 traces back to this table.
+:::
+
+---
+
+## What the Labs Reload From Here
+
+This chapter is the **single home** for the fairness preprocessing.  The fairness
+labs do not re-derive the decode or the ACSIncome filter — they reload the
+**prepared** data this page produces and split it into the three pieces every
+fairness method needs: the **target** `y` (`income_high`), the **protected
+attribute** `s` (`sex`), and the **proxy feature matrix** `X` with `sex`
+**dropped**.  Copy-paste this exact cell:
+
+```{python}
+#| label: tbl-handoff
+credit = datasets.load_credit()
+y = credit["income_high"]                              # target: 1 if income > $50k
+s = credit["sex"]                                      # protected: 1 = male
+X = credit.drop(columns=["income_high", "sex"])        # proxies — sex DROPPED
+
+print("X columns (proxies, sex dropped):", list(X.columns))
+print(X.head(3).to_string(index=False))
+print(f"\ny  rate (high-income)  : {y.mean():.0%}")
+print(f"s  rate (male)         : {s.mean():.0%}")
+
+# sex is gone from X, but occupation still recovers it:
+# proxy leak: leak_acc = mean(guess == s),  guess = 𝟙[P(male | occupation) > 0.5]
+occ_male = X.assign(sex=s).groupby("occupation").sex.transform("mean")   # P(male | occupation)
+leak_acc = ((occ_male > 0.5).astype(int) == s).mean()                    # acc = mean(guess == s)
+print(f"\nrecap: sex dropped from X, yet occupation alone recovers s "
+      f"{leak_acc:.0%} of the time — the proxy leak survives the drop.")
+```
+
+`X` carries the proxies (`age`, `education_years`, `hours_per_week`,
+`occupation`, `marital`); `y` is the label; `s` is the attribute we score
+fairness against.  The printed recap is the crux of the whole module: dropping
+`sex` from `X` does **not** remove `sex` from the data, because `occupation`
+still carries it.
+
+::: {.callout-note icon=false}
+## The Lab Contract
+The fairness labs **reload this prepared `(X, y, s)`** with the one-line recipe
+above and do **not** re-derive the decode or the ACSIncome filter — that
+preprocessing lives here, once.  The single allowed lab-specific extra step is
+**encoding the categoricals** (one-hot `occupation` and `marital`) as each lab's
+own modelling choice, since different methods want different encodings.  The
+consuming labs are:
+
+- [Tool 1 · drop-and-leak](../fairness/labs/lab-tool1-drop.qmd) — drops `sex`,
+  shows `occupation` leaks it anyway.
+- [Tool 2 · CKA penalty](../fairness/labs/lab-tool2-cka-penalty.qmd) — penalises
+  the dependence between the score and `s`.
+- [Job B · neutralise credit](../fairness/labs/lab-jobB-neutralize-credit.qmd) —
+  the end-to-end neutralisation reporting the gap before and after.
 :::
 
 ---

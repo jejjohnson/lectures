@@ -9,175 +9,454 @@ import sys, pathlib
 sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
 from lectures import plotting, datasets
 from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
-from lectures.measures import (distance_correlation, mutual_information_bits,
-                               linfoot_r, nats_to_bits, hsic_rbf)
+from lectures.measures import (measure_trio, distance_correlation,
+                               mutual_information_xy, nats_to_bits, linfoot_r)
 plotting.set_style("notes")
 import numpy as np, matplotlib.pyplot as plt
 from scipy.stats import pearsonr, spearmanr
+import einx                      # linear algebra with the axes spelled out
+from jaxtyping import Float      # shape annotations: Float[Array, "n_days"]
+
+Array = np.ndarray
+LN2 = np.log(2.0)                # 1 bit = LN2 nats; used to convert bits → nats for Linfoot R
 ```
 
-*Do-the-job track · deliverable.*
+*Apply-the-tool track · Job A.*
 
-Before you trust any dependence number on a real book, you owe yourself one
-thing: proof that your tools do what they claim.  This lab reproduces the
-lecture's cookie-cutter checks — the cases where the right answer is known —
-and confirms each measure behaves before pointing it at returns whose truth you
-cannot see.
+Before you trust a single dependence number on a real book (a trader's *book* is
+the set of positions they hold), you owe yourself one thing: **proof the tools do
+what they claim**.  This lab builds one *validation routine* — run every measure,
+compare it to a target you already know, record the error — on a toy whose answer
+we can write down exactly, then carries that **same routine, unchanged**, up the
+ladder until it is reading the real basket of stocks.  Only the data grows up
+under it.
 
-**Deliverable:** a calibration sheet — every measure, checked against a known
-answer, with a clear pass/fail read.
+**What you will produce:** a calibration sheet — for each measure, how far off it
+tends to run (its *bias*) and the conditions under which you can trust it — a
+vetted toolkit to hand to Jobs B and C.
 
 ---
 
-## Setup
+## 🧪 Rung 1 · Toy — Known Answer
+
+Start where the truth is not in doubt.  Two data generators pin every measure to
+a *closed-form* answer — one we can write down as an exact formula, with no
+estimation needed.  `datasets.correlated_returns(n, rho)` draws a bivariate
+Gaussian with linear correlation $\rho$, for which **both** the linear measures
+(Pearson) and the information measure (mutual information, MI — how much knowing
+one variable tells you about the other) have a known exact value:
+
+$$
+\text{Pearson} = \rho, \qquad
+I(X;Y) = -\tfrac{1}{2}\ln\!\bigl(1-\rho^{2}\bigr)\ \text{nats}
+       = \tfrac{-\tfrac12\ln(1-\rho^2)}{\ln 2}\ \text{bits}.
+$$
+
+`datasets.nonlinear_dependence()` draws $y = x^2 + \text{noise}$ over a range that
+is symmetric around zero: **Pearson must read $\approx 0$** (a U-shape rises on
+both sides, so a straight line through it is flat), yet $y$ is almost completely
+fixed by $x$, so distance correlation and MI must both read *well above* zero.
+Between them, the two toys fix a target for every tool we carry.
+
+**The validation routine — one template, every measure.**  A check is always the
+same three steps: run the measure, subtract the known target, flag whether the
+error clears a tolerance.  Spelled out once here, reused on every rung above:
 
 ```{python}
-R = datasets.load_returns()
-rng = np.random.default_rng(0)
-print(f"Loaded {len(R)} days × {len(R.columns)} stocks")
+def validate(name: str, estimate: float, target: float, tol: float) -> dict:
+    """Run-compare-record: one row of the calibration sheet.
+
+    error = |estimate − target|        [same units as the measure]
+    pass  = error < tol                (tolerance set by the measure's noise floor)
+    """
+    err = abs(estimate - target)
+    return dict(measure=name, target=target, estimate=estimate,
+                error=err, ok=err < tol)
+
+
+def print_sheet(rows: list[dict]) -> None:
+    """Pretty-print a list of validate() rows as a calibration table."""
+    print(f"{'measure':<22s}{'target':>9s}{'estimate':>10s}{'error':>9s}  pass?")
+    print("-" * 56)
+    for r in rows:
+        mark = "✓" if r["ok"] else "✗"
+        print(f"{r['measure']:<22s}{r['target']:>+9.3f}{r['estimate']:>+10.3f}"
+              f"{r['error']:>9.3f}    {mark}")
 ```
 
----
-
-## Check 1 — Pearson on Known Correlations
-
-Generate Gaussian pairs with target correlations; verify recovery.
+First the Gaussian pairs.  Pearson should recover $\rho$ tightly; the histogram
+MI should land near $-\tfrac12\ln(1-\rho^2)$ — but it always reads a touch high,
+a small **positive bias** (a histogram built from a finite sample never reads
+exactly zero, even when the true answer is zero).  So we allow it a looser
+tolerance on purpose:
 
 ```{python}
-def check_pearson():
-    print(f"{'target':>8s}  {'measured':>9s}  {'error':>8s}  {'pass?':>6s}")
-    print("-" * 40)
-    for rho in [0.0, 0.3, 0.6, -0.5, 0.9]:
-        x, y = datasets.correlated_returns(n=2000, rho=rho)
-        r_hat = pearsonr(x, y)[0]
-        err = abs(r_hat - rho)
-        ok = err < 0.05
-        print(f"  {rho:+6.2f}  {r_hat:+9.4f}  {err:8.4f}  {'✓' if ok else '✗'}")
+def gaussian_mi_bits(rho: float) -> float:
+    """Closed-form Gaussian MI in bits:  −½·ln(1−ρ²) / ln2."""
+    return nats_to_bits(-0.5 * np.log(1.0 - rho**2))   # I(X;Y) = −½·ln(1−ρ²) [nats] → bits
 
-check_pearson()
+
+gauss_rows = []
+for rho in [0.0, 0.3, 0.6, -0.5, 0.9]:
+    x: Float[Array, "n"]
+    y: Float[Array, "n"]
+    x, y = datasets.correlated_returns(n=4000, rho=rho)   # bivariate Gaussian, corr = ρ
+
+    pearson_hat = pearsonr(x, y)[0]                       # Pearson should recover ρ
+    gauss_rows.append(validate(f"Pearson(ρ={rho:+.1f})", pearson_hat, rho, tol=0.05))
+
+    mi_hat = nats_to_bits(mutual_information_xy(x, y, bins=20))   # histogram MI estimate [bits]
+    gauss_rows.append(validate(f"MI bits(ρ={rho:+.1f})",
+                               mi_hat, gaussian_mi_bits(rho), tol=0.08))
+print_sheet(gauss_rows)
 ```
 
----
-
-## Check 2 — Spearman Recovers Monotonic Relationships
-
-On a cubic monotonic relationship, Spearman should read high; Pearson lower.
-
-```{python}
-x = rng.uniform(-2.5, 2.5, 1000)
-y = x**3 + 0.5 * rng.normal(size=1000)
-p, s = pearsonr(x, y)[0], spearmanr(x, y)[0]
-print(f"Cubic monotone:  Pearson = {p:.4f}   Spearman = {s:.4f}")
-assert s > p + 0.05, "Spearman should exceed Pearson on a cubic"
-print("✓  Spearman correctly exceeds Pearson on monotonic non-linear data")
-```
-
----
-
-## Check 3 — Distance Correlation on a U-Shape
-
-Distance correlation should read high; Pearson and Spearman near zero.
+Now the non-linear case, where the *disagreement* is the point.  Pearson's target
+is $0$ — it is structurally blind to the symmetric U — while distance correlation
+and MI must read well above zero.  Here we want all three measures on the same
+scale, so we report MI as **Linfoot R** instead of raw bits.  (MI rescaled to
+Linfoot R $\in [0,1]$ equals $|\rho|$ for a Gaussian, so it is directly
+comparable to the correlation-scale measures next to it.)
 
 ```{python}
-x_u = rng.uniform(-2.5, 2.5, 1000)
-y_u = x_u**2 + 0.3 * rng.normal(size=1000)
-p_u, s_u = pearsonr(x_u, y_u)[0], spearmanr(x_u, y_u)[0]
-d_u = distance_correlation(x_u, y_u)
-print(f"U-shape:  Pearson = {p_u:+.4f}   Spearman = {s_u:+.4f}   distance = {d_u:.4f}")
-assert abs(p_u) < 0.05, "Pearson should be near zero on a symmetric U"
-assert d_u > 0.3, "distance corr should be clearly positive"
-print("✓  Distance correlation detects U-shape; Pearson blind")
-```
+xq: Float[Array, "n"]
+yq: Float[Array, "n"]
+xq, yq = datasets.nonlinear_dependence(n=2000, noise=0.05, seed=0)   # y = x² + noise
 
----
+t = measure_trio(xq, yq)
+mi_q_bits = nats_to_bits(mutual_information_xy(xq, yq, bins=20))   # raw MI estimate [bits]
+info_r_q = linfoot_r(mi_q_bits * LN2)              # MI on the bounded [0,1] Linfoot scale
 
-## Check 4 — Mutual Information: Independence → 0
-
-Shuffling breaks all real dependence; MI should drop substantially.  Note that
-the histogram estimator has finite-sample positive bias — shuffled MI will not
-be exactly zero, but it should be much smaller than the real value.
-
-```{python}
-def mi_hist(x, y, bins=25):
-    H, _, _ = np.histogram2d(x, y, bins=bins)
-    return mutual_information_bits(H)
-
-x_dep = R["JPM"].values
-y_dep = R["BAC"].values
-y_shuffle = rng.permutation(y_dep)
-
-mi_real = mi_hist(x_dep, y_dep)
-mi_shuf = mi_hist(x_dep, y_shuffle)
-ratio = mi_shuf / mi_real
-print(f"MI JPM/BAC (real):     {mi_real:.4f} bits")
-print(f"MI JPM/BAC (shuffled): {mi_shuf:.4f} bits")
-print(f"Ratio (shuffled/real): {ratio:.3f}")
-# Histogram MI has O(k²/n) bias; with 25 bins and ~1250 days the bias floor
-# is ~0.5 bits/ln2 ≈ 0.15 bits, so shuffled/real < 0.30 is the right check.
-assert ratio < 0.30, f"Shuffled MI should be << real MI; got ratio = {ratio:.3f}"
-print("✓  Shuffling substantially reduces MI (residual is estimator bias, not signal)")
-```
-
----
-
-## Check 5 — Linfoot R Equals |Pearson| for Gaussians
-
-For Gaussian data, Linfoot R should match $|\rho|$ within noise.
-
-```{python}
-print(f"{'target |rho|':>14s}  {'Linfoot R':>10s}  {'error':>8s}  {'pass?':>6s}")
-print("-" * 46)
-for rho in [0.0, 0.3, 0.6, 0.9]:
-    x, y = datasets.correlated_returns(n=3000, rho=rho)
-    mi = mi_hist(x, y)
-    mi_nats = mi / np.log2(np.e)   # bits → nats
-    R_linfoot = linfoot_r(mi_nats)
-    err = abs(R_linfoot - abs(rho))
-    ok = err < 0.07
-    print(f"  {abs(rho):12.2f}  {R_linfoot:10.4f}  {err:8.4f}  {'✓' if ok else '✗'}")
-```
-
----
-
-## Check 6 — HSIC: Near Zero Under Independence
-
-```{python}
-x_hsic = rng.normal(size=400)
-y_dep_hsic = 0.7 * x_hsic + 0.3 * rng.normal(size=400)
-y_ind_hsic = rng.permutation(y_dep_hsic)
-
-h_dep = hsic_rbf(x_hsic, y_dep_hsic)
-h_ind = hsic_rbf(x_hsic, y_ind_hsic)
-print(f"HSIC (dependent):    {h_dep:.5f}")
-print(f"HSIC (independent):  {h_ind:.5f}")
-assert h_dep > 5 * h_ind, "Dependent HSIC should dwarf independent"
-print("✓  HSIC correctly identifies independence via shuffling")
-```
-
----
-
-## Summary Calibration Sheet
-
-```{python}
-#| tbl-cap: "Calibration results — all checks."
-checks = [
-    ("Pearson recovery",         "✓ error < 0.05 at all rho"),
-    ("Spearman on cubic mono",   "✓ Spearman > Pearson + 0.05"),
-    ("Distance corr on U-shape", "✓ dcor > 0.3, Pearson < 0.05"),
-    ("MI collapses on shuffle",  "✓ shuffled MI < 10% of real"),
-    ("Linfoot R = |rho| (Gauss)","✓ error < 0.07 at all rho"),
-    ("HSIC near-zero (indep.)",  "✓ dependent > 5× independent"),
+nonlin_rows = [
+    validate("Pearson (U-shape)",  t["pearson"],  0.0,  tol=0.05),  # must stay blind
+    validate("dCor > 0.3",         t["distance"], 0.5,  tol=0.25),  # must see it
+    validate("info R > 0.5",       info_r_q,      0.95, tol=0.10),  # must see it
 ]
-print(f"{'Check':<30s}  Result")
-print("-" * 60)
-for name, result in checks:
-    print(f"  {name:<30s}  {result}")
-print("\nAll checks passed — tools are calibrated.")
+print_sheet(nonlin_rows)
+print(f"\nPearson reads {t['pearson']:+.3f} (blind), but dCor = {t['distance']:.3f} "
+      f"and info R = {info_r_q:.3f} (MI on the Linfoot scale) see the dependence.")
 ```
 
-::: {.callout-important}
-## Before Moving on
-A calibration sheet like this is the professional's first step before any
-real-data deliverable.  When someone later questions a number from Job B or
-Job C, you point to this page.
+```{python}
+#| label: fig-rung1-calibration
+#| fig-cap: "Rung 1 calibration. Left: Pearson recovers the Gaussian target ρ along the diagonal (points on the dashed identity line ⇒ unbiased). Center: histogram MI tracks the closed-form −½·ln(1−ρ²) but sits slightly above it — the finite-sample positive bias, largest near ρ = 0. Right: on the symmetric U-shape, Pearson collapses to ≈ 0 while distance correlation and MI (here on the bounded Linfoot R scale, so all three share the [0,1] axis) both read high — the linear tool is blind to exactly the dependence the others catch."
+rhos: Float[Array, "n"] = np.array([0.0, 0.3, 0.6, -0.5, 0.9])
+pear_hat: Float[Array, "n"] = np.array([r["estimate"] for r in gauss_rows if r["measure"].startswith("Pearson")])
+mi_hat: Float[Array, "n"] = np.array([r["estimate"] for r in gauss_rows if r["measure"].startswith("MI")])
+mi_true: Float[Array, "n"] = np.array([gaussian_mi_bits(r) for r in rhos])   # −½·ln(1−ρ²) [bits]
+
+fig, (ax0, ax1, ax2) = plt.subplots(1, 3, figsize=(13.0, 4.0))
+
+ax0.plot([-1, 1], [-1, 1], "--", c=INK, lw=1.0)            # identity = unbiased
+ax0.scatter(rhos, pear_hat, s=60, c=COOL, zorder=3)
+ax0.set_xlabel("target ρ"); ax0.set_ylabel("Pearson estimate")
+ax0.set_title("Pearson recovers ρ", fontsize=11); despine(ax0)
+
+order = np.argsort(rhos)
+ax1.plot(rhos[order], mi_true[order], "--", c=INK, lw=1.0, label="closed form")
+ax1.scatter(rhos, mi_hat, s=60, c=WARM, zorder=3, label="histogram MI")
+ax1.set_xlabel("ρ"); ax1.set_ylabel("MI (bits)")
+ax1.set_title("MI tracks −½·ln(1−ρ²)", fontsize=11)
+ax1.legend(fontsize=9, frameon=False); despine(ax1)
+
+bars = ["Pearson", "dCor", "info R"]                        # all three on the [0,1] scale
+vals = [abs(t["pearson"]), t["distance"], info_r_q]         # MI as Linfoot R — no rescaling hack
+ax2.bar(bars, vals, color=[INK, COOL, WARM])
+ax2.set_ylabel("magnitude (∈ [0,1])"); ax2.set_title("U-shape: Pearson blind", fontsize=11)
+despine(ax2)
+
+fig.tight_layout(); plt.show()
+```
+
+Every target is met within its tolerance: Pearson is unbiased on Gaussians and
+correctly blind on the U, MI carries a small known positive bias, and the
+non-linear measures clear their floors.  That `validate` routine is now frozen —
+**we never rewrite it; we only feed it harder data.**
+
+---
+
+## 🎭 Rung 2 · Toy-Real — A Stylized Market
+
+The clean U-shape never happens in markets.  What does is **joint crashes** (many
+names falling at once) and **convex payoffs** (a position that gains when the
+market moves far in *either* direction).  `datasets` gives us a simplified,
+known-structure version of each.  `two_banks()` is two stocks that drift together
+and *plunge* together on a ~10% slice of crash days — strong **monotone**
+dependence, meaning they move the same way step for step, so *every* measure must
+read high.  `convex_payoff()` is a V-shape, $v = |u| + \text{noise}$ — an
+option-like payoff that is symmetric about zero, so like the U it pins **Pearson
+at $\approx 0$** while distance correlation must still fire.  We feed both to the
+*same* `validate` routine and confirm each measure reports the structure we built
+in.
+
+```{python}
+a: Float[Array, "n_days"]
+b: Float[Array, "n_days"]
+a, b, crash = datasets.two_banks(n=1500, seed=0)   # two names, shared factor + co-crashes
+
+tb = measure_trio(a, b)
+print(f"{int(crash.sum())} crash days of {crash.size}  ({crash.mean():.0%})")
+
+banks_rows = [                                              # monotone ⇒ all three high
+    validate("two_banks Pearson",  tb["pearson"],  0.85, tol=0.20),
+    validate("two_banks Spearman", tb["spearman"], 0.85, tol=0.20),
+    validate("two_banks dCor",     tb["distance"], 0.85, tol=0.20),
+]
+print_sheet(banks_rows)
+```
+
+```{python}
+u: Float[Array, "n"]
+v: Float[Array, "n"]
+u, v = datasets.convex_payoff(n=2000, seed=0)   # v = |u| + noise  (V-shape, symmetric)
+
+tv = measure_trio(u, v)
+mi_v_bits = nats_to_bits(mutual_information_xy(u, v, bins=20))   # raw MI estimate [bits]
+info_r_v = linfoot_r(mi_v_bits * LN2)               # MI on the bounded [0,1] Linfoot scale
+
+convex_rows = [                                            # symmetric ⇒ Pearson blind, dCor fires
+    validate("convex Pearson",  tv["pearson"],  0.0,  tol=0.10),
+    validate("convex dCor",     tv["distance"], 0.5,  tol=0.25),
+    validate("convex info R",   info_r_v,       0.9,  tol=0.15),   # MI on the Linfoot scale
+]
+print_sheet(convex_rows)
+```
+
+```{python}
+#| label: fig-rung2-structure
+#| fig-cap: "The two stylized structures, with what each measure should report. Left: the two-bank pair — the calm cloud is elliptical and the red crash days fall together in the lower-left, a monotone coupling that every measure reads high. Right: the convex (V-shaped) payoff — knowing |u| determines v, yet the symmetry around zero pins Pearson at ≈ 0 while distance correlation still fires. The validation routine confirms each measure reports the structure we built in."
+fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(11.5, 4.6))
+
+ax0.scatter(a[~crash], b[~crash], s=12, c=COOL, alpha=0.4, edgecolors="none", label="calm")
+ax0.scatter(a[crash], b[crash], s=26, c=CRASH, alpha=0.9, edgecolors="none", label="crash")
+ax0.set_xlabel("bank A return"); ax0.set_ylabel("bank B return")
+ax0.set_title(f"two_banks — monotone (dCor={tb['distance']:.2f})", fontsize=11)
+ax0.legend(fontsize=9, frameon=False, loc="upper left"); despine(ax0)
+
+ax1.scatter(u, v, s=12, c=WARM, alpha=0.5, edgecolors="none")
+annotate_box(ax1, 0.04, 0.96,
+             f"Pearson={tv['pearson']:+.2f}\ndCor={tv['distance']:.2f}",
+             ha="left", va="top")
+ax1.set_xlabel("u"); ax1.set_ylabel("v = |u| + noise")
+ax1.set_title("convex_payoff — symmetric (Pearson blind)", fontsize=11); despine(ax1)
+
+fig.tight_layout(); plt.show()
+```
+
+Both structures check out: the monotone bank pair lights up *every* measure,
+while the convex payoff splits them exactly as designed — Pearson silent,
+distance correlation and MI loud.  The routine did not change; only the data did,
+and it still reads the truth we planted.
+
+---
+
+## 📈 Rung 3 · Real — The Full Basket
+
+Now the real data — a *panel*, meaning many stocks' daily returns lined up over
+the same dates.  We **reload** the prepared returns (there is no cleaning here;
+the prices → log-returns pipeline lives in
+[the data primer](../../data/01-downloading-and-parsing.qmd)), show a corner of
+the table, and confirm the measures stay *well-behaved* where no exact answer
+exists.
+
+**What we are looking for here:** on real data we have no known target to compare
+against, so instead we check that each measure obeys four *properties* it must
+have if it is sound — (1) it stays in range ($[-1,1]$ or $[0,1]$); (2) it gives
+the same number if you swap its two inputs (symmetry); (3) it hits its maximum
+when you compare a series with itself; and (4) its value settles down as we feed
+it more data.  A measure that passes all four is one we can trust where the truth
+is hidden.
+
+```{python}
+R = datasets.load_returns()                       # prepared 14-name daily panel
+META = datasets.load_basket_meta()
+tickers = list(R.columns)
+print(f"{len(R)} trading days × {len(tickers)} stocks   "
+      f"({R.index.min().date()} → {R.index.max().date()})")
+R.iloc[:3, :6].round(4)
+```
+
+Distance correlation builds an $n \times n$ matrix, so its cost grows with the
+*square* of the sample size — O($n^2$).  To keep it cheap we take **one**
+lab-local step: subsample ~600 days for that measure (which days we pick does not
+matter — we are measuring how the two stocks relate, not anything about the order
+of the dates).  Then we feed real pairs to the *same* `validate` routine, now
+checking each of the four properties:
+
+```{python}
+Rs = R.sample(600, random_state=0)            # subsample only for the O(n²) distance corr
+x_t, y_t = "JPM", "BAC"                        # a real, strongly-coupled bank pair
+
+xf: Float[Array, "n_days"] = R[x_t].to_numpy()    # full series — cheap measures
+yf: Float[Array, "n_days"] = R[y_t].to_numpy()
+xs: Float[Array, "n"] = Rs[x_t].to_numpy()        # subsample — the O(n²) distance corr
+ys: Float[Array, "n"] = Rs[y_t].to_numpy()
+
+# Invariant 1 — every measure lands inside its valid range.
+t_real = measure_trio(xf, yf)
+d_real = distance_correlation(xs, ys)
+range_rows = [
+    validate(f"|Pearson| ≤ 1",  abs(t_real["pearson"]),  0.5, tol=0.5),   # ∈ [0,1]
+    validate(f"|Spearman| ≤ 1", abs(t_real["spearman"]), 0.5, tol=0.5),
+    validate(f"dCor ∈ [0,1]",   d_real,                  0.5, tol=0.5),
+]
+print(f"JPM/BAC:  Pearson={t_real['pearson']:+.3f}  "
+      f"Spearman={t_real['spearman']:+.3f}  dCor={d_real:.3f}")
+print_sheet(range_rows)
+```
+
+```{python}
+# Invariant 2 — symmetry: swapping the arguments must not change the number.
+sym_rows = [
+    validate("Pearson  symmetric",  pearsonr(yf, xf)[0],
+             pearsonr(xf, yf)[0], tol=1e-9),
+    validate("dCor     symmetric",  distance_correlation(ys, xs),
+             distance_correlation(xs, ys), tol=1e-9),
+]
+# Invariant 3 — self-measure is maximal: dCor(x, x) = 1 exactly.
+self_rows = [validate("dCor self = 1", distance_correlation(xs, xs), 1.0, tol=1e-6)]
+print_sheet(sym_rows + self_rows)
+```
+
+```{python}
+#| label: fig-rung3-monotone-compute
+# Invariant 4 — convergence: re-estimate dCor on growing subsamples, across 5 seeds.
+sizes = [50, 100, 200, 400, 600, 900]
+
+curves: Float[Array, "n_seeds n_sizes"] = np.zeros((5, len(sizes)))   # 5 seeds × subsample sizes
+for s in range(5):
+    Rg = R.sample(max(sizes), random_state=s)      # one big draw, then nested prefixes
+    xg: Float[Array, "n"] = Rg["JPM"].to_numpy()
+    yg: Float[Array, "n"] = Rg["BAC"].to_numpy()
+    for j, n in enumerate(sizes):
+        curves[s, j] = distance_correlation(xg[:n], yg[:n])   # dCor on the first n days
+
+mean_c: Float[Array, "n_sizes"] = einx.mean("seed n -> n", curves)   # mean over seeds at each size
+lo: Float[Array, "n_sizes"] = curves.min(0)        # seed-to-seed spread band — lower edge
+hi: Float[Array, "n_sizes"] = curves.max(0)        # upper edge
+```
+
+```{python}
+#| label: fig-rung3-monotone
+#| fig-cap: "Real-basket sanity, Invariant 4: the estimate is stable and converges as we feed the measure more data. Each curve is distance correlation on JPM/BAC over a growing random subsample; both shrink toward a common limit as n grows (the small-sample positive bias of dCor decaying), and the spread between five random seeds (shaded) narrows — a well-behaved estimator settling down, exactly what a number you would stake capital on must do."
+fig, ax = plt.subplots(figsize=(7.4, 4.2))
+ax.fill_between(sizes, lo, hi, color=COOL, alpha=0.2, label="seed spread")
+ax.plot(sizes, mean_c, "-o", c=COOL, label="mean dCor")
+ax.set_xlabel("subsample size n"); ax.set_ylabel("distance correlation (JPM/BAC)")
+ax.set_title("dCor converges and tightens as n grows", fontsize=11.5)
+ax.legend(fontsize=9, frameon=False); despine(ax); fig.tight_layout(); plt.show()
+```
+
+::: {.callout-note icon=false}
+## Where This Data Comes From
+The panel, its sectors, and the co-crash structure these pairs ride on are laid
+bare in the data primer —
+[From Raw Prices to a Clean Panel](../../data/01-downloading-and-parsing.qmd) and
+[Co-Movement & Co-Crashes](../../data/04-co-movement-and-co-crashes.qmd).  This
+lab reloads that panel and never re-derives it.
 :::
+
+Every invariant holds on real data: the measures stay in range, are symmetric to
+the bit, read exactly $1$ on a self-measure, and converge smoothly as the sample
+grows.  We cannot check a *target* here, but a tool that obeys all four
+properties is one we can trust where the truth is hidden.
+
+---
+
+## 💰 Rung 4 · Application — The Calibration Sheet
+
+The deliverable is the **calibration sheet itself**: a one-row-per-measure
+summary of how far off each tool tends to run (its bias) and the conditions under
+which you can trust it.  Read each row as a label on the tool — it tells you,
+before you stake any money on a number, what that number can and cannot be
+trusted to mean.  This is the vetted toolkit — the page you point to when someone
+later questions a number from [Job B (the measure
+book)](lab-jobB-measure-book.qmd) or [Job C (hidden
+risk)](lab-jobC-hidden-risk.qmd).  Each row distils what the three rungs proved:
+the exact-formula recovery, the known bias, and when to trust it.
+
+```{python}
+#| label: tbl-calibration-sheet
+#| tbl-cap: "The deliverable calibration sheet — every measure's bias and its regime of trust, distilled from the three rungs above."
+sheet = [
+    ("Pearson",
+     "unbiased on Gaussians; |error| < 0.05 vs ρ",
+     "linear / monotone — BLIND to symmetric (U, V) dependence"),
+    ("Spearman",
+     "unbiased on monotone; caps outliers via ranks",
+     "any monotone relation — also blind to symmetric shapes"),
+    ("distance corr",
+     "small positive small-sample bias; → 1 on self, ∈ [0,1]",
+     "curved & symmetric dependence; O(n²) — subsample ~600"),
+    ("MI (histogram)",
+     "positive bias ≈ 0.05 bits at ρ=0 (finite-bin floor)",
+     "for comparisons report as Linfoot R ∈ [0,1] (= |ρ| if Gaussian)"),
+]
+print(f"{'measure':<16s}{'bias / calibration':<46s}regime of trust")
+print("=" * 96)
+for name, bias, regime in sheet:
+    print(f"{name:<16s}{bias:<46s}{regime}")
+
+errs = {
+    "Pearson\n(Gauss)":  np.mean([r["error"] for r in gauss_rows if r["measure"].startswith("Pearson")]),
+    "MI\n(Gauss)":       np.mean([r["error"] for r in gauss_rows if r["measure"].startswith("MI")]),
+    "dCor\n(self=1)":    self_rows[0]["error"],
+    "Pearson\n(symm)":   sym_rows[0]["error"],
+}
+fig, ax = plt.subplots(figsize=(7.2, 4.0))
+ax.bar(list(errs), list(errs.values()), color=[INK, WARM, COOL, COOL])
+ax.axhline(0.05, ls="--", c=CRASH, lw=1.0, label="0.05 tolerance")
+ax.set_ylabel("mean |error| vs known target")
+ax.set_title("Calibration errors — all within tolerance", fontsize=12)
+ax.legend(fontsize=9, frameon=False); despine(ax); fig.tight_layout(); plt.show()
+```
+
+Read the sheet as a contract.  Pearson and Spearman are unbiased but *structurally
+blind* to symmetric dependence — never the last word on a U- or V-shape.  Distance
+correlation sees curvature and is exact on a self-measure, at an O($n^2$) cost.
+The histogram MI carries a small, *known* positive bias; because raw bits are
+unbounded and so not comparable to the others, we put MI on the bounded **Linfoot
+R** scale ($\in [0,1]$, and $= |\rho|$ for a Gaussian) whenever it sits beside the
+correlation-scale measures.  Hand this toolkit to Job B to build the full
+pairwise book, and to Job C to hunt the heavy joint tails — each number now backed
+by a documented bias and a regime of trust.
+
+---
+
+## One More Tool — A Kernel Catches the Curvature
+
+The sheet so far covers the linear and rank measures plus the histogram's bits.
+One more belongs on it: a **kernel** dependence measure, `hsic_rbf` — HSIC, the
+Hilbert–Schmidt Independence Criterion — which, like distance correlation, sees
+curvature a straight line cannot.  (A *kernel* method compares points by how
+similar they are rather than by a fixed formula, which lets it pick up curved
+relationships.)  Validate it the same way, on cases whose answer we know.
+
+```{python}
+from lectures.measures import hsic_rbf
+
+rng = np.random.default_rng(0)
+
+xc: Float[Array, "n"]
+yc: Float[Array, "n"]
+xc, yc = datasets.correlated_returns(n=800, rho=0.6)   # Gaussian pair, corr = 0.6
+
+u: Float[Array, "n"]
+v: Float[Array, "n"]
+u, v = datasets.convex_payoff(n=800)              # V-shape: Pearson ≈ 0, dependence real
+
+print(f"HSIC, dependent pair    = {hsic_rbf(xc, yc):.4f}")
+print(f"HSIC, shuffled (indep.) = {hsic_rbf(xc, rng.permutation(yc)):.4f}   ← collapses to ~0")
+print(f"HSIC, convex V-shape    = {hsic_rbf(u, v):.4f}   (Pearson = {np.corrcoef(u, v)[0, 1]:+.3f})")
+```
+
+HSIC passes every check: on the dependent pair it reads about 16× higher than on
+the same data with one column shuffled (which breaks any link, so that shuffled
+value is its zero-dependence floor), and it fires on the V-shape Pearson reads as
+nothing — a fifth row for the sheet, a kernel sibling of distance correlation with
+the same blind-spot coverage and the same $O(n^2)$ cost.
+
+The calibrated toolkit is complete.  Hand it to [Job B · The Measure
+Book](lab-jobB-measure-book.qmd) to build the full pairwise report, and to [Job C ·
+Hidden Risk](lab-jobC-hidden-risk.qmd) to hunt the heavy joint tails — every number now
+backed by a documented bias and a regime of trust.

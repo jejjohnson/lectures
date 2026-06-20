@@ -1,6 +1,6 @@
 ---
 title: "Tool 2 — The CKA Penalty"
-subtitle: "Close the hole · sweep μ · read the frontier"
+subtitle: "Penalise dependence on the group · close the curve hole · read the frontier"
 ---
 
 ```{python}
@@ -8,150 +8,469 @@ subtitle: "Close the hole · sweep μ · read the frontier"
 import sys, pathlib
 sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
 from lectures import plotting, datasets
-from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
-from lectures.measures import cka_rbf
+from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box  # noqa: F401
+from lectures.measures import cka_linear, cka_rbf
 from lectures.neutralize import fair_fit
 plotting.set_style("notes")
 import numpy as np, matplotlib.pyplot as plt
+import einx                      # linear algebra with the axes spelled out
+from jaxtyping import Float      # shape annotations: Float[Array, "n_rows"]
+
+Array = np.ndarray
+GREEN = plotting.PALETTE["green"]
 ```
 
-*Learn-the-tool track · Lab 2 of 3.*
+*Learn-the-tool track · Lab 2.*
 
-The hero rung.  `fair_fit` minimizes $\text{loss} = \text{fit} +
-\mu\,\operatorname{Dep}(\hat y, S)$ with a kernel dependence penalty.  You will
-close the nonlinear hole, then sweep $\mu$ to trace the trade-off frontier.
+Tool 1 showed the two ways neutrality fails — a dropped attribute leaks back through
+proxies, and *linear* removal leaves the curve.  This lab climbs the **penalty
+ladder** that fixes both at once: one penalised fit, $\text{loss} +
+\lambda\cdot\operatorname{CKA}(\hat y, S)$, that drives the dependence between a
+**prediction** and the **group** straight to zero.  CKA — *centered kernel
+alignment* — is just a number between 0 and 1 that measures how much two things
+depend on each other; 0 means no dependence at all.  The *tool* (penalised fit +
+the CKA dependence term) is built once on Rung 1 and reused unchanged; only the
+**data grows up under it**, from a toy whose answer you can check by hand to the
+real Census basket and the accuracy–fairness frontier it traces.
+
+The CKA penalty is not a new measure — it **reuses the exact double-centering of
+the distance-correlation lab** ([Tool 1 · the model-free
+ladder](../../dependence/labs/lab-tool1-ladder.qmd)).  There the transform centred
+a matrix of *distances*; here it centres a matrix of *kernel similarities*.  Same
+$\tilde A_{ij} = A_{ij} - \bar A_{i\cdot} - \bar A_{\cdot j} + \bar A_{\cdot\cdot}$,
+a different matrix going in.
+
+**What you will produce:** an accuracy–fairness frontier on real Census income
+predictions — a curve that shows, for every bit of the gap between groups you close,
+how much accuracy it costs to close it.
 
 ---
 
-## 1 · Close the Hole
+## 🧪 Rung 1 · Toy — Known Answer
+
+Start where the truth is not in doubt.  `datasets.credit_scores_by_group()` builds
+a toy lender whose underlying creditworthiness is **shifted by group**: group 1 sits
+a fixed `gap` above group 0, so a model that predicts repayment **inherits that
+shift unless something stops it**.  That makes the known answer easy to state by hand:
+train a predictor and its output will depend on the group (high CKA); add the
+penalty and the dependence must fall to $\approx 0$ — the prediction can no longer
+tell the groups apart.
 
 ```{python}
-d = datasets.fair_regression(n=1000, seed=0)
+#| label: data-toy
+d = datasets.credit_scores_by_group(n=600, gap=0.8, seed=0)
+score: Float[Array, "n"] = d["score"]                 # legitimate signal (group-shifted)
+group: Float[Array, "n"] = d["group"].astype(float)   # the protected attribute, 0/1
+repaid: Float[Array, "n"] = d["repaid"].astype(float)  # ground-truth label
+gap0 = repaid[group == 1].mean() - repaid[group == 0].mean()
+print(f"n={score.size}   repay rate: group0={repaid[group==0].mean():.0%}  "
+      f"group1={repaid[group==1].mean():.0%}   group gap={gap0:+.0%}")
+```
+
+**The tool — penalise the dependence, reusing the dCor double-centering.**  The
+algorithm is one objective:
+
+$$
+\min_{\hat y}\ \underbrace{\tfrac1n\lVert \hat y - y\rVert^2}_{\text{fit}}
+\;+\;\lambda\cdot\underbrace{\operatorname{CKA}(\hat y,\, S)}_{\text{dependence}}
+$$
+
+The only new piece is $\operatorname{CKA}$, and it is **not new at all** — it is the
+distance-correlation transform with a kernel matrix in place of a distance matrix.
+Spelled out with the axes visible, so the shared step is undeniable:
+
+```{python}
+#| label: cka-derivation
+def double_center(M: Float[Array, "n n"]) -> Float[Array, "n n"]:
+    """The dCor transform, verbatim: M̃ᵢⱼ = Mᵢⱼ − M̄ᵢ. − M̄.ⱼ + M̄..
+
+    Identical to `centered_distances` in the distance-correlation lab — only the
+    matrix going in differs (a kernel gram here, pairwise distances there).
+    """
+    row_mean = einx.mean("i j -> i", M)              # M̄ᵢ. — row means
+    col_mean = einx.mean("i j -> j", M)              # M̄.ⱼ — column means
+    A = einx.subtract("i j, i -> i j", M, row_mean)
+    A = einx.subtract("i j, j -> i j", A, col_mean)
+    return A + M.mean()                              # add back the grand mean M̄..
+
+
+def cka(x: Float[Array, "n"], y: Float[Array, "n"]) -> float:
+    """CKA = ⟨K̃ₓ, K̃ᵧ⟩ / √(⟨K̃ₓ,K̃ₓ⟩⟨K̃ᵧ,K̃ᵧ⟩) — normalised, double-centred gram alignment."""
+    Kx = einx.dot("i, j -> i j", x, x)               # linear gram ⟨xᵢ, xⱼ⟩   (n, n)
+    Ky = einx.dot("i, j -> i j", y, y)               # linear gram ⟨yᵢ, yⱼ⟩
+    Kxc, Kyc = double_center(Kx), double_center(Ky)  # the SAME centering as dCor
+    hsic = lambda A, B: float((A * B).mean())         # ⟨Ã, B̃⟩ — the dependence inner product
+    denom = np.sqrt(hsic(Kxc, Kxc) * hsic(Kyc, Kyc))
+    return hsic(Kxc, Kyc) / denom if denom > 0 else 0.0
+
+
+# the hand-rolled CKA must match the library's cka_linear — same double-centring:
+print(f"cka(score, group)        = {cka(score, group):.4f}   (double-centred gram alignment)")
+print(f"cka_linear(score, group) = {cka_linear(score, group):.4f}   (library — identical)")
+```
+
+The penalised fit itself is `fair_fit`: it fits the target, then — for $\lambda>0$ —
+removes from the prediction the part that can be explained by the group $S$ (this is
+the exact solution to the penalised objective above).  Run it with the penalty off
+and on, and read CKA against what we *know* is there:
+
+```{python}
+#| label: toy-fit
+pred0 = fair_fit(score, repaid, group, mu=0.0)   # plain — inherits the group shift
+pred8 = fair_fit(score, repaid, group, mu=8.0)   # penalised — CKA driven down
+print(f"plain  (λ=0):  CKA(pred, group) = {cka(pred0, group):.3f}   (depends on the group)")
+print(f"penalty(λ=8):  CKA(pred, group) = {cka(pred8, group):.3f}   ← curve gone, groups indistinct")
+```
+
+```{python}
+#| label: fig-toy-closes
+#| fig-cap: "The penalty severs prediction from group on the toy lender. Left: the plain predictor — the two group clouds sit at clearly different prediction levels (group 1 shifted up), so CKA reads high. Right: the penalised predictor — the two clouds collapse onto the same band, the group-shift erased, and CKA falls near zero. The prediction can no longer tell the groups apart, which is exactly what the penalty was asked to enforce."
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.2), sharey=True)
+jitter = 0.06 * np.random.default_rng(0).standard_normal(group.size)   # spread the 0/1 groups
+for ax, pred, ttl, c in [(axL, pred0, "plain", COOL), (axR, pred8, "CKA penalty (λ=8)", GREEN)]:
+    ax.scatter(group + jitter, pred, s=12, c=c, alpha=0.45, edgecolors="none")
+    for g in (0, 1):                                   # group-mean prediction line
+        ax.hlines(pred[group == g].mean(), g - 0.25, g + 0.25, color=INK, lw=2.2)
+    ax.set_title(f"{ttl} · CKA={cka(pred, group):.2f}", fontsize=11)
+    ax.set_xticks([0, 1]); ax.set_xlabel("group"); despine(ax)
+axL.set_ylabel("prediction")
+fig.tight_layout(); plt.show()
+```
+
+The known answer holds: the plain predictor inherits the group shift (CKA high, the
+two group-mean lines far apart); the penalised one collapses both groups onto the
+same prediction band (CKA $\to 0$).  That is the whole tool — minimise
+$\text{fit} + \lambda\cdot\operatorname{CKA}(\hat y, S)$, where CKA is the
+dependence transform you already met on the distance-correlation ladder.  Now we
+feed it data with a hole that the *cheap* fix cannot close.
+
+---
+
+## 🎭 Rung 2 · Toy-Real — A Stylized Market
+
+A group that shifts a prediction by a constant is the easy case — *linear*
+neutrality would catch it.  What actually happens in lending is subtler: the target
+bends with the sensitive variable (the group label $S$).  `datasets.fair_regression()`
+is a simplified stand-in for that — $y = 0.6x + 0.7S + 0.7(S^2-1) + \text{noise}$ —
+so $S$ enters the target both as a straight **line** and as a **curve**.  Drop $S$, or subtract the
+straight-line part of it, and the $0.7\,S$ term goes — but the $S^2$ curve stays.
+That leftover curve is a *proxy hole*: dependence on the group that a linear fix
+cannot see, so it leaves the hole wide open.  The CKA penalty, built on the same
+kernel that does see curves, closes it.  **Same `fair_fit`, no new code.**
+
+```{python}
+#| label: data-ramp
+d = datasets.fair_regression(n=600, seed=0)
 x, S, y = d["x"], d["s"], d["y"]
 
-y0 = fair_fit(x, y, S, mu=0.0)
-y8 = fair_fit(x, y, S, mu=8.0)
+# the cheap fix: plain least-squares, then subtract the LINEAR S-projection
+Phi = np.column_stack([np.ones(len(x)), x, S, S**2 - 1.0])
+theta, *_ = np.linalg.lstsq(Phi, y, rcond=None)
+y_plain = Phi @ theta                                  # plain fit — sees the curve
+b = np.cov(y_plain, S)[0, 1] / np.var(S)               # OLS slope on S
+y_linear = y_plain - b * S                              # linear neutrality: subtract the line
 
-print(f"plain (μ=0):   CKA={cka_rbf(y0, S):.3f}")
-print(f"CKA penalty:   CKA={cka_rbf(y8, S):.3f}   ← curve gone")
+y_cka = fair_fit(x, y, S, mu=8.0)                      # the kernel penalty — same tool as Rung 1
+
+print(f"                Pearson(·,S)   CKA_lin(·,S)   CKA_rbf(·,S)")
+print(f"plain            {np.corrcoef(y_plain, S)[0,1]:+.3f}        "
+      f"{cka_linear(y_plain, S):.3f}          {cka_rbf(y_plain, S):.3f}")
+print(f"linear removal   {np.corrcoef(y_linear, S)[0,1]:+.3f}        "
+      f"{cka_linear(y_linear, S):.3f}          {cka_rbf(y_linear, S):.3f}   ← curve survives")
+print(f"CKA penalty      {np.corrcoef(y_cka, S)[0,1]:+.3f}        "
+      f"{cka_linear(y_cka, S):.3f}          {cka_rbf(y_cka, S):.3f}   ← hole closed")
 ```
 
 ```{python}
-#| label: fig-tool2-closes
-#| fig-cap: "μ = 8 decouples the predictions from S."
-fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.2))
-axL.scatter(S, y0, s=10, c=COOL, alpha=0.5, edgecolors="none")
-axL.set_title(f"plain · CKA={cka_rbf(y0, S):.2f}", fontsize=11)
-despine(axL)
-axR.scatter(S, y8, s=10, c=plotting.PALETTE["green"], alpha=0.5,
-            edgecolors="none")
-axR.set_title(f"CKA penalty (μ=8) · CKA={cka_rbf(y8, S):.2f}", fontsize=11)
-despine(axR)
-for ax in (axL, axR):
-    ax.set_xlabel("S"); ax.set_ylabel("prediction")
-fig.tight_layout()
-plt.show()
+#| label: fig-ramp-hole
+#| fig-cap: "The proxy hole, and the tool that closes it. Left: the plain predictor bends with S — a clear U-shape, the S² term. Middle: linear removal flattens the average slope (Pearson → 0) but the U is untouched — the curve is exactly the dependence a linear fix cannot see, so CKA_rbf barely moves. Right: the CKA penalty, using the same kernel that registers the curve, erases it — the cloud is flat in S and CKA_rbf falls near zero. The middle panel is the hole; the right panel is the fix."
+fig, axes = plt.subplots(1, 3, figsize=(13, 4.0), sharey=True)
+panels = [(y_plain, "plain", COOL), (y_linear, "linear removal", WARM),
+          (y_cka, "CKA penalty (λ=8)", GREEN)]
+for ax, (pred, ttl, c) in zip(axes, panels):
+    ax.scatter(S, pred, s=10, c=c, alpha=0.45, edgecolors="none")
+    ax.set_title(f"{ttl}\nCKA_rbf={cka_rbf(pred, S):.2f}", fontsize=11)
+    ax.set_xlabel("S"); despine(ax)
+axes[0].set_ylabel("prediction")
+fig.tight_layout(); plt.show()
 ```
 
----
+Read the three panels left to right: linear removal kills the *correlation* but the
+*curve* survives — that leftover $S^2$ dependence is the hole, and CKA$_\text{rbf}$
+sees it even though Pearson correlation reads zero.  The penalty closes the hole
+because its kernel registers the curve the linear fix is blind to.
 
-## 2 · Sweep Μ — The Frontier
+So far `fair_fit` solved this in closed form — a teaching stand-in.  In practice you
+*train* the same idea on any network, and fair learning has one rule it never breaks:
+**the sensitive variable `S` never enters the model — it shapes only the loss.**  The
+deployed model takes features alone; `S` changes *how it learns*, not *what it sees*.
+Built by hand the mechanism is just three pieces:
 
-```{python}
-sweep = [0.0, 0.5, 1.0, 2.0, 5.0, 8.0, 20.0]
-print(f"{'μ':>6}  {'accuracy':>9}  {'CKA(ŷ,S)':>9}")
-print("-" * 28)
-acc, dep = [], []
-for mu in sweep:
-    p = fair_fit(x, y, S, mu=mu)
-    a = max(1 - np.mean((p - y) ** 2) / np.var(y), 0.0)
-    c = cka_rbf(p, S)
-    acc.append(a); dep.append(c)
-    print(f"{mu:>6g}  {a:>9.3f}  {c:>9.3f}")
-```
+1. a network that predicts the target from **features only** (never `S`);
+2. the **penalty** $\operatorname{CKA}(\hat y, S)$, written so the network can be trained against it (the optimiser can follow its gradient);
+3. the **total loss** $= \text{task loss} + \lambda\cdot\operatorname{CKA}$, added with
+   `add_loss` *during training* — so `S` reaches the optimiser but never the inputs.
 
-```{python}
-#| label: fig-tool2-frontier
-#| fig-cap: "Accuracy vs neutrality, elbow circled. Right of the elbow, neutrality is nearly free; left of it, every further drop in CKA costs real accuracy."
-dep_arr, acc_arr = np.array(dep), np.array(acc)
-
-# the elbow: the sweep point farthest from the chord joining the two endpoints
-dep_unit = (dep_arr - dep_arr.min()) / (np.ptp(dep_arr) + 1e-9)
-acc_unit = (acc_arr - acc_arr.min()) / (np.ptp(acc_arr) + 1e-9)
-start = np.array([dep_unit[0], acc_unit[0]])
-chord = np.array([dep_unit[-1] - dep_unit[0], acc_unit[-1] - acc_unit[0]])
-chord = chord / np.linalg.norm(chord)
-offsets = np.column_stack([dep_unit, acc_unit]) - start
-dist = np.linalg.norm(offsets - (offsets @ chord)[:, None] * chord, axis=1)
-knee = int(np.argmax(dist))
-print(f"elbow at μ = {sweep[knee]:g}  (CKA {dep_arr[knee]:.2f}, R² {acc_arr[knee]:.2f})")
-
-fig, ax = plt.subplots(figsize=(7.5, 4.4))
-ax.plot(dep_arr, acc_arr, "-o", c=COOL, lw=2.2)
-for mu, dx, ay in zip(sweep, dep_arr, acc_arr):
-    ax.annotate(f"μ={mu:g}", (dx, ay), textcoords="offset points",
-                xytext=(6, 6), fontsize=9, color=INK)
-ax.scatter([dep_arr[knee]], [acc_arr[knee]], s=240, facecolors="none",
-           edgecolors=CRASH, lw=2.6, zorder=5)
-ax.set_xlabel("CKA(ŷ, S)  →  less neutral"); ax.set_ylabel("accuracy (R²)")
-ax.set_title("The accuracy–neutrality frontier", fontsize=12)
-despine(ax)
-fig.tight_layout()
-plt.show()
-```
-
-::: {.callout-tip}
-## What to Look for
-There is no single "fair model" — there is a curve.  Pick the smallest $\mu$
-that pushes CKA below your threshold; everything to its right buys neutrality you
-may not need at an accuracy cost you do pay.
-:::
-
----
-
-## 3 · The Real Thing — `keras-fairkl`
-
-`fair_fit` is the closed-form teaching stand-in.  The production version
-trains the penalty **end to end**: `FairModelWrapper` adds $\mu \cdot
-\operatorname{CKA}(\hat y, S)$ to whatever task loss you compile, and the
-sensitive attribute rides in at `fit` time only — never as a model input.
+The leak we fight rides in on a **proxy** — a feature correlated with `S`, the way
+`occupation` carries `sex`.  We hand the net a proxy (not `S` itself) and watch the
+penalty pull the prediction free of `S` regardless:
 
 ```{python}
+#| label: keras-byhand
 import os
-os.environ["KERAS_BACKEND"] = "jax"
+os.environ["KERAS_BACKEND"] = "jax"          # set BEFORE importing keras (Keras 3, CPU JAX)
 import keras
 from keras import layers
-from fairkl import FairModelWrapper
 
-X_in = np.column_stack([x, S])     # the net SEES S — the penalty polices it
 
-for mu in (0.0, 4.0):
+def cka_in_graph(pred: Float[Array, "n 1"], s: Float[Array, "n 1"]):
+    """RBF CKA(prediction, S) in keras.ops so gradients flow — the SAME kernel that
+    caught the curve in Rung 2, and the SAME one `keras-fairkl` uses by default, so
+    the by-hand penalty and the package close the same nonlinear leak."""
+    def rbf_gram(z: Float[Array, "n 1"]) -> Float[Array, "n n"]:
+        z = keras.ops.reshape(z, (-1, 1))
+        sq_dist = (z - keras.ops.transpose(z)) ** 2             # (zᵢ − zⱼ)²   pairwise
+        sigma2 = keras.ops.median(sq_dist) + 1e-12             # median-heuristic bandwidth
+        return keras.ops.exp(-sq_dist / (2.0 * sigma2))        # Kᵢⱼ = exp(−(zᵢ−zⱼ)² / 2σ²)
+
+    def dc(M: Float[Array, "n n"]) -> Float[Array, "n n"]:     # double-centre, in-graph
+        return (M - keras.ops.mean(M, 0, keepdims=True)
+                  - keras.ops.mean(M, 1, keepdims=True) + keras.ops.mean(M))
+
+    Ac, Bc = dc(rbf_gram(pred)), dc(rbf_gram(s))               # centred RBF grams
+    h = lambda P, Q: keras.ops.mean(P * Q)                       # ⟨P̃, Q̃⟩
+    return h(Ac, Bc) / keras.ops.sqrt(h(Ac, Ac) * h(Bc, Bc) + 1e-12)
+
+
+class FairWrap(keras.Model):
+    """A minimal `FairModelWrapper`: a base predictor plus a CKA penalty on the loss.
+
+    The base network is called on the **features only**; the sensitive S arrives as
+    `q` at fit time and is used *only* inside `add_loss` — never as a model input.
+    """
+    def __init__(self, base: keras.Model, mu: float):
+        super().__init__(); self.base = base; self.mu = mu      # mu = λ, the penalty weight
+    def call(self, inputs, training=False):
+        x_feat, s = inputs["x"], inputs["q"]                    # q = the sensitive variable
+        pred = self.base(x_feat, training=training)             # the model sees ONLY features
+        if training and self.mu > 0:
+            self.add_loss(self.mu * cka_in_graph(pred, s))      # the penalty rides on the loss
+        return pred
+
+
+# the leak rides in on a PROXY — a feature that carries S (the way occupation carries sex)
+rng = np.random.default_rng(1)
+proxy: Float[Array, "n"] = S + 0.3 * rng.standard_normal(len(S))   # corr(proxy, S) ≈ 0.96
+X_feat = np.column_stack([x, proxy]).astype("float32")           # features: a clean x + the proxy. NO S.
+S_col = S[:, None].astype("float32")                            # S — handed to the loss as q
+
+print(f"{'':16}CKA(pred,S)   R²")
+for mu in (0.0, 6.0):
     keras.utils.set_random_seed(0)
-    mlp = keras.Sequential([layers.Dense(32, activation="tanh"),
-                            layers.Dense(32, activation="tanh"),
-                            layers.Dense(1)])
-    model = FairModelWrapper(mlp, mu=mu)     # loss = mse + μ·CKA(ŷ, S)
-    model.compile(optimizer=keras.optimizers.Adam(0.01), loss="mse")
-    model.fit(X_in, y[:, None], q=S[:, None],
-              epochs=400, batch_size=len(x), verbose=0)
-    pred = model.predict(X_in, verbose=0)[:, 0]
+    base = keras.Sequential([layers.Dense(32, activation="tanh"),
+                             layers.Dense(32, activation="tanh"), layers.Dense(1)])
+    model = FairWrap(base, mu)
+    model.compile(optimizer=keras.optimizers.Adam(0.01), loss="mse")   # mse = the task loss
+    model.fit({"x": X_feat, "q": S_col}, y[:, None].astype("float32"),
+              epochs=150, batch_size=128, verbose=0)
+    pred = np.asarray(base.predict(X_feat, verbose=0))[:, 0]    # deploy on features alone — S unseen
     r2 = max(1 - np.mean((pred - y) ** 2) / np.var(y), 0.0)
-    print(f"μ={mu:g}:  CKA(ŷ,S) = {cka_rbf(pred, S):.3f}   R² = {r2:.3f}")
+    tag = "plain (λ=0)" if mu == 0 else f"penalty (λ={mu:g})"
+    print(f"{tag:16}{cka_rbf(pred, S):.3f}        {r2:.3f}")
 ```
 
-Same frontier, real optimizer, any architecture — this is the API the
-[credit job](lab-jobB-neutralize-credit.qmd) scales to real data.
+With the penalty off, the net leans on the proxy and its prediction tracks `S` (CKA
+high, accuracy high); with it on, the net is forced to give up the part of the proxy
+that carries `S` — CKA falls toward zero at a real accuracy cost.  **`keras-fairkl` is
+exactly this, packaged**: it adds the same $\lambda\cdot\operatorname{CKA}(\hat y, S)$
+through `add_loss`, takes `S` at `fit` time as `q=`, and never feeds it to your model.
+
+```{python}
+#| label: keras-fairkl
+from fairkl import FairModelWrapper
+
+print(f"{'':16}CKA(pred,S)   R²")
+for mu in (0.0, 6.0):
+    keras.utils.set_random_seed(0)
+    mlp = keras.Sequential([layers.Dense(32, activation="tanh"),
+                            layers.Dense(32, activation="tanh"), layers.Dense(1)])
+    model = FairModelWrapper(mlp, mu=mu)        # the same mse + λ·CKA(ŷ, S) objective
+    model.compile(optimizer=keras.optimizers.Adam(0.01), loss="mse")
+    model.fit(X_feat, y[:, None], q=S_col,      # features in; S given only as q, at fit time
+              epochs=150, batch_size=128, verbose=0)
+    pred = model.predict(X_feat, verbose=0)[:, 0]
+    r2 = max(1 - np.mean((pred - y) ** 2) / np.var(y), 0.0)
+    print(f"keras-fairkl λ={mu:<4g}{cka_rbf(pred, S):.3f}        {r2:.3f}")
+```
+
+The by-hand `FairWrap` and the packaged `FairModelWrapper` agree closely — both wrap an
+ordinary network, both add an **RBF** $\lambda\cdot\operatorname{CKA}(\hat y, S)$ to the
+loss with `S` seen only at fit time, and both drive $\operatorname{CKA}(\hat y, S)$ from
+~0.22 down to ~0.02 at the same accuracy cost.  Same kernel, same objective, same
+result; the library just spares you re-writing the wrapper.  Only the data escalates
+from here.
 
 ---
 
-## 4 · Your Turn
+## 📈 Rung 3 · Real — The Full Basket
 
-- Find the $\mu$ that brings CKA below 0.05.  What accuracy do you keep?
-- Re-run with `datasets.fair_regression(seed=...)` for several seeds: how stable
-  is the elbow location?
-- In the Keras version, swap `CKALoss` for `HSICLoss`
-  (`FairModelWrapper(mlp, mu=..., fairness_loss=fairkl.HSICLoss())`).  Why does
-  the same $\mu$ now behave differently?  (Hint: which of the two is bounded?)
+Now the real panel.  We **reload** the prepared US-Census income data — there is no
+cleaning here; the ACS decode, the income-threshold target, and the protected
+attribute are built once in
+[the income & fairness primer](../../data/06-the-credit-dataset.qmd) — split it into
+the standard $(X, y, s)$ pieces, and train a proxy scorecard with `sex`
+**dropped**.  The one lab-local step is encoding the categoricals (one-hot
+`occupation` and `marital`), since the model needs numbers.
 
-Next: [Tool 3 — adversarial removal](lab-tool3-adversarial.qmd), the learned
-alternative to a fixed kernel.
+```{python}
+#| label: real-load
+import pandas as pd
+
+credit = datasets.load_credit()
+y_r = credit["income_high"].to_numpy().astype(float)   # target: 1 if income > $50k
+s_r = credit["sex"].to_numpy().astype(float)           # protected: 1 = male
+X_r = credit.drop(columns=["income_high", "sex"])      # proxies — sex DROPPED
+print(f"{len(credit):,} rows · X columns (sex dropped): {list(X_r.columns)}")
+
+# the only lab-local step: one-hot the categoricals, then standardize for the fit
+X_enc = pd.get_dummies(X_r, columns=["occupation", "marital"], drop_first=True).to_numpy().astype(float)
+X_z = (X_enc - X_enc.mean(0)) / (X_enc.std(0) + 1e-9)   # z-score each proxy column
+print(f"encoded proxy matrix: {X_z.shape}")
+```
+
+::: {.callout-note icon=false}
+## Where This Data Comes From
+The ACS decode, the `income_high` target, the protected `sex` attribute, and the
+proxy leak through `occupation` are built and owned **once** in
+[The Income & Fairness Dataset](../../data/06-the-credit-dataset.qmd).  This lab
+reloads that prepared `(X, y, s)` with the one-line recipe above and never
+re-derives it; the only lab-local step is one-hot encoding the categoricals, as
+that page's contract allows.
+:::
+
+Train a plain scorecard on the proxies (a logistic fit — `sex` is not among its
+inputs), then run the **same** penalised fit on its score, feeding the protected
+`sex` as the variable to neutralise.  We are checking two things: the **parity
+gap** (how much higher the average predicted score is for men than for women — it
+should be near zero if the model is fair) and the **CKA** between the prediction
+and `sex` (how much the prediction still depends on the group).  CKA needs an
+$n\times n$ table of pairwise similarities, which is too big for all 30,000 rows, so
+we read CKA on a ~2000-row sample; the parity gap is read on the full panel.
+
+```{python}
+#| label: real-fit
+from sklearn.linear_model import LogisticRegression
+
+clf = LogisticRegression(max_iter=2000).fit(X_z, y_r)   # scorecard — sex DROPPED from inputs
+base_score: Float[Array, "n"] = clf.predict_proba(X_z)[:, 1]   # P(high income | proxies)
+
+pred_plain = fair_fit(base_score, y_r, s_r, mu=0.0)     # plain — proxy leak intact
+pred_fair = fair_fit(base_score, y_r, s_r, mu=8.0)      # same tool, penalty on
+
+def parity_gap(p: Float[Array, "n"]) -> float:
+    """Demographic-parity gap: mean prediction for men − for women."""
+    return float(p[s_r == 1].mean() - p[s_r == 0].mean())   # P̄(male) − P̄(female)
+
+rng = np.random.default_rng(0)
+idx = rng.choice(len(y_r), 2000, replace=False)         # subsample only for the O(n²) CKA
+print(f"            parity gap   CKA(pred, sex)")
+print(f"plain        {parity_gap(pred_plain):+.3f}        {cka_rbf(pred_plain[idx], s_r[idx]):.3f}")
+print(f"CKA penalty  {parity_gap(pred_fair):+.3f}        {cka_rbf(pred_fair[idx], s_r[idx]):.3f}   ← gap closes")
+```
+
+```{python}
+#| label: fig-real-gap
+#| fig-cap: "The group gap in real income predictions, before and after the penalty. Each panel shows the distribution of predicted high-income probability for women (warm) and men (cool). Left: the plain scorecard — even with sex dropped, the male distribution sits visibly to the right, the proxy leak (chiefly through occupation) reproducing the real group gap. Right: the penalised scorecard — the two distributions align, the gap closed, the prediction no longer a proxy for sex."
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.0), sharex=True, sharey=True)
+bins = np.linspace(0, 1, 31)
+for ax, pred, ttl in [(axL, pred_plain, "plain scorecard"),
+                      (axR, pred_fair, "CKA penalty (λ=8)")]:
+    ax.hist(pred[s_r == 0], bins=bins, color=WARM, alpha=0.55, density=True, label="women")
+    ax.hist(pred[s_r == 1], bins=bins, color=COOL, alpha=0.55, density=True, label="men")
+    ax.axvline(pred[s_r == 0].mean(), color=WARM, lw=2)
+    ax.axvline(pred[s_r == 1].mean(), color=COOL, lw=2)
+    ax.set_title(f"{ttl} · gap={parity_gap(pred):+.2f}", fontsize=11)
+    ax.set_xlabel("predicted P(high income)"); despine(ax)
+axL.set_ylabel("density"); axL.legend(fontsize=9, frameon=False, loc="upper right")
+fig.tight_layout(); plt.show()
+```
+
+The same penalised fit that erased a toy group-shift now shrinks a **real** group
+gap.  The plain scorecard carries a +12-point parity gap — the very gap the
+[primer documents](../../data/06-the-credit-dataset.qmd).  It survives even with
+`sex` dropped, because `occupation` leaks the group back in.  The penalty closes the
+gap to near zero while the scorecard keeps predicting income.  One number is still
+missing — **what did that fairness cost in accuracy?**
+
+---
+
+## 💰 Rung 4 · Application — The Accuracy–Fairness Frontier
+
+There is no single "fair model"; there is a **curve**.  The deliverable is the
+accuracy–fairness frontier: sweep the penalty weight $\lambda$ from 0 (pure
+accuracy) upward, and at each setting read the model's accuracy against its
+fairness metric — here the demographic-parity gap (the gap between the average
+predicted scores of the two groups).  Each point on the curve is one $\lambda$
+setting, showing what accuracy and what gap it buys.  The frontier lays out the
+trade-off, so you can pick the smallest $\lambda$ that meets your fairness threshold
+and *see* what it costs.
+
+```{python}
+#| label: frontier-sweep
+sweep = [0.0, 0.5, 1.0, 2.0, 5.0, 8.0, 20.0]
+acc, gap, cka_dep = [], [], []
+print(f"{'λ':>6}  {'accuracy':>9}  {'parity gap':>11}  {'CKA(pred,sex)':>14}")
+print("-" * 46)
+for lam in sweep:
+    p = fair_fit(base_score, y_r, s_r, mu=lam)
+    a = ((p > 0.5).astype(int) == y_r).mean()            # classification accuracy at 0.5
+    g = abs(parity_gap(p))                               # |demographic-parity gap|
+    c = cka_rbf(p[idx], s_r[idx])                        # the kernel dependence
+    acc.append(a); gap.append(g); cka_dep.append(c)
+    print(f"{lam:>6g}  {a:>9.3f}  {g:>11.3f}  {c:>14.3f}")
+```
+
+```{python}
+#| label: fig-frontier-compute
+gap_arr: Float[Array, "n_sweep"] = np.array(gap)   # |parity gap| at each λ
+acc_arr: Float[Array, "n_sweep"] = np.array(acc)   # accuracy at each λ
+
+# the elbow = the sweep point farthest from the chord joining the two endpoints
+gap_u = (gap_arr - gap_arr.min()) / (np.ptp(gap_arr) + 1e-9)   # rescale both axes to [0,1]
+acc_u = (acc_arr - acc_arr.min()) / (np.ptp(acc_arr) + 1e-9)
+start: Float[Array, "2"] = np.array([gap_u[0], acc_u[0]])      # one endpoint of the chord
+chord: Float[Array, "2"] = np.array([gap_u[-1] - gap_u[0], acc_u[-1] - acc_u[0]])
+chord = chord / np.linalg.norm(chord)                          # unit chord direction
+
+offsets: Float[Array, "n_sweep 2"] = np.column_stack([gap_u, acc_u]) - start
+proj: Float[Array, "n_sweep"] = einx.dot("p i, i -> p", offsets, chord)   # offset · chord
+dist = np.linalg.norm(offsets - proj[:, None] * chord, axis=1)   # ⟂ distance of each point to the chord
+knee = int(np.argmax(dist))                                    # the elbow = the farthest point
+print(f"elbow at λ = {sweep[knee]:g}  (parity gap {gap_arr[knee]:.3f}, accuracy {acc_arr[knee]:.3f})")
+```
+
+```{python}
+#| label: fig-frontier
+#| fig-cap: "The accuracy–fairness frontier on real income predictions, λ sweeping from 0 (pure accuracy, right) toward full neutrality (left). The elbow (circled) is the sweet spot: right of it, the parity gap falls almost for free — a large fairness gain costs almost no accuracy; left of it, every further point of gap closed costs real accuracy. There is no single fair model — you read the curve and pick the smallest λ that meets your fairness bar."
+fig, ax = plt.subplots(figsize=(7.6, 4.4))
+ax.plot(gap_arr, acc_arr, "-o", c=COOL, lw=2.2)
+for lam, gx, ay in zip(sweep, gap_arr, acc_arr):
+    ax.annotate(f"λ={lam:g}", (gx, ay), textcoords="offset points",
+                xytext=(6, 6), fontsize=9, color=INK)
+ax.scatter([gap_arr[knee]], [acc_arr[knee]], s=240, facecolors="none",
+           edgecolors=CRASH, lw=2.6, zorder=5)
+ax.set_xlabel("demographic-parity gap  →  less fair")
+ax.set_ylabel("accuracy")
+ax.set_title("The accuracy–fairness frontier", fontsize=12)
+despine(ax); fig.tight_layout(); plt.show()
+```
+
+There it is: a curve you can stake a policy on.  The same penalty — minimise
+$\text{fit} + \lambda\cdot\operatorname{CKA}(\hat y, S)$, with CKA the very
+double-centering you met measuring distance correlation — read a toy group-shift, a
+nonlinear proxy hole, and finally real Census income, escalating only the data and
+never the tool.  At the top it hands back not a verdict but a **frontier**: pick the
+smallest $\lambda$ that clears your fairness bar, and the curve tells you exactly
+what accuracy you pay for it.  Scaling this penalty end to end on the full feature
+set — and reporting the gap before and after on the real scorecard — is the job
+[Job B · Neutralize an Income Model](lab-jobB-neutralize-credit.qmd) takes up next.

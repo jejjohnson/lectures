@@ -1,6 +1,6 @@
 ---
 title: "Tool 3 — MI by Gaussianization"
-subtitle: "estimate mutual information · validate it"
+subtitle: "Mutual Information Between Blocks · in Bits"
 ---
 
 ```{python}
@@ -9,90 +9,397 @@ import sys, pathlib
 sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
 from lectures import plotting, datasets
 from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
-from lectures.measures import mutual_information_xy
+from lectures.gaussianization import gaussianize_1d
+from lectures.measures import mutual_information_xy, nats_to_bits, linfoot_r
 plotting.set_style("notes")
 import numpy as np, matplotlib.pyplot as plt
+import einx                      # linear algebra with the axes spelled out
+from jaxtyping import Float      # shape annotations: Float[Array, "n_days d"]
+
+Array = np.ndarray
+LN2 = np.log(2)                  # 1 bit = ln 2 nats
 ```
 
 *Learn-the-tool track · Lab 3 of 3.*
 
-The forward map answers "how much do these share?" in nats.  You will estimate
-mutual information and check it against a case with a known answer.
+The marginal-Gaussianization labs ([Tool 1](lab-tool1-change-of-variables.qmd),
+[Tool 2 · RBIG](lab-tool2-rbig.qmd)) reshaped *one variable at a time*.  This lab puts
+that map to work on a sharper, harder question: how much do two whole *blocks* of assets
+share?  The measure we use is **mutual information (MI)** — the amount of information,
+in **bits**, that knowing one block tells you about the other.  The trick is the
+headline of this chapter — **Gaussianize first, then measure** — because once every
+column is a normal score, mutual information between blocks has a one-line closed form
+(an exact formula) in their covariance.  That is what saves us when there are many
+assets at once, where the naive histogram falls apart.  The spine of the lab is learning
+to *prove* the estimator — the recipe that turns data into a number — on a known answer
+before trusting it on returns.
+
+**What you will produce:** a trustworthy Gaussianize-then-MI estimator, validated
+against a closed form, and a group-vs-group information report for the real basket,
+across many assets at once.
 
 ---
 
-## 1 · The Estimator on Three Shapes
+## 🧪 Rung 1 · Toy — Known Answer
+
+`datasets.info_blocks()` is built for exactly this check: two blocks
+$x = [x_1,\dots,x_{d}]$ and $y = [y_1,\dots,y_{d}]$ from a shared factor model whose
+mutual information has a **closed form**, printed in `truth["I_xy"]`.  We can dial the
+block width $d$ up and watch each estimator against the truth.
+
+**The algorithm — Gaussianize, then measure.**  Mutual information is the KL
+divergence between the joint and the product of marginals,
+$I(x;y) = D_{\mathrm{KL}}\!\big(p_{x,y}\,\|\,p_x p_y\big)$.  Estimating that directly
+when there are many dimensions is hopeless.  The way out: mutual information does not
+change when you reshape each coordinate by any order-preserving (monotone) map, so we
+first **Gaussianize every column** — turn each one into a standard normal score by its
+rank (the Gaussian-copula transform).  That strips away each column's individual shape
+without touching how the columns depend on one another, and what is left is a joint
+whose dependence we can read straight off its covariance:
 
 ```{python}
-rng = np.random.default_rng(0)
-n = 3000
-indep = (rng.normal(size=n), rng.normal(size=n))
-lin = rng.multivariate_normal([0, 0], [[1, 0.7], [0.7, 1]], size=n)
-s = rng.normal(size=n); curve = (s, s**2 + 0.3 * rng.normal(size=n))
+def gaussianize_cols(X: Float[Array, "n d"]) -> Float[Array, "n d"]:
+    """Gaussianize each column — rank → standard normal (the Gaussian-copula transform).
 
-shapes = [("independent", indep),
-          ("linear ρ=0.7", (lin[:, 0], lin[:, 1])),
-          ("U-shape (curved)", curve)]
-for name, (xx, yy) in shapes:
-    print(f"{name:<18} MI ≈ {mutual_information_xy(xx, yy):.3f} nats")
+    Reuses the chapter's `gaussianize_1d` column by column.  Strips each marginal's
+    shape so only the dependence structure is left for the covariance to capture.
+    """
+    return np.column_stack([gaussianize_1d(X[:, j]) for j in range(X.shape[1])])
+
+
+def block_mi_bits(x: Float[Array, "n dx"], y: Float[Array, "n dy"]) -> float:
+    """Mutual information between two blocks — Gaussianize-then-Gaussian-MI   [bits].
+
+    Gaussianize every column, then on the normal scores   I(x;y) = ½·ln( |Σx|·|Σy| / |Σ| )
+    — the exact MI of the Gaussian their copula now is.
+    """
+    dx = x.shape[1]
+
+    Z: Float[Array, "n d"] = gaussianize_cols(np.column_stack([x, y]))   # normal scores, d = dx+dy
+    Zc: Float[Array, "n d"] = Z - Z.mean(0)                              # centre each column
+    Σ: Float[Array, "d d"] = einx.dot("n i, n j -> i j", Zc, Zc) / len(Z)   # Σ = (1/n)·ZᵀZ — copula covariance
+
+    _, logdet = np.linalg.slogdet(Σ)                             # ln|Σ|
+    _, logdet_x = np.linalg.slogdet(np.atleast_2d(Σ[:dx, :dx]))  # ln|Σx| — top-left x·x slab
+    _, logdet_y = np.linalg.slogdet(np.atleast_2d(Σ[dx:, dx:]))  # ln|Σy| — bottom-right y·y slab
+
+    return 0.5 * (logdet_x + logdet_y - logdet) / LN2            # I(x;y) = ½·ln(|Σx||Σy|/|Σ|)  [bits]
+
+
+def hist_block_mi_bits(
+    x: Float[Array, "n dx"], y: Float[Array, "n dy"], bins: int = 5
+) -> float:
+    """The skip-Gaussianization alternative: bin the joint directly   [bits].
+
+    Sum   Σ pᵢⱼ·log₂[ pᵢⱼ/(pᵢ·pⱼ) ]   over a (bins,)*d table.  Fine in 1-D; in many
+    dimensions the cells empty out and the estimate breaks — the curse we Gaussianize past.
+    """
+    dx = x.shape[1]
+    d = x.shape[1] + y.shape[1]
+    XY: Float[Array, "n d"] = np.column_stack([x, y])
+
+    counts: Float[Array, "..."] = np.histogramdd(XY, bins=bins)[0]   # (bins,)*d joint table
+    p: Float[Array, "..."] = counts / counts.sum()                   # pᵢⱼ — joint cell probabilities
+    px: Float[Array, "..."] = p.sum(axis=tuple(range(dx, d)))        # pᵢ — marginal over the y axes
+    py: Float[Array, "..."] = p.sum(axis=tuple(range(dx)))           # pⱼ — marginal over the x axes
+    p_indep: Float[Array, "..."] = np.tensordot(px, py, axes=0)      # pᵢ·pⱼ under independence
+
+    m = p > 0                                                        # 0·log0 = 0 by convention
+    return float((p[m] * np.log2(p[m] / p_indep[m])).sum())          # Σ pᵢⱼ·log₂[pᵢⱼ/(pᵢ·pⱼ)]  [bits]
 ```
 
-See the data behind those numbers — the same scatter, three different
-dependencies:
+At $d = 1$ — a scalar pair — Gaussianizing first changes nothing the histogram cannot
+also reach, and both land on the truth.  Widen the blocks and the gap opens: the
+histogram does not just lose accuracy, it **explodes**, because the joint cells empty
+out and read as spurious structure.  The Gaussianize-then-MI estimator stays honest —
+the covariance of the normal scores never needs a populated grid.
 
 ```{python}
-#| label: fig-tool3-shapes
-#| fig-cap: "The three pairs whose MI is reported above. MI is ~0 for the independent cloud and lights up for both the linear tilt and the curve (which a correlation would miss)."
-fig, axes = plt.subplots(1, 3, figsize=(12, 3.8))
-for ax, (name, (xx, yy)) in zip(axes, shapes):
-    ax.scatter(xx, yy, s=8, c=COOL, alpha=0.3, edgecolors="none")
-    ax.set_title(f"{name}\nMI ≈ {mutual_information_xy(xx, yy):.2f} nats", fontsize=11)
-    ax.set_xticks([]); ax.set_yticks([]); despine(ax)
-fig.tight_layout()
-plt.show()
+#| label: fig-curse-compute
+# Sweep the block width d and read all three numbers — truth, Gaussianize-then-MI, histogram.
+widths = [1, 2, 3, 4]
+truth, gauss, hist = [], [], []
+for d in widths:
+    b = datasets.info_blocks(n=4000, dx=d, dy=d, within=0.5, between=0.5, seed=1)
+    truth.append(b["truth"]["I_xy"] / LN2)               # I(x;y) closed form, nats → bits
+    gauss.append(block_mi_bits(b["x"], b["y"]))          # Gaussianize-then-Gaussian-MI  [bits]
+    hist.append(hist_block_mi_bits(b["x"], b["y"], bins=5))   # raw (bins,)*2d histogram MI  [bits]
+
+print(f"{'d':>2}{'truth':>9}{'gauss':>9}{'hist':>9}   (bits)")
+for d, t, g, h in zip(widths, truth, gauss, hist):
+    print(f"{d:>2}{t:>9.3f}{g:>9.3f}{h:>9.3f}")
 ```
 
-Independent ≈ a small finite-sample floor; both dependent shapes light up —
-including the curve a correlation would miss.
-
----
-
-## 2 · Validate Against the Gaussian Closed Form
-
-For a Gaussian pair, $I = -\tfrac12 \ln(1-\rho^2)$.
-
 ```{python}
-#| label: fig-tool3-validate
-#| fig-cap: "Estimated vs exact mutual information across correlations."
-rhos = np.linspace(0, 0.9, 10)
-truth = [-0.5 * np.log(1 - r**2) for r in rhos]
-est = []
-for r in rhos:
-    xy = rng.multivariate_normal([0, 0], [[1, r], [r, 1]], size=4000)
-    est.append(mutual_information_xy(xy[:, 0], xy[:, 1], bins=24))
-
-fig, ax = plt.subplots(figsize=(6.8, 4.2))
-ax.plot(rhos, truth, c=INK, lw=2.4, label="exact")
-ax.plot(rhos, est, "o", c=COOL, label="estimate")
-ax.set_xlabel("ρ"); ax.set_ylabel("MI (nats)")
+#| label: fig-curse
+#| fig-cap: "Why Gaussianize first. As the block width d grows (info_blocks, n=4000, equal within/between loadings), the closed-form truth (black) drifts up gently. The Gaussianize-then-MI estimator (blue) tracks it. Skipping Gaussianization and binning the raw joint (red) tracks at d=1 but blows up past it — by d=4 it reports ~10× the true bits, pure binning artefact. In more than one dimension only the Gaussianized estimate is usable; that is the whole reason this chapter reshapes the data before it measures."
+fig, ax = plt.subplots(figsize=(7.6, 4.2))
+ax.plot(widths, truth, color=INK, lw=2, marker="o", label="closed-form truth")
+ax.plot(widths, gauss, color=COOL, lw=2, marker="s", label="Gaussianize-then-MI")
+ax.plot(widths, hist, color=CRASH, lw=2, marker="^", label="histogram (skip Gaussianize)")
+ax.set_xticks(widths); ax.set_xlabel("block width  d  (each side is d-dimensional)")
+ax.set_ylabel("I(x; y)  (bits)")
+ax.set_title("Gaussianizing first is what survives past 1-D", fontsize=12)
 ax.legend(fontsize=9, frameon=False); despine(ax)
-fig.tight_layout()
-plt.show()
+fig.tight_layout(); plt.show()
 ```
 
-::: {.callout-tip}
-## What to Look for
-The estimate tracks the truth but sits a touch high at ρ=0 — the finite-sample
-**bias floor** of any histogram MI.  Always compare a measured MI to the floor on
-shuffled data, never to zero.
+The histogram's failure is not only about *width*.  Switch the factors to heavy-tailed
+(`fat_tails=True`) at a fixed $d=2$ and the coarse grid breaks the *other* way — its
+cells now cluster around the dense centre and starve the tails, so it **under**-reads
+the shared bits.  Gaussianizing first is immune: the rank transform sends any
+marginal, fat tails and all, to the same clean normal scores.
+
+```{python}
+# Same d=2 blocks, Gaussian factors vs heavy-tailed factors — the histogram now breaks the other way.
+bg = datasets.info_blocks(n=4000, dx=2, dy=2, within=0.5, between=0.5, seed=1)
+bf = datasets.info_blocks(n=4000, dx=2, dy=2, within=0.5, between=0.5,
+                          fat_tails=True, seed=1)
+
+print(f"d=2, I(x;y) against the Gaussian reference (= {bg['truth']['I_xy']/LN2:.3f} bits)")
+print(f"{'factors':<14}{'gauss':>9}{'hist':>9}   (bits)")
+print(f"{'Gaussian':<14}{block_mi_bits(bg['x'], bg['y']):>9.3f}"
+      f"{hist_block_mi_bits(bg['x'], bg['y']):>9.3f}")
+print(f"{'fat tails':<14}{block_mi_bits(bf['x'], bf['y']):>9.3f}"
+      f"{hist_block_mi_bits(bf['x'], bf['y']):>9.3f}   ← histogram now under-reads")
+```
+
+The known answer is unambiguous: Gaussianize first, then measure the copula
+covariance — and never trust a raw histogram above one dimension, on either fat tails
+or wide blocks.
+
+---
+
+## 🎭 Rung 2 · Toy-Real — A Stylized Market
+
+Now the *same* estimator on a small, real block — the "toy example of real data" from
+the data primer: two banks against two energy majors,
+$x = [\text{JPM}, \text{BAC}]$, $y = [\text{XOM}, \text{CVX}]$.  **What we are looking
+for:** how much these two sectors move together.  There is **no closed form** here — no
+exact answer to check against — so we validate two ways.  First a **shuffle floor**:
+scramble the data so there is provably no link, and read what the estimator reports (it
+should read near zero).  Second the **histogram disagreement**: on real fat tails the
+coarse 4-D grid and the Gaussianized covariance no longer agree, and the floor tells us
+which one to believe.
+
+From here on we report the information on the **Linfoot R** scale (MI rescaled to
+R ∈ [0,1], which equals |ρ| for a Gaussian, so it lines up directly with the
+correlation-scale measures), rather than raw bits.
+
+```{python}
+R = datasets.load_returns()
+x_blk: Float[Array, "n_days 2"] = R[["JPM", "BAC"]].to_numpy()    # block x — two banks
+y_blk: Float[Array, "n_days 2"] = R[["XOM", "CVX"]].to_numpy()    # block y — two energy
+print(f"real block: x = [JPM, BAC] {x_blk.shape}   y = [XOM, CVX] {y_blk.shape}")
+
+# MI rescaled to Linfoot R ∈ [0,1], = |ρ| for a Gaussian, so it is comparable to
+# the correlation-scale measures.  block_mi_bits returns bits → nats → R.
+r_real = linfoot_r(block_mi_bits(x_blk, y_blk) * LN2)               # I([JPM,BAC]; [XOM,CVX])
+r_hist = linfoot_r(hist_block_mi_bits(x_blk, y_blk, bins=5) * LN2)  # naive 4-D histogram
+
+# Shuffle floor: break the x↔y pairing by permuting y's rows; a sound estimator → ~0
+rng = np.random.default_rng(0)
+floor: Float[Array, "n_shuffles"] = np.array(
+    [linfoot_r(block_mi_bits(x_blk, y_blk[rng.permutation(len(y_blk))]) * LN2)
+     for _ in range(40)]
+)
+
+print(f"\nI([JPM,BAC]; [XOM,CVX])   (MI rescaled to Linfoot R ∈ [0,1])")
+print(f"  Gaussianize-then-MI = {r_real:.3f} info R")
+print(f"  histogram (4-D)     = {r_hist:.3f} info R   ← disagrees: real fat tails break it")
+print(f"  shuffle floor       = {floor.mean():.3f} ± {floor.std():.3f} info R")
+```
+
+```{python}
+#| label: fig-realtoy
+#| fig-cap: "Trusting a block-MI estimate with no closed form. Three readings of I([JPM,BAC]; [XOM,CVX]), all on the Linfoot R scale (R ∈ [0,1], = |ρ| for a Gaussian). The shuffle floor (grey, with its spread as a whisker) is what the estimator reads once x and y are decoupled — essentially zero. The Gaussianize-then-MI estimate (blue) sits far above it, so the dependence is real, not estimator bias. The histogram (red), fooled by the fat tails its coarse 4-D grid cannot resolve, under-reads well below it. The floor, not the histogram, is the honest cross-check on real data."
+labels = ["shuffle floor\n(x, y decoupled)", "histogram\n(4-D bins)", "Gaussianize\n-then-MI"]
+values = [floor.mean(), r_hist, r_real]
+errors = [floor.std(), 0.0, 0.0]                   # only the floor has a spread to show
+colors = ["0.7", CRASH, COOL]
+
+fig, ax = plt.subplots(figsize=(8.4, 3.4))
+ax.barh(labels, values, xerr=errors, color=colors, alpha=0.95,
+        error_kw=dict(ecolor=INK, capsize=4))
+for y, v in enumerate(values):
+    ax.text(v + 0.012, y, f"{v:.3f}", va="center", fontsize=10, color=INK)
+ax.set_xlim(0, r_real * 1.28)                      # headroom so the value labels fit
+ax.set_xlabel("info R  (MI on the Linfoot scale, 0–1)")
+ax.set_title("The estimate clears its floor — the dependence is real", fontsize=12)
+despine(ax); fig.tight_layout(); plt.show()
+```
+
+::: {.callout-note icon=false}
+## Where This Block Comes From
+The `[JPM, BAC]` and `[XOM, CVX]` blocks — and why a *sector* is a block — are built
+in the data primer's
+[Co-Movement & Co-Crashes](../../data/04-co-movement-and-co-crashes.qmd).  This lab
+reloads them; the only lab-local step is the shuffle floor.
 :::
 
+The Gaussianize-then-MI estimate, **info R ≈ 0.54**, clears its near-zero floor
+decisively — the two sectors genuinely share information — while the histogram, fooled
+by the fat tails, reports something much lower.  On real data with many dimensions the
+floor *is* the validation; the histogram is not.  This is the chapter's claim made
+concrete: reshape each margin to normal *first*, and the dependence the raw grid mangles
+becomes a clean number.
+
 ---
 
-## 3 · Your Turn
+## 📈 Rung 3 · Real — The Full Basket
 
-- Estimate the bias floor: shuffle one column (`rng.permutation`) and re-measure
-  MI.  Subtract it as a baseline.
-- Vary `bins`.  How does the bias floor change with resolution and sample size?
+A *sector* is a block, so the same `block_mi_bits` now answers a portfolio question:
+how much information does each sector share with each other sector?  Group the basket
+into sector blocks (the grouping is the data primer's, reloaded) and read off two
+quantities — the between-block $I(\text{Banks}; \text{Energy})$, reported as **info R**
+on the Linfoot scale (R ∈ [0,1], = |ρ| for a Gaussian, comparable to correlation), and
+the **total correlation** of the whole 14-name basket, $T(\text{all})$, the same
+$-\tfrac12\ln|\Sigma|$ on the full copula covariance.  Total correlation stays in
+**bits**: it is the kind of quantity you add up across the basket, and the Linfoot
+rescaling is not additive, so bits are the honest unit there.  **What we are looking
+for:** the sector pairs with the brightest cells — the ones that share the most of
+their movement.
 
-Next, the do-the-job track: [Job A — validate the estimator](lab-jobA-validate.qmd).
+```{python}
+META = datasets.load_basket_meta()
+sector_of = dict(zip(META["ticker"], META["sector"]))
+sectors = ["Banks", "Tech", "Energy", "Utilities", "Staples"]
+blocks: dict[str, Float[Array, "n_days d"]] = {
+    s: R[[t for t in R.columns if sector_of[t] == s]].to_numpy() for s in sectors
+}
+for s in sectors:
+    print(f"  {s:<10s} block: {blocks[s].shape[1]} names")
+
+# Between-block: banks vs energy — the headline I(x; y) on real sector blocks,
+# rescaled bits → nats → Linfoot R ∈ [0,1] so it sits on the correlation scale.
+r_be = linfoot_r(block_mi_bits(blocks["Banks"], blocks["Energy"]) * LN2)
+
+# Whole-basket total correlation: gaussianize all 14 columns, then T = -½·ln|Σ| [bits].
+# This one stays in bits — total correlation is additive, and Linfoot R is not.
+Z_all: Float[Array, "n_days 14"] = gaussianize_cols(R.to_numpy())     # normal scores, all names
+Zc: Float[Array, "n_days 14"] = Z_all - Z_all.mean(0)                 # centre each column
+Σ_all: Float[Array, "14 14"] = einx.dot("n i, n j -> i j", Zc, Zc) / len(Z_all)   # Σ = (1/n)·ZᵀZ
+_, logdet_all = np.linalg.slogdet(Σ_all)                             # ln|Σ|
+T_all = -0.5 * logdet_all / LN2                      # T(all 14) = -½·ln|Σ| — total redundancy  [bits]
+
+print(f"\nI(Banks; Energy) = {r_be:.3f} info R   (between two sector blocks)")
+print(f"T(all 14 names)  = {T_all:.3f} bits   (redundancy across the whole basket)")
+```
+
+The single between-block number sits inside a fuller picture: fill the group-vs-group
+MI matrix so every sector pair can be read at once.
+
+```{python}
+#| label: fig-sector-mi-compute
+# Fill the symmetric group-vs-group MI matrix — one block_mi_bits call per sector pair,
+# each rescaled bits → nats → Linfoot R ∈ [0,1] so cells are comparable to correlation.
+n_s = len(sectors)
+MI: Float[Array, "n_s n_s"] = np.zeros((n_s, n_s))                   # symmetric matrix, info R
+for i in range(n_s):
+    for j in range(i + 1, n_s):
+        r = linfoot_r(block_mi_bits(blocks[sectors[i]], blocks[sectors[j]]) * LN2)   # info R(sectorᵢ; sectorⱼ)
+        MI[i, j] = MI[j, i] = r                                      # symmetric: I(x;y) = I(y;x)
+```
+
+```{python}
+#| label: fig-sector-mi
+#| fig-cap: "Group-vs-group mutual information between sector blocks, Gaussianize-then-MI estimator, shown as info R on the Linfoot scale (R ∈ [0,1], = |ρ| for a Gaussian). Bright = two sectors that share a lot of their movement (redundant — little diversification against each other); dark = sectors that move more independently. The brightest cells pair like with like — the two defensives (Utilities–Staples) and the cyclicals (Banks–Energy, Banks–Tech); the darkest pair a cyclical with a defensive (Tech–Utilities, Banks–Utilities), the cross-style combinations that move most on their own."
+fig, ax = plt.subplots(figsize=(6.6, 5.6))
+im = ax.imshow(MI, cmap="magma")
+ax.set_xticks(range(n_s)); ax.set_xticklabels(sectors, rotation=45, ha="right", fontsize=9)
+ax.set_yticks(range(n_s)); ax.set_yticklabels(sectors, fontsize=9)
+for i in range(n_s):
+    for j in range(n_s):
+        if i != j:
+            ax.text(j, i, f"{MI[i, j]:.2f}", ha="center", va="center",
+                    color="white" if MI[i, j] < MI.max() * 0.6 else "black", fontsize=9)
+fig.colorbar(im, ax=ax, fraction=0.046, label="info R  (MI on the Linfoot scale, 0–1)")
+ax.set_title("Information shared between sectors", fontsize=12)
+fig.tight_layout(); plt.show()
+```
+
+::: {.callout-note icon=false}
+## Where This Data Comes From
+The 14-name panel, its sector grouping, and the co-crash structure these blocks ride
+on are laid bare in the data primer —
+[Co-Movement & Co-Crashes](../../data/04-co-movement-and-co-crashes.qmd), which builds
+exactly the within-block ($T$) versus between-block ($I$) split this rung reports.
+This lab reloads the panel and the sectors; it never re-derives them.
+:::
+
+Two numbers, two scales of the same idea: banks and energy share information at
+**info R ≈ 0.56** as blocks — about as much as two assets with that correlation — while
+the whole 14-name book carries **~7 bits** of total redundancy, the compressible
+overlap a diversified portfolio is fighting.  The pair sits on the Linfoot scale so it
+lines up with correlation; the whole-basket total stays in bits because it is an
+additive total, not a single pairing.  Both came from one estimator,
+`gaussianize → covariance → log-determinants`, with only the slab of $\Sigma$ changing.
+
+---
+
+## 💰 Rung 4 · Application — High-D Group-vs-Group MI
+
+The deliverable is a ranked, **floor-debiased** report: of every pair of sectors, how
+much information do they share, and which pair actually diversifies?  We report it as
+**info R** on the Linfoot scale (R ∈ [0,1], = |ρ| for a Gaussian, comparable to the
+correlation-scale measures).  This is mutual information doing what no correlation cell
+can — comparing a whole multidimensional group against another whole group, in many
+dimensions, with each estimate checked against its own shuffle floor so what we report
+is dependence, not estimator bias.  **What we are looking for:** the lowest bars, the
+sector pairs that share the *least* and so diversify a portfolio.
+
+```{python}
+#| label: fig-report-compute
+defensive = {"Utilities", "Staples"}
+
+
+def is_cross_style(name: str) -> bool:
+    """One cyclical sector and one defensive — the diversifying combinations."""
+    a, b = name.split("–")
+    return (a in defensive) != (b in defensive)   # exactly one side is defensive
+
+
+# Each sector pair, debiased by its own shuffle floor, on the info-R scale:
+#   info R = R(x;y) − E[R(x; shuffled y)],  the reading once x↔y is decoupled (so ≈ 0).
+report = []
+for i in range(n_s):
+    for j in range(i + 1, n_s):
+        xi, yj = blocks[sectors[i]], blocks[sectors[j]]
+        floor_ij = np.mean(
+            [linfoot_r(block_mi_bits(xi, yj[rng.permutation(len(yj))]) * LN2)
+             for _ in range(10)]
+        )
+        report.append((f"{sectors[i]}–{sectors[j]}", MI[i, j] - floor_ij))   # floor-debiased info R
+
+report.sort(key=lambda r: r[1])
+
+print(f"{'sector pair':<20s}{'shared info (info R)':>20s}   style")
+print("-" * 48)
+for name, r in report[::-1]:
+    print(f"{name:<20s}{r:>20.3f}   {'cross (diversifies)' if is_cross_style(name) else 'like'}")
+```
+
+```{python}
+#| label: fig-report
+#| fig-cap: "The high-D group-vs-group information report, on the Linfoot info-R scale (R ∈ [0,1], = |ρ| for a Gaussian). Each bar is the shared information between two sector blocks (5×3, 5×2, … dimensional), debiased by its shuffle floor (≈0 throughout, confirming these are real). Information pools among like sectors (red): the two defensives Utilities–Staples share the most of all, the cyclicals Banks–Energy/Banks–Tech close behind. Every cross-style pair — a cyclical against a defensive (green) — sits lower. The green bars at the bottom are where diversification actually lives."
+fig, ax = plt.subplots(figsize=(7.8, 4.4))
+colors = [plotting.PALETTE["green"] if is_cross_style(n) else CRASH for n, _ in report]
+ax.barh([n for n, _ in report], [b for _, b in report], color=colors)
+ax.set_xlabel("shared info R, floor-debiased  (Linfoot scale, 0–1)")
+ax.set_title("Like pairs with like; cross-style pairs diversify", fontsize=12)
+despine(ax); fig.tight_layout(); plt.show()
+```
+
+Read the report as a diversification map: information pools among **like** sectors —
+the two defensives share the most of all, the cyclicals cluster close behind — while
+the **cross-style** pairs, a cyclical sector against a defensive one (Tech–Utilities,
+Banks–Utilities), share the least.  Those low green bars are the genuinely independent
+movement a portfolio wants.  All of it rests on one move we *proved* against a closed
+form before trusting it on returns: **Gaussianize every margin, then measure the
+covariance** — high-dimensional mutual information that a histogram could never reach.
+
+That move generalises straight to the full estimator: where this lab Gaussianized each
+margin and stopped at the *copula covariance*, [Job B · Gaussianize the
+Basket](lab-jobB-gaussianize-basket.qmd) runs the same reshape end to end on the real
+book, and the [uncertainty chapter](../../uncertainty/index.qmd) carries these normal
+scores forward into risk.

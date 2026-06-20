@@ -1,6 +1,6 @@
 ---
 title: "Tool 3 — Adversarial Removal"
-subtitle: "The learned Dep and its instability"
+subtitle: "Learn the dependence: an adversary you train to fail"
 ---
 
 ```{python}
@@ -8,108 +8,480 @@ subtitle: "The learned Dep and its instability"
 import sys, pathlib
 sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
 from lectures import plotting, datasets
-from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
-from lectures.measures import cka_rbf
-from lectures.neutralize import fair_fit
+from lectures.plotting import INK, COOL, WARM, CRASH, BAND, despine, annotate_box  # noqa: F401
 plotting.set_style("notes")
-import numpy as np, matplotlib.pyplot as plt
+import numpy as np
+import matplotlib.pyplot as plt
+import einx                      # linear algebra with the axes spelled out
+from jaxtyping import Float      # shape annotations: Float[Array, "n"]
+
+Array = np.ndarray
+GREEN = plotting.PALETTE["green"]
 ```
 
-*Learn-the-tool track · Lab 3 of 3.*
+*Learn-the-tool track · Lab 3.*
 
-Instead of a *fixed* dependence measure, **learn** one: a probe tries to recover
-$S$ from the predictions, and "neutral" means the probe fails.  This lab measures
-that recoverability directly.
+The two earlier tools fixed the dependence measure in advance — a probe of a
+chosen degree (Tool 1), a kernel of a chosen width (Tool 2).  This lab **learns**
+the measure instead.  We train a predictor whose internal representation feeds an
+**adversary** — a second model whose only job is to recover the protected attribute
+(here, a person's `sex`) — and we train the predictor to *fool* it.  This is a
+min–max game, $\min_{\text{predictor}}\ \max_{\text{adversary}}$: the predictor
+tries to push the dependence between its representation and the attribute down,
+while the adversary tries to find any leftover trace of it.  We keep playing until
+the best adversary we can train is reduced to guessing.  The *tool* — the
+adversarial pair, and the gradient-reversal layer that couples them — is built once
+on Rung 1 and reused unchanged; only the **data grows up under it**, from a toy
+whose answer we set by hand to a calibrated frontier on real Census income.
+
+**What you will produce:** the **accuracy–fairness frontier** for the real income
+model — a curve that traces exactly what each step toward fairness costs in
+accuracy, and where that fairness is nearly free.
 
 ---
 
-## 1 · The Adversary's View
+## 🧪 Rung 1 · Toy — Known Answer
 
-For a model neutralized at weight $\mu$, fit a probe $S \approx g(\hat y)$ and
-score how much of $S$ it recovers ($R^2$).  A fair model leaves nothing to
-recover.
+Start where you set the truth yourself.  `datasets.credit_scores_by_group()`
+builds a toy scorecard whose latent score is shifted by a sensitive `group`
+(`latent = noise + gap·group`): **the score carries the group on purpose.**  Hand a
+predictor only the score and ask it to predict `repaid`, and its representation
+*must* inherit the group — so an adversary reading that representation can recover
+the group well above chance.  The whole question is whether we can train the
+predictor to scrub the group out of its representation while still predicting
+`repaid` — and here we can check the answer, because we *built* the dependence in.
 
 ```{python}
-d = datasets.fair_regression(n=1000, seed=0)
-x, S, y = d["x"], d["s"], d["y"]
+#| label: data-toy
+toy = datasets.credit_scores_by_group(n=600, gap=0.8, seed=0)
 
-def adversary_r2(pred, S, degree=2):
-    coef = np.polyfit(pred, S, degree)
-    S_hat = np.polyval(coef, pred)
-    return max(1 - np.mean((S_hat - S) ** 2) / np.var(S), 0.0)
+s_toy: Float[Array, "n"] = toy["group"].astype("float32")             # protected attribute (0/1)
+y_toy: Float[Array, "n"] = toy["repaid"].astype("float32")           # task label
+X_toy: Float[Array, "n 1"] = toy["score"][:, None].astype("float32")   # the only feature
 
-mus = [0.0, 0.5, 2.0, 8.0, 20.0]
-print(f"{'μ':>6}  {'CKA(ŷ,S)':>9}  {'adversary R²':>13}")
-print("-" * 32)
-r2 = []
-for mu in mus:
-    p = fair_fit(x, y, S, mu=mu)
-    rr = adversary_r2(p, S)
-    r2.append(rr)
-    print(f"{mu:>6g}  {cka_rbf(p, S):>9.3f}  {rr:>13.3f}")
+base_toy = max(s_toy.mean(), 1 - s_toy.mean())      # always-guess-majority floor: max(p, 1−p)
+
+print(f"feature: score only   ({X_toy.shape[0]} rows)")
+print(f"group balance: {s_toy.mean():.0%} in group 1   →  base rate {base_toy:.0%}")
+```
+
+**The algorithm — the adversarial game.**  Three pieces share one network.  An
+**encoder** turns features into a representation $z$; a **predictor** head maps $z$
+to the task label; an **adversary** head maps $z$ to the protected attribute.  The
+predictor and adversary pull in opposite directions:
+
+```
+min over (encoder, predictor)   task_loss(ŷ, y)  −  λ · adv_loss(ŝ, s)
+max over (adversary)                                  adv_loss(ŝ, s)
+
+  ŷ = predictor(encoder(x))     # the forecast — wants to be accurate
+  ŝ = adversary(encoder(x))     # the attacker — wants to recover s
+  λ  = adversary weight         # how hard the encoder must hide s
+```
+
+The adversary is trained *to recover* $s$; the encoder is trained to make it
+*fail*.  The trick that lets us train both in one `fit` call is a
+**gradient-reversal layer**.  On the forward pass it does nothing — it passes the
+representation straight through.  On the backward pass (when the network updates its
+weights) it flips the sign of the gradient and scales it by $\lambda$.  The effect:
+the same training step that *improves* the adversary at reading $s$ simultaneously
+*pushes the encoder to hide $s$* from it.  Spelled out:
+
+```{python}
+#| label: toolkit
+import os
+os.environ["KERAS_BACKEND"] = "jax"          # set BEFORE importing keras — Keras 3 on CPU JAX
+import keras
+from keras import layers
+
+
+@keras.saving.register_keras_serializable()
+class GradientReversal(layers.Layer):
+    """Identity forward; multiplies the gradient by −λ backward (DANN).
+
+    forward:   GRL(z) = z
+    backward:  ∂GRL/∂z = −λ · I      so descent on the adversary's loss becomes
+                                     *ascent* for the encoder — it learns to hide s.
+    """
+
+    def __init__(self, lam: float = 1.0, **kw):
+        super().__init__(**kw)
+        self.lam = float(lam)
+
+    def call(self, z):
+        # (1+λ)·stop_grad(z) − λ·z  ≡  z forward, −λ·grad backward
+        return keras.ops.stop_gradient((1.0 + self.lam) * z) - self.lam * z
+
+
+def adversarial_fit(
+    X: Float[Array, "n d"],
+    y: Float[Array, "n"],
+    s: Float[Array, "n"],
+    lam: float,
+    rep_dim: int = 8,
+    epochs: int = 200,
+    batch_size: int | None = None,
+    seed: int = 0,
+):
+    """Train the min–max pair; return (ŷ, ŝ) on X — each shape (n,).
+
+    Encoder → predictor head (task) and → GradientReversal(λ) → adversary head (s).
+    Reused unchanged on every rung; only the data fed in escalates.
+    """
+    keras.utils.set_random_seed(seed)                         # reproducible init
+    inp = keras.Input(shape=(X.shape[1],))
+    h = layers.Dense(rep_dim * 2, activation="tanh")(inp)
+    z = layers.Dense(rep_dim, activation="tanh", name="rep")(h)   # the representation
+    y_out = layers.Dense(1, activation="sigmoid", name="task")(z)         # predictor
+    g = layers.Dense(rep_dim * 2, activation="tanh")(GradientReversal(lam)(z))
+    s_out = layers.Dense(1, activation="sigmoid", name="adv")(g)          # adversary
+
+    model = keras.Model(inp, [y_out, s_out])
+    model.compile(optimizer=keras.optimizers.Adam(0.005),
+                  loss={"task": "binary_crossentropy", "adv": "binary_crossentropy"})
+    model.fit(X, {"task": y[:, None], "adv": s[:, None]},
+              epochs=epochs, batch_size=batch_size or len(X), verbose=0)
+
+    ŷ: Float[Array, "n"]                                      # task forecast P(y=1)
+    ŝ: Float[Array, "n"]                                      # adversary guess P(s=1)
+    ŷ, ŝ = (np.asarray(p)[:, 0] for p in model.predict(X, verbose=0))
+    return ŷ, ŝ
+```
+
+Run the game at $\lambda=0$ (adversary present but not yet fighting the encoder — so
+just a plain probe) and at a strong $\lambda$, and compare what the adversary
+recovers against its **base-rate floor** — the accuracy it would get for free by
+always guessing the larger group:
+
+```{python}
+#| label: toy-fit
+def adv_accuracy(ŝ: Float[Array, "n"], s: Float[Array, "n"]) -> float:
+    """How often the adversary's guess matches the true attribute (acc = mean(round ŝ == s))."""
+    return float((np.round(ŝ) == s).mean())
+
+
+ŷ0, ŝ0 = adversarial_fit(X_toy, y_toy, s_toy, lam=0.0)    # adversary uncoupled → a probe
+ŷ8, ŝ8 = adversarial_fit(X_toy, y_toy, s_toy, lam=8.0)    # the min–max game switched on
+print(f"base-rate floor               = {base_toy:.0%}   (always guess the majority group)")
+print(f"adversary recovery  (λ=0)     = {adv_accuracy(ŝ0, s_toy):.0%}   (the score leaks the group)")
+print(f"adversary recovery  (λ=8)     = {adv_accuracy(ŝ8, s_toy):.0%}   ← driven down to the floor")
+print(f"task accuracy       (λ=0 → 8) = {(np.round(ŷ0) == y_toy).mean():.0%} → "
+      f"{(np.round(ŷ8) == y_toy).mean():.0%}")
 ```
 
 ```{python}
-#| label: fig-tool3-adv
-#| fig-cap: "Recoverability of S decays toward chance as μ grows."
-fig, ax = plt.subplots(figsize=(7.5, 4.2))
-ax.plot(mus, r2, "-o", c=CRASH, lw=2.2)
-ax.set_xlabel("neutrality weight μ")
-ax.set_ylabel("adversary R² (recoverability of S)")
-ax.set_title("S becomes unrecoverable from the predictions", fontsize=12)
+#| label: fig-toy-adv-compute
+# Sweep the adversary weight λ: train the game at each, record what the adversary recovers.
+λ_grid = [0.0, 1.0, 3.0, 8.0, 20.0]
+adv_curve = []
+
+for lam in λ_grid:
+    _, ŝ = adversarial_fit(X_toy, y_toy, s_toy, lam=lam)
+    adv_curve.append(adv_accuracy(ŝ, s_toy))   # acc → base rate as λ ↑
+```
+
+```{python}
+#| label: fig-toy-adv
+#| fig-cap: "The adversarial game on the toy scorecard. Left: the representation the encoder builds, colored by the dropped group — at λ=0 the two groups separate cleanly (the adversary reads the group straight off the axis), at λ=8 they are scrambled together (nothing left to read). Right: the adversary's recovery accuracy falls from well above its base-rate floor toward the floor as the weight λ grows — the min–max game has driven the dependence between representation and group out, which is exactly what we built in."
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.2))
+
+# left: 1-D score jittered by group, plain vs neutralized adversary score ŝ
+jit: Float[Array, "n"] = 0.04 * np.random.default_rng(0).standard_normal(len(s_toy))
+axL.scatter(X_toy[:, 0], ŝ0 + jit, s=10, c=[COOL if g == 0 else WARM for g in s_toy],
+            alpha=0.5, edgecolors="none")
+axL.set_xlabel("score (the only feature)")
+axL.set_ylabel("adversary ŝ  (λ=0)")
+axL.set_title("λ=0 · the adversary reads the group", fontsize=11)
+despine(axL)
+
+axR.plot(λ_grid, adv_curve, "-o", c=CRASH, lw=2.2, label="adversary recovery")
+axR.axhline(base_toy, color=INK, lw=1.4, ls="--", label="base-rate floor")
+axR.set_xlabel("adversary weight λ")
+axR.set_ylabel("adversary accuracy at recovering group")
+axR.set_ylim(base_toy - 0.05, max(adv_curve) + 0.05)
+axR.set_title("Recovery → base rate as λ grows", fontsize=11)
+axR.legend(frameon=False, fontsize=9)
+despine(axR)
+
+fig.tight_layout()
+plt.show()
+```
+
+The known answer holds: at $\lambda=0$ the adversary recovers the group well above
+chance, and as $\lambda$ grows the *same* game scrubs the group out of the
+representation until the best adversary we can train is reduced to its base rate.
+Unlike a fixed probe or kernel, **the measure is learned** — the adversary adapts
+to whatever shape the leak takes.  That recovery-down-to-the-floor curve is the
+signature this lab tracks all the way up.
+
+---
+
+## 🎭 Rung 2 · Toy-Real — A Stylized Market
+
+A score shifted by a group is honest but blunt.  In real data the leak rarely sits
+in the attribute itself; it hides in a **proxy** — an innocent-looking feature that
+moves together with the attribute (think of how `occupation` tracks `sex`).
+`datasets.fair_regression()` builds that situation on purpose: a sensitive `s`
+drives a target through both a straight-line term and a **curved** one
+(`y = 0.6x + 0.7s + 0.7(s²−1) + noise`), and we feed the predictor only a feature
+that stands in for `s` — never `s` directly.  That curved leak is exactly the hole a
+*linear* removal cannot reach (Tool 1's blind spot).  But our adversary is a neural
+network, so it can learn the curved leak, and the encoder is then forced to scrub
+*that* out too.  **Same `adversarial_fit`, no new code.**
+
+```{python}
+#| label: data-stylized
+d = datasets.fair_regression(n=600, seed=0)
+x: Float[Array, "n"] = d["x"]                            # legitimate feature
+s_raw: Float[Array, "n"] = d["s"]                        # sensitive variable
+y_raw: Float[Array, "n"] = d["y"]                        # y = 0.6x + 0.7s + 0.7(s²−1) + noise
+proxy: Float[Array, "n"] = s_raw + 0.4 * np.random.default_rng(0).standard_normal(len(s_raw))   # a stand-in for s
+
+s_sr: Float[Array, "n"] = (s_raw > np.median(s_raw)).astype("float32")   # binarize s → the attribute to hide
+y_sr: Float[Array, "n"] = (y_raw > np.median(y_raw)).astype("float32")   # binarize the target
+X_sr: Float[Array, "n 2"] = np.column_stack([x, proxy]).astype("float32")    # legit feat + proxy, NO s
+base_sr = max(s_sr.mean(), 1 - s_sr.mean())
+
+# ρ(proxy, s) = ⟨p̃, s̃⟩ / (‖p̃‖·‖s̃‖)   with p̃ = proxy − mean, s̃ = s − mean   (Pearson)
+p_c: Float[Array, "n"] = proxy - proxy.mean()
+s_c: Float[Array, "n"] = s_raw - s_raw.mean()
+ρ_proxy_s = einx.dot("n, n ->", p_c, s_c) / (np.linalg.norm(p_c) * np.linalg.norm(s_c))
+print(f"corr(proxy, s) = {ρ_proxy_s:+.2f}   (the stand-in carries s)")
+
+ŷ0, ŝ0 = adversarial_fit(X_sr, y_sr, s_sr, lam=0.0)     # the SAME game as Rung 1
+ŷ8, ŝ8 = adversarial_fit(X_sr, y_sr, s_sr, lam=8.0)
+print(f"base-rate floor          = {base_sr:.0%}")
+print(f"adversary recovery (λ=0) = {adv_accuracy(ŝ0, s_sr):.0%}   (reads s off the proxy)")
+print(f"adversary recovery (λ=8) = {adv_accuracy(ŝ8, s_sr):.0%}   ← the proxy leak is closed")
+```
+
+```{python}
+#| label: fig-stylized-adv-compute
+# Same λ sweep as Rung 1 — only the data escalated (proxy leak), not the tool.
+λ_grid = [0.0, 1.0, 3.0, 8.0, 20.0]
+adv_curve_sr = []
+
+for lam in λ_grid:
+    _, ŝ = adversarial_fit(X_sr, y_sr, s_sr, lam=lam)
+    adv_curve_sr.append(adv_accuracy(ŝ, s_sr))   # acc → base rate as λ ↑
+```
+
+```{python}
+#| label: fig-stylized-adv
+#| fig-cap: "The same adversarial game on the stylized proxy leak. Left: the proxy is strongly correlated with the dropped s, so at λ=0 the adversary's score ŝ separates the two groups cleanly along the proxy axis. Right: as λ grows the adversary's recovery accuracy collapses from well above its floor down to the base rate — the network adversary learned the proxy leak (including the curve linear neutrality misses), and the encoder was driven to close it. Same tool, one rung more realistic."
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.2))
+
+axL.scatter(proxy[s_sr == 0], ŝ0[s_sr == 0], s=10, c=COOL, alpha=0.5,
+            edgecolors="none", label="low s")
+axL.scatter(proxy[s_sr == 1], ŝ0[s_sr == 1], s=10, c=WARM, alpha=0.5,
+            edgecolors="none", label="high s")
+axL.set_xlabel("proxy (s dropped)")
+axL.set_ylabel("adversary ŝ  (λ=0)")
+axL.set_title("λ=0 · the adversary reads the proxy", fontsize=11)
+axL.legend(frameon=False, fontsize=9)
+despine(axL)
+
+axR.plot(λ_grid, adv_curve_sr, "-o", c=CRASH, lw=2.2, label="adversary recovery")
+axR.axhline(base_sr, color=INK, lw=1.4, ls="--", label="base-rate floor")
+axR.set_xlabel("adversary weight λ")
+axR.set_ylabel("adversary accuracy at recovering s")
+axR.set_ylim(base_sr - 0.05, max(adv_curve_sr) + 0.05)
+axR.set_title("Proxy leak closed as λ grows", fontsize=11)
+axR.legend(frameon=False, fontsize=9)
+despine(axR)
+
+fig.tight_layout()
+plt.show()
+```
+
+Same game, same verdict, one rung more realistic.  The proxy walked `s` back into
+the features, and at $\lambda=0$ a network adversary reads it off — *including* the
+$s^2$ curve a linear method (Tool 1) is blind to.  Turn the weight up and the
+encoder is forced to scrub the proxy's signal out of the representation, curve and
+all.  This is the shape of every real leak: not the attribute, but a stand-in that
+bends with it — and the learned adversary follows whatever shape it takes.  Now we
+go find the real stand-in.
+
+---
+
+## 📈 Rung 3 · Real — The Full Basket
+
+Now the real Census panel.  We **reload** the prepared income data — there is no
+cleaning here; the Census decode, the ACSIncome filter, and the `(X, y, s)` handoff
+all live in [the data primer](../../data/06-the-credit-dataset.qmd) — show a corner,
+and run the *same* adversarial game on the features, with `sex` dropped from the
+inputs.  Here is what we are looking for, and it is the question Tool 1 left open:
+dropping the `sex` column did **not** stop the model from leaking it, because
+`occupation` still carries it.  So can the adversary be driven to *fail* at
+recovering `sex` — and when it does, does the gap between how men and women are
+scored actually shrink?
+
+```{python}
+#| label: real-load
+import pandas as pd
+
+credit = datasets.load_credit().sample(8000, random_state=0).reset_index(drop=True)
+y: Float[Array, "n"] = credit["income_high"].to_numpy().astype("float32")   # target: 1 if income > $50k
+s: Float[Array, "n"] = credit["sex"].to_numpy().astype("float32")           # protected: 1 = male
+X = credit.drop(columns=["income_high", "sex"])           # proxies — sex DROPPED (DataFrame)
+print(f"{len(credit):,} rows × {X.shape[1]} proxy columns   "
+      f"(sex dropped; {s.mean():.0%} male, {y.mean():.0%} high-income)")
+print(X.head(3).to_string(index=False))
+```
+
+::: {.callout-note icon=false}
+## Where This Data Comes From
+The Census decode (`SEX`/`PINCP`/`OCCP` → readable columns), the ACSIncome row
+filter, and the prepared `(X, y, s)` split — including the proof that `occupation`
+recovers `sex` on its own — are laid bare in the data primer,
+[The Income & Fairness Dataset](../../data/06-the-credit-dataset.qmd).  This lab
+reloads that prepared `(X, y, s)` and never re-derives it; the only lab-local steps
+are **one-hot encoding** the categoricals and **standardizing** so the net trains
+on $\mathcal{O}(1)$ inputs — each lab's own modelling choice.
+:::
+
+```{python}
+#| label: real-fit
+Xenc: Float[Array, "n d"] = pd.get_dummies(X, columns=["occupation", "marital"]).to_numpy(dtype="float32")
+Xenc = (Xenc - Xenc.mean(0)) / (Xenc.std(0) + 1e-8)       # z = (x − μ)/σ  → net trains on 𝒪(1)
+base = max(s.mean(), 1 - s.mean())                        # base-rate floor: max(p, 1−p)
+
+
+def group_gap(ŷ: Float[Array, "n"], s: Float[Array, "n"]) -> float:
+    """|P(ŷ=high | male) − P(ŷ=high | female)| — the disparity in positive-prediction rate."""
+    return float(abs(ŷ[s == 1].mean() - ŷ[s == 0].mean()))
+
+
+# bigger panel → minibatch the SAME game (only the data escalated, not the tool)
+ŷ0, ŝ0 = adversarial_fit(Xenc, y, s, lam=0.0, epochs=120, batch_size=256)   # plain model
+ŷ8, ŝ8 = adversarial_fit(Xenc, y, s, lam=8.0, epochs=120, batch_size=256)   # neutralized
+print(f"base-rate floor                = {base:.0%}   (always guess 'male')")
+print(f"adversary recovers sex (λ=0)   = {adv_accuracy(ŝ0, s):.0%}   ← occupation still leaks it")
+print(f"adversary recovers sex (λ=8)   = {adv_accuracy(ŝ8, s):.0%}   ← driven back to its floor")
+print(f"group gap in predictions       = {group_gap(ŷ0, s):.3f} → {group_gap(ŷ8, s):.3f}")
+print(f"task accuracy                  = {(np.round(ŷ0) == y).mean():.0%} → "
+      f"{(np.round(ŷ8) == y).mean():.0%}")
+```
+
+```{python}
+#| label: fig-real-adv-compute
+# Sweep λ on the real panel: at each weight record adversary recovery, group gap, task accuracy.
+λ_grid = [0.0, 1.0, 2.0, 4.0, 8.0, 16.0]
+adv_real, gap_real, acc_real = [], [], []
+
+for lam in λ_grid:
+    ŷ, ŝ = adversarial_fit(Xenc, y, s, lam=lam, epochs=120, batch_size=256)
+    adv_real.append(adv_accuracy(ŝ, s))                  # acc of recovering sex from z
+    gap_real.append(group_gap(ŷ, s))                     # |P(ŷ|male) − P(ŷ|female)|
+    acc_real.append(float((np.round(ŷ) == y).mean()))    # task accuracy
+```
+
+```{python}
+#| label: fig-real-adv
+#| fig-cap: "The adversarial game on the real ACS income panel, sex dropped. Left: the adversary's recovery of sex falls from above its base-rate floor (λ=0, occupation leaking it) down to the floor as λ grows — the encoder scrubs sex out of the representation it could only have absorbed through occupation. Right: the group gap in the model's high-income predictions shrinks in lock-step. The same min–max game that scrubbed a toy now neutralizes a real income model, with the adversary's failure and the gap's collapse moving together."
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11.5, 4.2))
+
+axL.plot(λ_grid, adv_real, "-o", c=CRASH, lw=2.2, label="adversary recovery")
+axL.axhline(base, color=INK, lw=1.4, ls="--", label="base-rate floor")
+axL.set_xlabel("adversary weight λ")
+axL.set_ylabel("adversary accuracy at recovering sex")
+axL.set_title("Sex becomes unrecoverable", fontsize=11)
+axL.legend(frameon=False, fontsize=9)
+despine(axL)
+
+axR.plot(λ_grid, gap_real, "-o", c=WARM, lw=2.2)
+axR.set_xlabel("adversary weight λ")
+axR.set_ylabel("group gap in predictions")
+axR.set_title("…and the group gap shrinks with it", fontsize=11)
+despine(axR)
+
+fig.tight_layout()
+plt.show()
+```
+
+Read the two panels together: as the adversary weight rises, its ability to recover
+`sex` from the representation falls to the base-rate floor, and the gap between men's
+and women's high-income predictions shrinks right alongside it.  The same game that
+scrubbed a toy now neutralizes a real income model — dropping `sex` did nothing to
+`occupation`, but the learned adversary forced the encoder to forget it.  One
+question is left: what did that cost?
+
+---
+
+## 💰 Rung 4 · Application — The Accuracy–Fairness Frontier
+
+The deliverable is the **frontier**: there is no single "fair model," only a curve
+of choices.  Sweeping the adversary weight $\lambda$ traces every available
+trade-off between **task accuracy** (how often the model is right) and a **fairness
+metric** (here, the group gap — the difference in how men and women are scored), and
+the shape of that curve is the decision.  Where the curve is flat, fairness is nearly
+free; where it turns down steeply, every further step toward fairness is paid for in
+accuracy.  We already swept $\lambda$ on Rung 3 — now we just *read it as a frontier*
+and mark the **elbow**: the smallest weight that buys most of the available fairness
+before the accuracy cost starts to bite.
+
+```{python}
+#| label: frontier
+acc_arr: Float[Array, "n_lam"] = np.array(acc_real)      # task accuracy at each λ
+gap_arr: Float[Array, "n_lam"] = np.array(gap_real)     # group gap at each λ  (lower = fairer)
+
+print(f"{'λ':>6}  {'accuracy':>9}  {'group gap':>10}  {'adv recovery':>13}")
+print("-" * 44)
+for lam, a, g, r in zip(λ_grid, acc_arr, gap_arr, adv_real):
+    print(f"{lam:>6g}  {a:>9.3f}  {g:>10.3f}  {r:>13.3f}")
+
+# the elbow: the frontier point farthest from the chord joining the two endpoints.
+# Rescale gap & accuracy to [0,1] so the two axes are comparable.
+g_unit: Float[Array, "n_lam"] = (gap_arr - gap_arr.min()) / (np.ptp(gap_arr) + 1e-9)
+a_unit: Float[Array, "n_lam"] = (acc_arr - acc_arr.min()) / (np.ptp(acc_arr) + 1e-9)
+points: Float[Array, "n_lam xy"] = np.column_stack([g_unit, a_unit])   # each λ as a (gap, acc) point
+
+start: Float[Array, "xy"] = points[0]
+chord: Float[Array, "xy"] = points[-1] - points[0]      # endpoint-to-endpoint direction
+chord = chord / np.linalg.norm(chord)                   # ĉ = chord / ‖chord‖   (unit vector)
+
+offsets: Float[Array, "n_lam xy"] = points - start      # each point relative to the start
+proj: Float[Array, "n_lam"] = einx.dot("point xy, xy -> point", offsets, chord)   # ⟨offset, ĉ⟩  scalar along chord
+residual: Float[Array, "n_lam xy"] = offsets - einx.multiply("point, xy -> point xy", proj, chord)   # offset − ⟨offset,ĉ⟩·ĉ
+dist: Float[Array, "n_lam"] = np.linalg.norm(residual, axis=1)   # ⊥ distance to the chord
+knee = int(np.argmax(dist))                             # farthest point = the elbow
+
+print(f"\nelbow at λ = {λ_grid[knee]:g}  "
+      f"(accuracy {acc_arr[knee]:.3f}, gap {gap_arr[knee]:.3f})")
+```
+
+```{python}
+#| label: fig-frontier
+#| fig-cap: "The accuracy–fairness frontier for the real income model, swept over the adversary weight λ. Each point is one trained model: moving left lowers the group gap (fairer) at some cost in accuracy. The curve is flat near the plain model — the first large reduction in the gap is nearly free — then bends down as further fairness starts to cost real accuracy. The circled elbow is the smallest λ that buys most of the available fairness; everything to its left is neutrality you may not need at an accuracy price you do pay."
+fig, ax = plt.subplots(figsize=(7.8, 4.6))
+ax.plot(gap_arr, acc_arr, "-o", c=COOL, lw=2.2)
+for lam, gx, ay in zip(λ_grid, gap_arr, acc_arr):
+    ax.annotate(f"λ={lam:g}", (gx, ay), textcoords="offset points",
+                xytext=(6, 6), fontsize=9, color=INK)
+ax.scatter([gap_arr[knee]], [acc_arr[knee]], s=240, facecolors="none",
+           edgecolors=CRASH, lw=2.6, zorder=5)
+ax.set_xlabel("group gap in predictions  →  less fair")
+ax.set_ylabel("task accuracy")
+ax.set_title("The accuracy–fairness frontier (adversarial removal)", fontsize=12)
 despine(ax)
 fig.tight_layout()
 plt.show()
 ```
 
----
+There it is — the deliverable, and the honest end of the climb.  The same
+adversarial game read a toy we built, a stylized proxy leak, and finally a real
+income model, escalating only the data and never the tool; at the top it hands back
+not a single number but a **frontier** the desk can choose a point on.  Read it as a
+menu: the elbow is the smallest adversary weight that drives the group gap down most
+of the way while barely moving accuracy, and points to its left buy extra neutrality
+at a real accuracy cost — the trade-off no single "fair model" can express.
 
-## 2 · Probe Capacity Matters
-
-A weak probe can be fooled while a stronger one still finds $S$.  Compare a
-linear probe with a quadratic one on the *plain* model.
-
-```{python}
-p0 = fair_fit(x, y, S, mu=0.0)
-print(f"linear probe R²    = {adversary_r2(p0, S, degree=1):.3f}")
-print(f"quadratic probe R² = {adversary_r2(p0, S, degree=2):.3f}   ← sees the curve")
-```
-
-You can see why: the plain model's predictions bend with $S$, so a straight-line
-probe slides off while a curved one locks on.
-
-```{python}
-#| label: fig-tool3-probes
-#| fig-cap: "S vs the plain model's predictions. The linear probe (straight) misses the bend that the quadratic probe (curved) recovers."
-order = np.argsort(p0)
-lin_fit = np.polyval(np.polyfit(p0, S, 1), p0)
-quad_fit = np.polyval(np.polyfit(p0, S, 2), p0)
-fig, ax = plt.subplots(figsize=(7, 4.2))
-ax.scatter(p0, S, s=10, c=COOL, alpha=0.3, edgecolors="none", label="data")
-ax.plot(p0[order], lin_fit[order], c=WARM, lw=2.4,
-        label=f"linear probe (R²={adversary_r2(p0, S, 1):.2f})")
-ax.plot(p0[order], quad_fit[order], c=CRASH, lw=2.4,
-        label=f"quadratic probe (R²={adversary_r2(p0, S, 2):.2f})")
-ax.set_xlabel("prediction ŷ"); ax.set_ylabel("sensitive S")
-ax.legend(fontsize=9, frameon=False); despine(ax)
-fig.tight_layout()
-plt.show()
-```
-
-::: {.callout-tip}
-## What to Look for
-"Fair against a weak probe" is not "fair." The adversarial method is only as
-strong as its probe — which is the same lesson as the measurement ladder: the
-*shape* you can detect bounds the shape you can remove.
-:::
-
----
-
-## 3 · Your Turn
-
-- Raise the probe degree to 3–4.  Does the plain model leak more?  Does a
-  CKA-penalized model still hold up?
-- Adversarial training is a min-max game and can oscillate.  Sketch why a fixed
-  kernel penalty (Tool 2) trades flexibility for stability.
-
-Next, take these tools to real data: [Job A — validate](lab-jobA-validate.qmd).
+One caution travels with the method.  The frontier was traced by a min–max game, and
+these games can be unstable: a stronger adversary, or a longer training schedule, can
+shift these points around, because *the measure is learned rather than fixed*.  That
+flexibility is the adversary's strength on Rung 2 — it found the $s^2$ curve a linear
+method missed — and its weakness here, since the frontier you get can wobble from run
+to run.  The fixed-kernel penalty of
+[Tool 2 · The CKA Penalty](lab-tool2-cka-penalty.qmd) gives up that flexibility in
+exchange for a stable, reproducible frontier; which to reach for is the choice this
+module leaves you holding.

@@ -9,215 +9,399 @@ import sys, pathlib
 sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
 from lectures import plotting, datasets
 from lectures.plotting import INK, COOL, WARM, CRASH, GRID, PANEL, despine
-from lectures.measures import (distance_correlation, cka_rbf,
-                               mutual_information_bits, linfoot_r)
+from lectures.measures import (measure_trio, distance_correlation,
+                               mutual_information_xy, cocrash_fraction,
+                               linfoot_r)
 plotting.set_style("notes")
 import numpy as np, matplotlib.pyplot as plt
 from scipy.stats import pearsonr, spearmanr
-from jaxtyping import Float      # shape annotations: Float[Array, "n_days"]
+import einx                      # linear algebra with the axes spelled out
+from jaxtyping import Float      # shape annotations: Float[Array, "n"]
 
 Array = np.ndarray
 ```
 
-*Learn-the-tool track · wrap-up.*
+*Wrap-up · the measure zoo.*
 
-You have climbed the whole ladder: Pearson, Spearman, distance correlation,
-HSIC/CKA on [Road 1](../02-kernels-hsic.qmd); mutual information and Linfoot R
-on [Road 2](../03-mutual-information.qmd).  This lab closes the chapter the
-way every benchmark should — **all the measures, side by side, on a zoo of
-relationships where you know the right answer.**  It is the chapter's version
-of the famous correlation-examples figure, with the full ladder attached.
+You have met every tool on the no-density road — Pearson, Spearman, distance
+correlation — plus mutual information (how much knowing one variable tells you
+about the other) and the tail co-crash fraction (how often the two crash on the
+same day).  This lab closes the chapter the way every benchmark should: **one
+routine runs all five measures over a zoo of relationship shapes where you
+already know the right answer**, so you can *see* which number catches which
+shape and which is fooled.
 
-**What you will produce:** one grid of datasets × measures that you can keep
-as a cheat sheet — *which number catches which shape, and what it reads when
-it does*.
+**What you will produce:** a finished *which-tool-when* cheat-sheet — a compact
+table mapping each dependence shape, and each real-world symptom, to the
+cheapest measure that catches it.
 
 ---
 
-## 1 · Build the Zoo
+## 🧪 Rung 1 · Toy — Known Answer
 
-Eight relationships, each chosen to break (or flatter) a specific rung:
+Start where the truth is not in doubt.  We line up four **shapes**, each a toy
+whose dependence we can read by eye, and run **five measures** on each.  The
+shapes are chosen to break a specific rung:
+
+| shape | generator | what it is | who should catch it |
+|---|---|---|---|
+| linear | `correlated_returns` | $y = \rho x + \varepsilon$ | everyone — Pearson's home turf |
+| U-shape | `nonlinear_dependence` | $y = x^2 + \varepsilon$ | non-monotone — *not* Pearson/Spearman |
+| V-shape | `convex_payoff` | $v = |u| + \varepsilon$ | non-monotone — *not* Pearson/Spearman |
+| fat-tail | `tail_dependent_pair` | shared Student-$t$ co-crash | tail measures — cocrash, MI |
 
 ```{python}
 #| label: build-zoo
-rng = np.random.default_rng(42)
-n = 600
-
-
 def make_zoo() -> dict[str, tuple[Float[Array, "n"], Float[Array, "n"]]]:
-    """Eight (x, y) pairs: from straight lines to pure independence."""
-    t = rng.normal(size=n)                   # a shared "driver" variable
-    θ = rng.uniform(0, 2 * np.pi, n)         # angle, for the ring
-    x_u = rng.uniform(-2.5, 2.5, n)          # uniform driver, for the U
-    x_s = rng.uniform(0, 1, n)               # uniform driver, for the sine
-
+    """Four (x, y) shapes whose dependence we know by hand."""
     return {
-        # the cheap tool's home turf: y = 0.8·x + ε
-        "linear": (t, 0.8 * t + 0.6 * rng.normal(size=n)),
-        # monotone but curved: y = x³ + ε — bends Pearson, not Spearman
-        "monotone curve": (t, t**3 + 1.5 * rng.normal(size=n)),
-        # the V: y = x² + ε — non-monotone, kills Pearson AND Spearman
-        "U-shape": (x_u, x_u**2 + 0.4 * rng.normal(size=n)),
-        # a ring: strong dependence, zero correlation of every linear kind
-        "ring": (np.cos(θ) + 0.15 * rng.normal(size=n),
-                 np.sin(θ) + 0.15 * rng.normal(size=n)),
-        # two full cosine periods: y = cos(4π·x) + ε — symmetric about x = ½,
-        # so the linear trend cancels EXACTLY (a sine would not: each period
-        # tilts the cloud by −1/4π)
-        "wave": (x_s, np.cos(4 * np.pi * x_s) + 0.25 * rng.normal(size=n)),
-        # an X: two crossing diagonals — symmetric, so linear measures cancel
-        "cross": (t, t * rng.choice([-1, 1], size=n) + 0.3 * rng.normal(size=n)),
-        # no trend, rising risk: y = x·ε — dependence lives in the SPREAD
-        "fan (heteroskedastic)": (t, t * rng.normal(size=n)),
-        # the control: genuinely nothing to find
-        "independent": (rng.normal(size=n), rng.normal(size=n)),
+        "linear":   datasets.correlated_returns(n=1500, rho=0.6, seed=0),
+        "U-shape":  datasets.nonlinear_dependence(n=1500, noise=0.05, seed=0),
+        "V-shape":  datasets.convex_payoff(n=1500, seed=0),
+        "fat-tail": datasets.tail_dependent_pair(n=1500, df=3, seed=0),
     }
 
 
 zoo = make_zoo()
-print("datasets:", list(zoo.keys()))
+print("shapes:", list(zoo.keys()))
 ```
 
----
-
-## 2 · One Scoring Function, Six Measures
-
-One subtlety before scoring: the histogram MI estimator is **biased upward**.
-Even pure noise lands some counts unevenly across a 20×20 grid, so independent
-data scores ~0.3 "bits" that are pure estimation artefact — and Linfoot R
-inflates that to a scary-looking 0.6.  The honest fix is the chapter's oldest
-trick: build the [independence reference](../01-correlation.qmd#the-independence-reference)
-by **shuffling**, measure the MI of the shuffled pair, and subtract.  What
-survives is information *above chance*.
+**The grid routine — five measures, one template.**  Every measure on this road
+has the shape `compare(x, y)`; the grid just calls each one on each pair and
+stacks the answers into a *measure × shape* table.  The only subtlety is cost:
+distance correlation builds an $n \times n$ matrix, so we **subsample ~500 rows**
+for it (row order is irrelevant to a cross-sectional dependence), while the cheap
+measures run on the full series.
 
 ```{python}
-#| label: score-fn
-def mi_bits_debiased(
-    x: Float[Array, "n"], y: Float[Array, "n"], n_shuffles: int = 3
-) -> float:
-    """Histogram MI, calibrated against the shuffled (independent) baseline.
+#| label: grid-routine
+SUBSAMPLE = 500                              # cap the O(n²) measures at n=500
 
-    I(X;Y) = Σᵢⱼ pᵢⱼ · log₂[ pᵢⱼ / (pᵢ.·p.ⱼ) ]     [bits]
-    debiased: subtract the average MI of (x, shuffle(y)) — same marginals,
-    link destroyed — so independent data reads ≈ 0 instead of the bin artefact.
+# the five columns of the grid — name → (function, units)
+MEASURES: dict[str, str] = {
+    "Pearson":     "[−1, 1]  linear only",
+    "Spearman":    "[−1, 1]  monotone",
+    "dCor":        "[0, 1]   any shape",
+    "info R":      "[0, 1]   any shape (MI on Linfoot scale)",
+    "cocrash":     "P(both crash) — tail",
+}
+
+
+def score_pair(x: Float[Array, "n"], y: Float[Array, "n"],
+               sub: int = SUBSAMPLE) -> dict[str, float]:
+    """Run all five measures on one (x, y) pair → one row of the grid.
+
+    Pearson r    = cov(x,y)/(σₓσᵧ)              ∈ [−1, 1]   straight lines only
+    Spearman ρ   = corr(rank x, rank y)         ∈ [−1, 1]   any monotone shape
+    dCor         = dCov/√(dVarₓ·dVarᵧ)          ∈ [0, 1]    any shape (n×n cost)
+    info R       = linfoot_r(I(X;Y))            ∈ [0, 1]    MI on the |ρ| scale
+    cocrash      = P(Y in lower-q tail | X is)  ∈ [0, 1]    joint-tail co-moves
     """
-    def mi_hist(xx, yy):
-        joint_counts = np.histogram2d(xx, yy, bins=20)[0]   # (20, 20) day counts
-        return mutual_information_bits(joint_counts)
+    idx = np.random.default_rng(0).choice(len(x), size=min(sub, len(x)),
+                                          replace=False)        # one O(n²) subsample
+    xs: Float[Array, "n_sub"] = x[idx]                         # (≤500,) for dCor
+    ys: Float[Array, "n_sub"] = y[idx]
 
-    mi_raw = mi_hist(x, y)
-    baseline = np.mean([mi_hist(x, rng.permutation(y)) for _ in range(n_shuffles)])
-    return max(0.0, mi_raw - baseline)
-
-
-def score_all(x: Float[Array, "n"], y: Float[Array, "n"]) -> dict[str, float]:
-    """The whole ladder for one pair.
-
-    Pearson r      = cov(X,Y) / (σₓ·σᵧ)               ∈ [−1, 1]   linear only
-    Spearman ρₛ    = corr(rank(x), rank(y))            ∈ [−1, 1]   monotone
-    dCor           = dCov / √(dVar·dVar)               ∈ [0, 1]    any shape
-    CKA (RBF)      = HSIC / √(HSIC·HSIC)               ∈ [0, 1]    any shape
-    MI             = histogram MI − shuffle baseline    [bits]      any shape
-    Linfoot R      = √(1 − e^(−2·I_nats))              ∈ [0, 1]    MI, rescaled
-    """
-    mi_bits = mi_bits_debiased(x, y)
-    mi_nats = mi_bits * np.log(2)                      # bits → nats (1 bit = ln 2 nats)
     return {
-        "Pearson": pearsonr(x, y)[0],
-        "Spearman": spearmanr(x, y)[0],
-        "dCor": distance_correlation(x, y),
-        "CKA": cka_rbf(x, y),
-        "MI (bits)": mi_bits,
-        "Linfoot R": linfoot_r(mi_nats),
+        "Pearson":   float(pearsonr(x, y)[0]),
+        "Spearman":  float(spearmanr(x, y)[0]),
+        "dCor":      distance_correlation(xs, ys),             # subsampled, n×n
+        "info R":    linfoot_r(mutual_information_xy(x, y, bins=20)),  # MI → [0,1], = |ρ| if Gaussian
+        "cocrash":   cocrash_fraction(x, y, q=0.10),          # lower-10% joint tail
     }
 
 
-scores = {name: score_all(x, y) for name, (x, y) in zoo.items()}
-measures = list(next(iter(scores.values())).keys())
+def run_grid(pairs: dict[str, tuple]) -> dict[str, dict[str, float]]:
+    """Apply every measure to every shape → a {shape: {measure: value}} table."""
+    return {name: score_pair(x, y) for name, (x, y) in pairs.items()}
+
+
+grid = run_grid(zoo)
+shapes = list(grid.keys())
+measures = list(MEASURES.keys())
 ```
 
----
+Now read the grid against what we *know* is there.  Walk any row: the cheap
+linear tools should fire on the linear shape and **die on the symmetric U and V**,
+while distance correlation and the info R column light up everywhere there is real
+dependence; the cocrash fraction should jump only on the fat-tailed co-crash.
 
-## 3 · The Famous Plot, With the Full Ladder
+The **info R** column is mutual information rescaled to the Linfoot scale
+$R \in [0, 1]$, which equals $|\rho|$ for a Gaussian pair — so it sits on the same
+scale as the correlation measures and can be compared with them directly, instead
+of the unbounded bits we used earlier.
+
+```{python}
+#| label: print-grid
+print(f"{'shape':<10s}" + "".join(f"{m:>11s}" for m in measures))
+print("-" * (10 + 11 * len(measures)))
+for s in shapes:
+    cells = []
+    for m in measures:
+        v = grid[s][m]
+        cells.append(f"{v:>+11.3f}" if m in ("Pearson", "Spearman")
+                     else f"{v:>11.3f}")
+    print(f"{s:<10s}" + "".join(cells))
+print("\nunits:")
+for m, u in MEASURES.items():
+    print(f"  {m:<11s} {u}")
+```
+
+The known answers hold.  On the **U-shape** and **V-shape** Pearson and Spearman
+read $\approx 0$ — both are symmetric about their axis, so a monotone tool
+cancels — yet dCor and the info R column clearly see the (near-deterministic)
+dependence: info R reads $\approx 0.97$ on the U and $\approx 0.90$ on the V, near
+the top of its $[0, 1]$ range.  On the **fat-tail** pair the cocrash fraction is
+far above the $q = 0.10$ an independent pair would give: the two names genuinely
+crash together.
+
+```{python}
+#| label: fig-zoo-grid-compute
+# Assemble the measure × shape table, then a [0,1] strength score for the heat colour.
+zoo_shapes = list(grid.keys())                              # the four toy rows so far
+
+# raw values:  Mᵢⱼ = measure j evaluated on shape i      (signed for corr cols)
+M: Float[Array, "n_shapes n_measures"] = np.array(
+    [[grid[s][m] for m in measures] for s in zoo_shapes])
+
+# colour strength:  |value| for the signed correlation columns; dCor, info R and
+# cocrash are already on [0, 1], so they need no rescaling
+strength: Float[Array, "n_shapes n_measures"] = np.abs(M.copy())
+```
 
 ```{python}
 #| label: fig-zoo-grid
-#| fig-cap: "The measure zoo. Each panel is one relationship; beneath it, every measure's verdict. Walk the rows of any column: Pearson dies at the U-shape; Spearman survives one panel longer; dCor, CKA, MI and Linfoot R light up for every real dependence and stay silent on the control."
-fig, axes = plt.subplots(2, 4, figsize=(14.5, 7.6))
-for ax, (name, (x, y)) in zip(axes.flat, zoo.items()):
-    ax.scatter(x, y, s=8, c=COOL if name != "independent" else WARM,
+#| fig-cap: "The zoo on one screen. Top row: the four relationship shapes (fat-tail subsampled for a readable cloud). Bottom: the measure × shape grid, each cell coloured by strength (|value| for the signed correlation columns; dCor, info R and cocrash are already on [0, 1]). Walk the Pearson and Spearman columns — they go dark on the symmetric U and V where dCor, info R and cocrash stay bright: same blindness, two shapes."
+fig, (axes_top, ax_grid) = plt.subplots(
+    2, 1, figsize=(11.5, 9.0), gridspec_kw=dict(height_ratios=[1.0, 1.25]))
+fig.delaxes(ax_grid)                              # rebuild the bottom as one wide axis
+top = fig.add_gridspec(2, 4, height_ratios=[1.0, 1.25])
+
+for j, s in enumerate(zoo_shapes):               # the four scatters across the top
+    ax = fig.add_subplot(top[0, j])
+    x, y = zoo[s]
+    sub = np.random.default_rng(0).choice(len(x), size=min(500, len(x)), replace=False)
+    ax.scatter(x[sub], y[sub], s=8, c=COOL if s != "fat-tail" else CRASH,
                alpha=0.45, edgecolors="none")
-    sc = scores[name]
-    lines = [f"P {sc['Pearson']:+.2f}   S {sc['Spearman']:+.2f}   dCor {sc['dCor']:.2f}",
-             f"CKA {sc['CKA']:.2f}   MI {sc['MI (bits)']:.2f}b   R {sc['Linfoot R']:.2f}"]
-    ax.set_title(name, fontsize=11, fontweight="bold")
-    ax.text(0.5, -0.16, "\n".join(lines), transform=ax.transAxes, ha="center",
-            va="top", fontsize=9, family="monospace", color=INK,
-            bbox=dict(boxstyle="round,pad=0.35", fc=PANEL, ec=GRID))
-    ax.set_xticks([]); ax.set_yticks([])
-    despine(ax)
-fig.tight_layout(h_pad=4.5)
-plt.show()
-```
+    ax.set_title(s, fontsize=11, fontweight="bold")
+    ax.set_xticks([]); ax.set_yticks([]); despine(ax)
 
-The same verdicts as a single heat-grid — the chapter on one screen:
-
-```{python}
-#| label: fig-zoo-heatmap
-#| fig-cap: "Datasets × measures. Cell color = strength on each measure's own scale (|value| for the correlation-like columns, value/max for MI). The signed measures (Pearson, Spearman) go dark only for monotone shapes; the four general measures form a bright block everywhere except the independent control row."
-M = np.zeros((len(zoo), len(measures)))
-for i, name in enumerate(zoo):
-    for j, m in enumerate(measures):
-        M[i, j] = scores[name][m]
-
-# normalize per column for color: |value| for [−1,1] scales, value/max for bits
-strength = np.abs(M.copy())
-mi_col = measures.index("MI (bits)")
-strength[:, mi_col] = strength[:, mi_col] / strength[:, mi_col].max()
-
-fig, ax = plt.subplots(figsize=(9.5, 5.6))
+ax = fig.add_subplot(top[1, :])                  # the heat-grid spanning the bottom
 ax.imshow(strength, cmap="BuPu", vmin=0, vmax=1, aspect="auto")
 for i in range(M.shape[0]):
     for j in range(M.shape[1]):
-        ax.text(j, i, f"{M[i, j]:+.2f}" if j < 2 else f"{M[i, j]:.2f}",
-                ha="center", va="center", fontsize=10,
+        txt = f"{M[i, j]:+.2f}" if j < 2 else f"{M[i, j]:.2f}"
+        ax.text(j, i, txt, ha="center", va="center", fontsize=11,
                 color="white" if strength[i, j] > 0.55 else INK)
 ax.set_xticks(range(len(measures))); ax.set_xticklabels(measures, fontsize=10)
-ax.set_yticks(range(len(zoo))); ax.set_yticklabels(list(zoo.keys()), fontsize=10)
-ax.set_title("The chapter in one grid: which measure catches which shape",
+ax.set_yticks(range(len(zoo_shapes))); ax.set_yticklabels(zoo_shapes, fontsize=10)
+ax.set_title("measure × shape — which number catches which dependence",
              fontsize=12, fontweight="bold")
-plt.tight_layout()
+fig.tight_layout(h_pad=2.0)
 plt.show()
 ```
 
-::: {.callout-tip}
-## How to Read the Grid
-
-- **Pearson** column: large only when the cloud *tilts* — linear and monotone
-  rows.  The fan, ring, cross, and U all read ≈ 0: same blindness, four shapes.
-- **Spearman**: identical story, one row more (the monotone curve is rescued).
-- **dCor / CKA / MI / Linfoot R**: nonzero on *every* dependent row and
-  essentially zero on the control.  They agree on detection but have
-  favourites — CKA dims on the ring, MI loves the U — and they differ in
-  **units**: dCor and CKA are scores, MI is bits, Linfoot R reads like a
-  correlation.
-- The **fan** row is the quiet star: no trend at all, yet every general
-  measure fires.  Risk that lives in the spread is still dependence.
-:::
+The grid is built **once** here; every rung above just feeds it new data.  The
+routine — `run_grid` over `score_pair` — never changes again.
 
 ---
 
-## 4 · Your Turn
+## 🎭 Rung 2 · Toy-Real — A Stylized Market
 
-1. **Add a dataset** to the zoo that you predict will fool *Spearman but not
-   Pearson*.  (Hint: is that even possible?  Why not — and what does that say
-   about the ladder's ordering?)
-2. **Stress the estimators**: shrink `n` from 600 to 100 and re-run.  Which
-   columns degrade first, and why?  (Watch the MI histogram especially.)
-3. **Bandwidth games**: recompute the CKA column with `sigma=0.05` and
-   `sigma=50` instead of the median heuristic.  Match what you see to the
-   [bandwidth sweep](../02-kernels-hsic.qmd#the-zoo--choosing-the-distance-and-the-kernel)
-   figure.
-4. **Real-data row**: append `("JPM/BAC real", ...)` from
-   `datasets.load_returns()` and place the real pair inside the zoo.  Which
-   synthetic row does it most resemble — and which measure tells you that?
+The four toy shapes never happen exactly in markets.  What *does* is a **joint
+crash**: two banks that drift together on calm days and plunge together on the
+bad ones.  `datasets.two_banks()` is that stylization — a shared factor plus a
+~10% set of days where both names crater.  We add it as **one new row** to the
+*same* grid and read where it lands among the toy shapes.
+
+```{python}
+#| label: rung2-twobanks
+a: Float[Array, "n_days"]                        # bank A daily returns
+b: Float[Array, "n_days"]                        # bank B daily returns
+a, b, crash = datasets.two_banks(n=1500, seed=0)  # crash: boolean co-crash mask
+print(f"{int(crash.sum())} crash days of {crash.size}  ({crash.mean():.0%})")
+
+grid["two_banks"] = score_pair(a, b)             # SAME routine, new market-shaped row
+shapes = list(grid.keys())
+
+print(f"\n{'shape':<10s}" + "".join(f"{m:>11s}" for m in measures))
+print("-" * (10 + 11 * len(measures)))
+for s in shapes:
+    cells = [f"{grid[s][m]:>+11.3f}" if m in ("Pearson", "Spearman")
+             else f"{grid[s][m]:>11.3f}" for m in measures]
+    print(f"{s:<10s}" + "".join(cells))
+```
+
+```{python}
+#| label: fig-twobanks
+#| fig-cap: "The stylized bank pair, crash days highlighted. The calm cloud is roughly elliptical, so Pearson and Spearman are both high — the dependence is monotone, the cheap tools already have it. But the red crash days in the lower-left are huge co-moving outliers, and the cocrash fraction reads far above the 0.10 an independent pair would give: a heavy joint tail the linear number alone never reveals."
+fig, ax = plt.subplots(figsize=(6.4, 5.0))
+ax.scatter(a[~crash], b[~crash], s=12, c=COOL, alpha=0.4, edgecolors="none",
+           label="calm days")
+ax.scatter(a[crash], b[crash], s=26, c=CRASH, alpha=0.9, edgecolors="none",
+           label="crash days")
+ax.set_xlabel("bank A return"); ax.set_ylabel("bank B return")
+ax.set_title("two_banks — monotone everywhere, heavy in the tail", fontsize=11.5)
+ax.legend(fontsize=9, frameon=False, loc="upper left"); despine(ax)
+fig.tight_layout(); plt.show()
+```
+
+`two_banks` lands like the **linear** row on Pearson/Spearman/dCor/info R — the
+bulk dependence is monotone, so the cheap tools all agree and read high.  What
+sets it apart is the **cocrash** column, which jumps the way it did for the
+fat-tail toy: the co-movement that matters lives in the tail, and only the tail
+measure flags it.  The grid routine did not change — only the data did.
+
+---
+
+## 📈 Rung 3 · Real — The Full Basket
+
+Now the real panel.  We **reload** the prepared returns — there is no cleaning
+here; the prices → log-returns pipeline lives in
+[the data primer](../../data/01-downloading-and-parsing.qmd) — display a corner,
+and add **real pairs** to the *same* grid: a within-sector bank pair and a
+cross-sector pair.  What we are looking for: does real daily stock data land like
+one of the toy shapes we already understand, and does any cheap measure miss
+dependence the others catch?
+
+```{python}
+#| label: rung3-load
+R = datasets.load_returns()                       # prepared 14-name daily panel
+META = datasets.load_basket_meta()
+label  = dict(zip(META["ticker"], META["label"]))
+sector = dict(zip(META["ticker"], META["sector"]))
+print(f"{len(R)} trading days × {R.shape[1]} stocks   "
+      f"({R.index.min().date()} → {R.index.max().date()})")
+R.iloc[:3, :6].round(4)
+```
+
+::: {.callout-note icon=false}
+## Where This Data Comes From
+The panel, its sectors, and the co-crash structure these pairs ride on are laid
+bare in the data primer —
+[From Raw Prices to a Clean Panel](../../data/01-downloading-and-parsing.qmd) and
+[Co-Movement & Co-Crashes](../../data/04-co-movement-and-co-crashes.qmd).  This
+lab reloads that panel and never re-derives it.
+:::
+
+We pick **two** real pairs from sectors that the metadata tells us apart — a
+bank/bank pair (same sector, expected to couple) and a bank/energy pair (cross
+sector, the diversification story) — and feed each through the unchanged grid.
+`score_pair` already subsamples ~500 rows internally for the $n \times n$ measure,
+so no extra step is needed here.
+
+```{python}
+#| label: rung3-grid
+banks  = [t for t in R.columns if sector[t] == "Banks"]
+energy = [t for t in R.columns if sector[t] == "Energy"]
+within_pair = (banks[0], banks[1])                       # same-sector bank pair
+cross_pair  = (banks[0], energy[0])                      # cross-sector bank/energy
+
+for tag, (x_t, y_t) in [("banks", within_pair), ("bank/energy", cross_pair)]:
+    x_series: Float[Array, "n_days"] = R[x_t].values          # full daily return series
+    y_series: Float[Array, "n_days"] = R[y_t].values
+    grid[f"{x_t}/{y_t}"] = score_pair(x_series, y_series)
+
+shapes = list(grid.keys())
+print(f"{within_pair[0]}/{within_pair[1]}  = "
+      f"{label[within_pair[0]]} vs {label[within_pair[1]]}  (same sector)")
+print(f"{cross_pair[0]}/{cross_pair[1]}  = "
+      f"{label[cross_pair[0]]} vs {label[cross_pair[1]]}  (cross sector)\n")
+
+print(f"{'shape':<14s}" + "".join(f"{m:>11s}" for m in measures))
+print("-" * (14 + 11 * len(measures)))
+for s in shapes:
+    cells = [f"{grid[s][m]:>+11.3f}" if m in ("Pearson", "Spearman")
+             else f"{grid[s][m]:>11.3f}" for m in measures]
+    print(f"{s:<14s}" + "".join(cells))
+```
+
+Read the two real rows against the toys above them.  The **same-sector bank
+pair** behaves like `two_banks`: high and monotone everywhere, with a cocrash
+fraction well above 0.10 — they move together on calm days and fall together on
+bad ones.  The **cross-sector pair** is weaker on every cheap measure, yet its
+cocrash is still well above what an independent pair would give.  That gap is the
+diversification illusion: two names that look loosely linked most of the time
+still tend to crash on the same days.  Crucially, **no real row resembles the U or
+V**: daily stock dependence is monotone — when one name moves up the other tends
+to move up too — so the non-monotone shapes of Rung 1 simply do not arise in this
+basket, a fact the grid makes visible at a glance.
+
+---
+
+## 💰 Rung 4 · Application — The "Which Tool When" Cheat-Sheet
+
+The deliverable is the finished cheat-sheet: for each **shape or symptom** you
+might meet, the **cheapest measure that catches it**, read straight off the grid
+you built.  The rule of thumb is *spend the least that works* — a Pearson
+correlation is one cheap line; distance correlation and mutual information (the
+info R column) cost a full $n \times n$ pass; reach for them only when the cheaper
+tools go dark on something you can see is there.
+
+```{python}
+#| label: cheat-sheet
+# pull the grid's own numbers into the cheat-sheet so it is a worked table, not prose
+def fired(shape: str, m: str) -> bool:
+    """Did measure m register dependence on this shape? (caught it, not a near-zero)"""
+    v = abs(grid[shape][m])
+    return v > 0.15 if m != "cocrash" else v > 0.20    # cocrash floor ≈ 2× the q=0.10
+
+CHEAT = [
+    # symptom you observe          shape it looks like   cheapest measure that fires
+    ("straight-line co-movement",  "linear",    "Pearson"),
+    ("curved but still monotone",  "linear",    "Spearman"),   # ranks beat raw on curves
+    ("symmetric U / smile",        "U-shape",   "dCor"),       # Pearson & Spearman die
+    ("V / option-like payoff",     "V-shape",   "dCor"),
+    ("dependence in the spread",   "U-shape",   "info R"),     # MI, on the [0,1] Linfoot scale
+    ("they crash together",        "fat-tail",  "cocrash"),    # tail-only co-moves
+]
+
+print(f"{'symptom':<28s}{'→ measure':<13s}{'reads on its shape':>20s}")
+print("-" * 61)
+for symptom, shape, m in CHEAT:
+    v = grid[shape][m]
+    reads = f"{v:+.2f}" if m in ("Pearson", "Spearman") else f"{v:.2f}"
+    caught = "✓" if fired(shape, m) else "·"
+    print(f"{symptom:<28s}{m:<13s}{reads:>16s}  {caught}")
+
+print("\nrule: spend the least that works — Pearson is one line; dCor & info R cost n×n.")
+```
+
+```{python}
+#| label: fig-cheatsheet
+#| fig-cap: "The which-tool-when cheat-sheet as a decision strip. Left to right is increasing cost: Pearson and Spearman are one cheap line each and catch straight or monotone shapes; distance correlation and info R (mutual information) cost an n×n pass and are what you reach for when the cheap tools go dark on a symmetric U or V; the cocrash fraction is the only one that reads the joint tail. Each tool's band lists the symptoms it is the cheapest catch for."
+catalogue = [                                      # (tool, cost rank, symptoms it owns)
+    ("Pearson",   0, ["straight-line\nco-movement"]),
+    ("Spearman",  1, ["curved but\nmonotone"]),
+    ("dCor",      2, ["symmetric U", "V payoff"]),
+    ("info R",    2, ["dependence\nin the spread"]),
+    ("cocrash",   3, ["they crash\ntogether"]),
+]
+cost_color = {0: COOL, 1: COOL, 2: WARM, 3: CRASH}
+
+fig, ax = plt.subplots(figsize=(11.0, 4.2))
+for i, (tool, cost, symptoms) in enumerate(catalogue):
+    ax.barh(i, 1.0, color=cost_color[cost], alpha=0.18, edgecolor=GRID)
+    ax.text(0.02, i, tool, va="center", ha="left", fontsize=12,
+            fontweight="bold", color=INK)
+    ax.text(0.98, i, "  ·  ".join(s.replace("\n", " ") for s in symptoms),
+            va="center", ha="right", fontsize=10, color=INK)
+ax.set_yticks(range(len(catalogue)))
+ax.set_yticklabels([f"cost {c}" for _, c, _ in catalogue], fontsize=9)
+ax.set_xlim(0, 1); ax.set_xticks([])
+ax.set_title("Which tool when — cheapest measure that catches each symptom",
+             fontsize=12, fontweight="bold")
+ax.invert_yaxis(); despine(ax)
+fig.tight_layout(); plt.show()
+```
+
+That is the whole no-density road on one card: **Pearson** for straight lines,
+**Spearman** the moment a curve stays monotone, **distance correlation** or
+**mutual information** when a symmetric U or V kills the cheap tools, and the
+**cocrash fraction** for the joint-tail co-movement none of the others read
+directly.  The grid proved each entry on data whose answer you knew.
+
+From here the [job track](lab-jobB-measure-book.qmd) turns this cheat-sheet into
+a full pairwise measure book on the real basket, and [Job C · Hidden
+Risk](lab-jobC-hidden-risk.qmd) takes the cocrash column rigorous with a
+*conditional* co-crash test.

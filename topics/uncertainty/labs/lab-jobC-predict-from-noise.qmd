@@ -1,118 +1,459 @@
 ---
 title: "Job C — Predict From Noise"
-subtitle: "A calibrated, time-varying interval from forecast volatility"
+subtitle: "A calibrated, regime-aware predictive band by learning σ(x)"
 ---
 
 ```{python}
 #| echo: false
+import os
+os.environ["KERAS_BACKEND"] = "jax"          # MUST precede `import keras` — JAX CPU backend
 import sys, pathlib
 sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
 from lectures import plotting, datasets
-from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box, mark_event  # noqa: F401
+from lectures.plotting import INK, COOL, WARM, CRASH, BAND, despine, annotate_box, mark_event  # noqa: F401
 plotting.set_style("notes")
 import numpy as np, pandas as pd, matplotlib.pyplot as plt
+import keras
+from keras import layers
+import einx                      # linear algebra with the axes spelled out
+from jaxtyping import Float      # shape annotations: Float[Array, "n_obs"]
+
+Array = np.ndarray
+GREEN = plotting.PALETTE["green"]
 ```
 
-*Do-the-job track · Job C of 3.*
+*Apply-the-tool track · Job C.*
 
-A daily return is ~unpredictable in its **mean** — but its **noise** is not.
-Volatility *clusters*: turbulent days follow turbulent days.  So the move is to
-**predict the noise** — forecast tomorrow's volatility from the past — and band
-with it.  Deliverable: an interval that stays honest **in a crisis**, where a
-single constant error bar fails.
+You usually cannot guess tomorrow's return — its **average** move is close to
+unpredictable.  But its **noise** is not.  Volatility (how much prices swing) tends
+to *cluster*: a turbulent day is usually followed by another turbulent day.  So the
+move is to **predict the noise** — learn a function $\sigma(x)$ that says how wide the
+band of likely outcomes should be at each input — and let the interval *breathe* with
+it, growing in stormy stretches and shrinking in calm ones.  This lab climbs the same
+one model up four rungs: a toy whose noise ramp you can read by eye, a stylized
+calm-then-turbulent market, the real volatility series, and finally a **calibrated,
+regime-aware band** — one whose width adapts to the current market regime (calm vs.
+turbulent) and whose coverage we actually check.
+
+**What you will produce:** a regime-aware predictive band on real volatility whose
+~90% interval is verified to contain ~90% of days the model never trained on
+(*out-of-sample* days) — honest in the crisis, where a single fixed-width error bar
+gets pierced.
 
 ---
 
-## 1 · Forecast the Noise (Volatility)
+## 🧪 Rung 1 · Toy — Known Answer
 
-The RiskMetrics EWMA forecast uses only the past, so it is a real one-step-ahead
-prediction: $\sigma_t^2 = \lambda\,\sigma_{t-1}^2 + (1-\lambda)\,r_{t-1}^2$.
+Start where the noise level is known by construction.  `datasets.heteroscedastic_noise()`
+draws $y = \sin(1.3x) + \sigma(x)\,\varepsilon$ with the noise **ramping** from
+quiet on the left to loud on the right — $\sigma(x)$ climbs from $\approx 0.05$ to
+$\approx 0.50$ across the range.  A single global error bar is therefore wrong
+everywhere: too wide on the calm left, too narrow on the loud right.  Here the true
+ramp is known, so we can check the predicted $\sigma(x)$ against it by eye.
 
 ```{python}
-R = datasets.load_returns()
-r = R["JPM"].to_numpy(); dates = R.index
+# y = sin(1.3x) + σ(x)·ε   (noise ramps quiet-left → loud-right)
+x_toy: Float[Array, "n"]
+y_toy: Float[Array, "n"]
+x_toy, y_toy = datasets.heteroscedastic_noise(n=300, seed=0)
 
-lam = 0.94
-v = np.empty_like(r); v[0] = np.var(r[:20])
-for t in range(1, len(r)):
-    v[t] = lam * v[t - 1] + (1 - lam) * r[t - 1] ** 2   # causal: only the past
-sigma_t = np.sqrt(v)
+σ_true: Float[Array, "n"] = 0.05 + 0.45 * (x_toy + 3.0) / 6.0    # σ(x) = 0.05 + 0.45·(x+3)/6 — the construction ramp
 
-# Train the constant bar on the calm post-GFC, pre-COVID years; test on 2020+,
-# so the COVID crisis is genuinely out of sample.
-train = (dates >= "2012-01-01") & (dates < "2020-01-01")
-te = np.where(dates >= "2020-01-01")[0]
-const = r[train].std()                     # the one-number alternative
-print(f"constant σ (calm 2012–19 train) : {const:.3f}")
-print(f"forecast σ_t (2020+ test)       : {sigma_t[te].min():.3f} (calm) .. {sigma_t[te].max():.3f} (crisis)")
+print(f"x: {x_toy.shape}    y = sin(1.3x) + σ(x)·ε   (σ ramps {σ_true.min():.2f} → {σ_true.max():.2f})")
 ```
 
-## 2 · Calibration — Where Each Band Holds
-
-Returns are ~zero-mean, so the 95% interval is $\pm 1.96\,\sigma$.  Split the
-out-of-sample days into calm and turbulent thirds and check coverage of each band.
+**The algorithm — one net, two heads.**  The fix for varying noise is to make the
+network **own up to it**: predict not just the mean $\mu(x)$ but also $\log\sigma(x)$
+(the width), and train both together under the Gaussian negative log-likelihood (the
+standard "how surprised is a bell curve by this data" loss).  Big errors are forgiven
+*only* where the net has declared $\sigma$ large.  But there is a catch: the loss also
+adds a penalty that grows with $\sigma$, so claiming large noise everywhere is costly.
+Caught between these two pressures, the net learns to widen the band only where the
+data is genuinely noisier.  This is the **only** model in the lab; every higher rung
+reuses these two functions unchanged.
 
 ```{python}
-z = 1.96
-st = sigma_t[te]
-calm = te[st <= np.quantile(st, 1 / 3)]
-turb = te[st >= np.quantile(st, 2 / 3)]
+def make_mlp(n_out: int = 2, seed: int = 0) -> keras.Model:
+    """x → Dense(64, tanh) → Dense(64, tanh) → Dense(n_out).
 
-print(f"{'days':>16}  {'constant σ':>11}  {'forecast σ_t':>13}   (target 95%)")
-for name, idx in [("all test", te), ("calm", calm), ("turbulent", turb)]:
-    cov_c = np.mean(np.abs(r[idx]) <= z * const)
-    cov_f = np.mean(np.abs(r[idx]) <= z * sigma_t[idx])
-    print(f"{name:>16}  {cov_c:>11.0%}  {cov_f:>13.0%}")
+    n_out = 2 ⇒ the two heads [μ(x), log σ(x)] the band model needs.
+    """
+    keras.utils.set_random_seed(seed)        # reproducible weight init
+    return keras.Sequential([
+        layers.Dense(64, activation="tanh"),
+        layers.Dense(64, activation="tanh"),
+        layers.Dense(n_out),
+    ])
+
+
+def gaussian_nll(y_true, y_pred):
+    """−log 𝒩(y | μ(x), σ(x)²) up to a constant:  (y−μ)²/(2σ²) + log σ.
+
+    y_pred is [μ, log σ]; the exp(−2 log σ) = 1/σ² weights each squared error,
+    and the bare +log σ term is the tax that stops σ from inflating everywhere.
+    """
+    μ, log_σ = y_pred[..., :1], y_pred[..., 1:]
+
+    # NLL = ½·exp(−2 log σ)·(y−μ)² + log σ   = (y−μ)²/(2σ²) + log σ
+    weighted_sq_err = 0.5 * keras.ops.exp(-2 * log_σ) * (y_true - μ) ** 2
+    return keras.ops.mean(weighted_sq_err + log_σ)
 ```
 
-The headline is the last row: on **turbulent days the constant band covers only
-~79%** when it promises 95% — it gets pierced exactly in the crisis — while the
-**forecast-σ band stays ~95%**.  Predicting the noise keeps the interval honest
-when it matters most.
+Train it on the toy and read the predicted noise against the known ramp:
 
 ```{python}
-#| label: fig-jobC-vol-band
-#| fig-cap: "Out-of-sample JPM returns (2020 on). The forecast +/- 1.96 sigma_t band (blue) breathes with volatility and contains the crisis days; the constant +/- 1.96 sigma band (dashed), fixed on the calm 2012-19 years, is repeatedly pierced through the 2020 COVID stress."
-te_dates = dates[te]
-rt = r[te]; sg = sigma_t[te]
-fig, ax = plt.subplots(figsize=(10, 3.8))
-ax.fill_between(te_dates, -z * sg, z * sg, color=COOL, alpha=0.35,
-                label="±1.96 σ̂$_t$  (forecast)")
-ax.axhline(z * const, color=CRASH, lw=1.6, ls="--", label="±1.96 σ  (constant)")
-ax.axhline(-z * const, color=CRASH, lw=1.6, ls="--")
-ax.plot(te_dates, rt, c=INK, lw=0.5, alpha=0.8)
-breach = np.abs(rt) > z * const
-ax.scatter(te_dates[breach], rt[breach], s=14, c=CRASH, zorder=5,
-           label="pierces constant band")
+#| label: fit-toy
+def fit_sigma_net(x: Array, y: Float[Array, "n"],
+                  epochs: int = 200, seed: int = 0) -> tuple[Array, Array]:
+    """Fit the two-head net and return (μ(x), σ(x)) on the training inputs.
+
+    Accepts a scalar input ``x`` of shape ``(n,)`` or a windowed input ``(n, W)``.
+    """
+    X: Float[Array, "n features"] = x if x.ndim == 2 else x[:, None]   # 1 feature for a scalar x
+
+    net = make_mlp(n_out=2, seed=seed)
+    net.compile(optimizer=keras.optimizers.Adam(0.01), loss=gaussian_nll)
+    net.fit(X, y[:, None], epochs=epochs, batch_size=64, verbose=0)
+
+    pred: Float[Array, "n 2"] = net.predict(X, verbose=0)
+    return pred[:, 0], np.exp(pred[:, 1])        # μ(x),  σ(x) = exp(log σ)
+
+
+def pearson_corr(a: Float[Array, "n"], b: Float[Array, "n"]) -> float:
+    """ρ(a,b) = Cov(a,b) / (σ_a·σ_b)   — Pearson correlation of two vectors."""
+    ac: Float[Array, "n"] = a - a.mean()         # centre
+    bc: Float[Array, "n"] = b - b.mean()
+    cov: float = einx.dot("n, n ->", ac, bc) / a.size      # Cov(a,b) = ⟨ac·bc⟩
+    var_a: float = einx.dot("n, n ->", ac, ac) / a.size    # Var(a)
+    var_b: float = einx.dot("n, n ->", bc, bc) / b.size    # Var(b)
+    return float(cov / np.sqrt(var_a * var_b))
+
+
+μ_toy: Float[Array, "n"]
+σ_toy: Float[Array, "n"]
+μ_toy, σ_toy = fit_sigma_net(x_toy, y_toy, epochs=200, seed=2)
+
+ρ: float = pearson_corr(σ_toy, σ_true)           # does predicted σ̂(x) track the true ramp?
+coverage_2σ: float = np.mean(np.abs(y_toy - μ_toy) <= 2 * σ_toy)   # fraction inside μ ± 2σ
+
+print(f"predicted σ(x) ranges {σ_toy.min():.2f} (calm)  ..  {σ_toy.max():.2f} (loud)")
+print(f"corr(σ̂(x), true σ(x)) = {ρ:+.3f}   ← the net recovers the ramp")
+print(f"2σ coverage on the toy = {coverage_2σ:.2f}")
+```
+
+```{python}
+#| label: fig-toy-sigma
+#| fig-cap: "The toy with its predicted band (left) and the predicted σ(x) against the known ramp (right). The band is tight where the data is quiet on the left and fans open where the noise grows on the right — exactly the shape a single constant bar can never make. The right panel confirms the net's σ̂(x) tracks the true construction ramp, not just the overall scatter."
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 3.9))
+axL.fill_between(x_toy, μ_toy - 2 * σ_toy, μ_toy + 2 * σ_toy, color=COOL, alpha=0.30,
+                 label="μ(x) ± 2σ(x)")
+axL.scatter(x_toy, y_toy, s=12, c=INK, alpha=0.55, edgecolors="none")
+axL.plot(x_toy, μ_toy, c=INK, lw=2)
+axL.set_title("the band breathes with the noise", fontsize=11.5)
+axL.set_xlabel("x")
+axL.set_ylabel("y")
+axL.legend(fontsize=9, frameon=False)
+despine(axL)
+
+axR.plot(x_toy, σ_true, c=INK, lw=2, label="true σ(x) (construction)")
+axR.plot(x_toy, σ_toy, c=CRASH, lw=2, label="predicted σ̂(x)")
+axR.set_title("σ̂(x) recovers the ramp", fontsize=11.5)
+axR.set_xlabel("x")
+axR.set_ylabel("σ")
+axR.legend(fontsize=9, frameon=False)
+despine(axR)
+
+fig.tight_layout()
+plt.show()
+```
+
+The known answer holds: the predicted $\sigma(x)$ climbs with the true ramp, and
+the band is tight on the left, wide on the right.  The model has learned **where to
+be uncertain** — the one capability a constant bar lacks, and the whole reason this
+job climbs to real volatility.
+
+---
+
+## 🎭 Rung 2 · Toy-Real — A Stylized Market
+
+$y = \sin(1.3x)$ never happens in markets, but the *shape* of the noise does: a
+**calm stretch followed by a turbulent one**.  We build a simplified ("stylized")
+version of that here — a series that sits quiet for the first half, then erupts to
+several times the volatility in the second — and feed the **same** $\sigma(x)$ model
+the only input it will ever get on real data: the recent past.  If the model works,
+the predicted band should stay tight through the calm stretch and fan open the moment
+the turbulence starts.
+
+```{python}
+#| label: stylized-regime
+rng = np.random.default_rng(0)
+n = 600
+
+regime_vol: Float[Array, "n"] = np.where(np.arange(n) < n // 2, 0.4, 1.6)   # calm half, then 4× turbulent
+ret: Float[Array, "n"] = regime_vol * rng.standard_normal(n)                # rₜ = σ_regime·ε,  zero-mean
+
+# The real-data input the model will use everywhere below: |return| over a short past
+# window. We lag returns into a 5-day window of magnitudes — the only honest predictor.
+W = 5
+mag: Float[Array, "n"] = np.abs(ret)                                           # |rₜ|
+X_win: Float[Array, "m W"] = np.stack([mag[i:i + W] for i in range(n - W)])    # (m, 5) past |r|
+y_next: Float[Array, "m"] = ret[W:]                                            # next-day return
+
+print(f"stylized regime: {n} days, vol {regime_vol.min():.1f} (calm) → {regime_vol.max():.1f} (turbulent)")
+print(f"windowed inputs X: {X_win.shape}   target y: {y_next.shape}")
+```
+
+The model is unchanged — same `make_mlp`, same `gaussian_nll`, same two heads — only
+the data is now a windowed market series.  The target is ~zero-mean, so $\mu(x)\approx0$
+and the story is entirely in $\sigma(x)$:
+
+```{python}
+#| label: fit-stylized
+μ_reg: Float[Array, "m"]
+σ_reg: Float[Array, "m"]
+μ_reg, σ_reg = fit_sigma_net(X_win, y_next, epochs=150, seed=3)
+
+calm_idx: Float[Array, "m"] = np.arange(len(σ_reg)) < (n // 2 - W)   # boolean mask of calm-regime days
+
+σ_calm: float = σ_reg[calm_idx].mean()           # mean σ̂ on calm days
+σ_turb: float = σ_reg[~calm_idx].mean()          # mean σ̂ on turbulent days
+
+print(f"predicted σ̂ — calm regime    : {σ_calm:.2f}")
+print(f"predicted σ̂ — turbulent regime: {σ_turb:.2f}   ← band widens ~{σ_turb / σ_calm:.1f}×")
+```
+
+```{python}
+#| label: fig-stylized
+#| fig-cap: "The stylized calm-then-turbulent series with the learned ±2σ̂(x) band. The same two-head net that recovered the toy ramp now reads the recent |return| window and widens its band the moment the turbulent regime begins — the band breathes with the regime, not a clock."
+days = np.arange(W, n)
+fig, ax = plt.subplots(figsize=(10, 3.6))
+ax.fill_between(days, μ_reg - 2 * σ_reg, μ_reg + 2 * σ_reg, color=COOL, alpha=0.30,
+                label="μ̂ ± 2σ̂(x)")
+ax.plot(days, y_next, c=INK, lw=0.5, alpha=0.8)
+ax.axvline(n // 2, color=CRASH, lw=1.4, ls="--", alpha=0.7)
+ax.text(n // 2 + 6, ax.get_ylim()[1] * 0.85, "turbulence starts", fontsize=9, color=CRASH)
+ax.set_xlabel("day")
+ax.set_ylabel("return")
+ax.set_title("Same model — the band widens in the turbulent regime", fontsize=12)
+ax.legend(fontsize=9, frameon=False, loc="lower left")
+despine(ax)
+
+fig.tight_layout()
+plt.show()
+```
+
+The band more than triples in width across the regime switch, on nothing but the
+recent magnitudes — the model has learned that *loud recent days mean a loud next
+day*.  That is precisely volatility clustering, the one feature that makes the noise
+predictable on real data, which is the rung we climb to now.
+
+---
+
+## 📈 Rung 3 · Real — The Full Basket
+
+Now the real series.  Here is what we are looking for: trained only on calm years,
+can the model's predicted noise $\sigma(x)$ rise and fall *with the real volatility*
+on later years it was never shown?  We **reload** the realised-volatility target
+(the actual size of price swings, measured after the fact) — there is no cleaning
+here; the prices → log-returns → rolling-vol pipeline lives in
+[Returns, Volatility & Fat Tails](../../data/02-returns-and-volatility.qmd), which
+**owns** this target — display it, and feed the *same* windowed input to the *same*
+$\sigma(x)$ model.
+
+```{python}
+#| label: reload-vol
+R = datasets.load_returns()                       # prepared 14-name daily panel
+r: Float[Array, "n_days"] = R["JPM"].to_numpy()   # the return series we band
+dates = R.index
+
+σ_realised = R["JPM"].rolling(21).std() * np.sqrt(252)   # σ_annual = σ_daily·√252  (the §2 target)
+
+print(f"{len(r)} trading days   ({dates.min().date()} → {dates.max().date()})")
+print("realised-vol target — first values (annualised):")
+print(σ_realised.dropna().head().round(3).to_string())
+```
+
+::: {.callout-note icon=false}
+## Where This Target Comes From
+The realised-volatility series, its 21-day window, and the high-volatility regimes
+it rides on are built once in
+[Returns, Volatility & Fat Tails](../../data/02-returns-and-volatility.qmd), which
+**owns** this target.  This lab reloads it with the one-liner above and never
+re-derives volatility from scratch — the only step left to the lab is the modelling
+choice on top: the past-magnitude window the band model trains on.
+:::
+
+We do **one** lab-local step — turn each return into a 5-day window of the most recent
+absolute returns, the same magnitude window as Rung 2 (the model's only honest
+predictor; window mechanics live in
+[Patching & Windowing](../../data/07-patching-and-windowing.qmd)) — then split the
+data **by date**: train on the calm years after the 2008 global financial crisis (GFC)
+and before COVID, and *test on 2020 onward*, so the COVID crisis is genuinely something
+the model never saw during training.
+
+```{python}
+#| label: real-windows
+W = 5
+mag: Float[Array, "n_days"] = np.abs(r)                                            # |rₜ|
+X_real: Float[Array, "m W"] = np.stack([mag[i:i + W] for i in range(len(r) - W)])  # (m, 5) past |r|
+y_real: Float[Array, "m"] = r[W:]                                                  # next-day return
+win_dates = dates[W:]
+
+train = (win_dates >= "2012-01-01") & (win_dates < "2020-01-01")   # calm train years
+test = win_dates >= "2020-01-01"                                    # COVID+ is out of sample
+print(f"train (2012–19, calm): {train.sum()} days   test (2020+): {test.sum()} days")
+
+# Train the same two-head net on the calm years, then predict on the held-out test
+# window — same model as Rung 1, fit on real returns, evaluated out of sample.
+net = make_mlp(n_out=2, seed=4)
+net.compile(optimizer=keras.optimizers.Adam(0.01), loss=gaussian_nll)
+net.fit(X_real[train], y_real[train][:, None], epochs=120, batch_size=64, verbose=0)
+
+pred_test: Float[Array, "n_test 2"] = net.predict(X_real[test], verbose=0)
+μ_te: Float[Array, "n_test"] = pred_test[:, 0]               # μ(x) on 2020+ days
+σ_te: Float[Array, "n_test"] = np.exp(pred_test[:, 1])       # σ(x) = exp(log σ) on 2020+ days
+
+print(f"learned σ̂ on test  : {σ_te.min():.3f} (calm) .. {σ_te.max():.3f} (crisis)")
+```
+
+```{python}
+#| label: fig-real-sigma
+#| fig-cap: "JPM's learned next-day σ̂(x) on the 2020+ test years (red), overlaid on the realised 21-day volatility (grey, daily-scaled). The net was trained only on the calm 2012–19 window of past magnitudes, yet its predicted noise tracks the realised-vol spikes out of sample — the COVID crash, the 2020 aftershocks, the 2022 selloff — because loud recent days forecast a loud next day."
+σ_realised_daily: Float[Array, "m"] = (σ_realised / np.sqrt(252)).to_numpy()[W:]   # σ_annual/√252 → daily scale
+te_dates = win_dates[test]
+
+fig, ax = plt.subplots(figsize=(10, 3.6))
+ax.plot(te_dates, σ_realised_daily[test], c=INK, lw=0.8, alpha=0.5, label="realised σ (21-day)")
+ax.plot(te_dates, σ_te, c=CRASH, lw=1.0, label="learned σ̂(x) (next-day)")
 mark_event(ax, pd.Timestamp("2020-03-16"), "COVID")
-ax.set_ylim(-0.18, 0.18); ax.set_ylabel("JPM daily return")
-ax.legend(loc="lower left", fontsize=9, frameon=False); despine(ax)
+ax.set_ylabel("daily σ")
+ax.set_xlabel("date")
+ax.set_title("Learned σ̂(x) tracks realised volatility out of sample", fontsize=12)
+ax.legend(fontsize=9, frameon=False, loc="upper right")
+despine(ax)
+
+fig.tight_layout()
+plt.show()
+```
+
+The learned $\sigma(x)$ — trained on calm years, evaluated in a crisis it never saw —
+rises and falls with the realised volatility it was never directly shown.  The model
+has carried the toy's lesson all the way to the real book: it knows *where* to widen.
+What remains is to turn that into a band we can stake a number on.
+
+---
+
+## 💰 Rung 4 · Application — A Calibrated, Regime-Aware Band
+
+The deliverable is a **calibrated, regime-aware predictive band**: $\mu(x)\pm z\,\sigma(x)$
+sized so that a band we *call* ~90% actually contains ~90% of the days the model never
+trained on (this match between the promised and the actual rate is what *calibrated*
+means) — *including the calm and the turbulent thirds checked separately*.  The key
+number is **coverage**: the fraction of days that land inside the band, which we want
+near 90%.  Two things can go wrong, and the coverage check catches both: a band that is
+honest on average but pierced in the crisis (the fixed-width-bar failure), or a
+$\sigma(x)$ that breathes correctly but is the wrong size overall.
+
+Returns hover around zero on average, so the band is just $\pm z\,\sigma(x)$, with
+$z=1.645$ being the multiplier that gives a 90% range for a bell curve.  We compare two
+bands: our learned $\sigma(x)$ band against a **fixed-width bar** — a single width set
+once from the calm training years — and we measure coverage on all test days and then
+on the calm / turbulent thirds separately:
+
+```{python}
+#| label: coverage-check
+z = 1.645                                          # z₀.₉₀ — 90% two-sided for a Gaussian
+σ_const: float = y_real[train].std()               # the one-number alternative (calm years)
+yr: Float[Array, "n_test"] = y_real[test]          # out-of-sample returns
+
+# split the test days into calm / turbulent thirds by the *learned* σ̂(x)
+calm: Float[Array, "n_test"] = σ_te <= np.quantile(σ_te, 1 / 3)    # σ̂ ≤ 33rd pct
+turb: Float[Array, "n_test"] = σ_te >= np.quantile(σ_te, 2 / 3)    # σ̂ ≥ 67th pct
+
+
+def coverage(mask: Array, half_width: Array | float) -> float:
+    """Fraction of |return| inside the band on the masked days — target 0.90.
+
+    coverage = mean( |rₜ| ≤ half_width )   over the masked days.
+    """
+    if np.isscalar(half_width):
+        inside: Float[Array, "k"] = np.abs(yr[mask]) <= half_width
+    else:
+        inside = np.abs(yr[mask]) <= half_width[mask]
+    return float(np.mean(inside))
+
+
+print(f"{'test days':>14}  {'constant σ':>11}  {'learned σ̂(x)':>13}   (target 90%)")
+for name, m in [("all", np.ones_like(yr, bool)), ("calm", calm), ("turbulent", turb)]:
+    cov_c: float = coverage(m, z * σ_const)        # constant ±z·σ band
+    cov_f: float = coverage(m, z * σ_te)           # learned ±z·σ̂(x) band
+    print(f"{name:>14}  {cov_c:>11.0%}  {cov_f:>13.0%}")
+```
+
+```{python}
+#| label: fig-jobC-band
+#| fig-cap: "The deliverable: JPM's out-of-sample returns (2020 on) inside the learned ±1.645 σ̂(x) band (blue), which breathes with volatility and contains the crisis days. The constant ±1.645 σ bar (dashed red), fixed on the calm 2012–19 years, is repeatedly pierced through the COVID stress — the red points are days that escape it. Predicting the noise keeps the 90% interval honest exactly where a constant bar fails."
+fig, ax = plt.subplots(figsize=(10, 3.8))
+ax.fill_between(te_dates, μ_te - z * σ_te, μ_te + z * σ_te, color=COOL, alpha=0.32,
+                label="±1.645 σ̂(x)  (learned)")
+ax.axhline(z * σ_const, color=CRASH, lw=1.5, ls="--", label="±1.645 σ  (constant)")
+ax.axhline(-z * σ_const, color=CRASH, lw=1.5, ls="--")
+ax.plot(te_dates, yr, c=INK, lw=0.5, alpha=0.8)
+
+breach: Float[Array, "n_test"] = np.abs(yr) > z * σ_const   # days that pierce the constant bar
+ax.scatter(te_dates[breach], yr[breach], s=14, c=CRASH, zorder=5, label="pierces constant band")
+
+mark_event(ax, pd.Timestamp("2020-03-16"), "COVID")
+ax.set_ylim(-0.18, 0.18)
+ax.set_ylabel("JPM daily return")
+ax.legend(loc="lower left", fontsize=9, frameon=False)
+despine(ax)
+
 fig.tight_layout()
 plt.show()
 ```
 
 ::: {.callout-tip}
 ## The Deliverable
-The calibration table is the report: a constant bar can look fine *on average* yet
-fail in the tail, while a volatility forecast holds across regimes.  Even the
-forecast band misses a touch more than nominal — fat tails; Gaussianize the
-standardized residuals $r_t/\sigma_t$ (the Chapter-2 callback) to recover the last
-points.
+The coverage table *is* the report.  Read the turbulent row: the **fixed-width band
+covers well under 90%** there — it gets pierced exactly in the crisis — while the
+**learned σ̂(x) band stays near 90% in every regime**.  A fixed-width bar can look fine
+on average yet fail precisely when capital is at risk; a band that predicts its own
+noise holds across calm and turbulent days alike.  That regime-aware honesty is the
+whole point of predicting the noise rather than fixing it.
 :::
 
 ---
 
-## Your Turn
+## Confirm It — The Band Holds *Because* σ̂(x) Breathes
 
-- Change `lam` (try 0.97 and 0.85).  A slower decay is smoother but lags the crisis
-  — does turbulent-day coverage drop?
-- Standardize $r_t/\sigma_t$ and histogram it: still fat-tailed?  Gaussianize and
-  re-band, then re-check the table.
-- **Learn the forecaster**: replace EWMA with the
-  [NLL net from Tool 3](lab-tool3-bands.qmd) — inputs $(|r_{t-1}|, \ldots, |r_{t-5}|)$,
-  outputs $(\mu_t, \log\sigma_t)$, trained on the pre-2020 years only.  Does a
-  learned $\sigma_t$ beat the one-line recursion on turbulent-day coverage?
-- Add **epistemic** uncertainty: retrain that net on bootstrap resamples of the
-  training years and widen the band by the committee's spread; re-check calibration.
+The claim is that the calibrated band survives the crisis *because* its width tracks
+the regime — not just because it happens to be wider on average.  To test that, we run
+a fair fight on the **turbulent test third**: we compare the learned band against a
+fixed-width bar that has been **rescaled to have the same average width**.  Now both
+bands spend the same total width — so the only thing that differs is *where* each one
+puts that width.
 
-Back to the chapter: [Uncertainty overview](../index.qmd).
+```{python}
+#| label: confirm
+avg_halfwidth: float = (z * σ_te).mean()           # ⟨z·σ̂⟩ — match total width with a flat bar
+
+cov_learned: float = coverage(turb, z * σ_te)      # learned σ̂(x): wide where it matters
+cov_matched: float = coverage(turb, avg_halfwidth)  # same average width, but flat
+
+print("turbulent-third coverage  (target 90%)")
+print(f"  learned σ̂(x) band              {cov_learned:.0%}")
+print(f"  flat bar, SAME average width   {cov_matched:.0%}   ← width in the wrong place")
+print(f"\nlearned band uplift on turbulent days: {100 * (cov_learned - cov_matched):+.0f} pts")
+```
+
+Matched for total width, the flat bar still under-covers the turbulent days while the
+learned band holds — the gain is not extra width, it is *width spent where the noise
+actually is*.  The regime-aware ladder has done its job: a band that learns $\sigma(x)$
+stays honest in the crisis, the one place a constant bar cannot.
+
+That closes the uncertainty chapter — we can now *measure* dependence, *generate* the
+joint, and *band* a prediction honestly.  The same penalty machinery that taught a net
+to confess its noise can be turned to a different demand — making a model's predictions
+*independent of a protected attribute* — which is where the
+[fairness chapter](../../fairness/index.qmd) picks up next.

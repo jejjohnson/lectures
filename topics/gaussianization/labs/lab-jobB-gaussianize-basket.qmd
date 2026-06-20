@@ -1,6 +1,6 @@
 ---
 title: "Job B — Gaussianize the Basket"
-subtitle: "Normal-scores + pairwise MI on real returns"
+subtitle: "Copula MI on real returns — the non-Gaussian dependence book"
 ---
 
 ```{python}
@@ -10,83 +10,442 @@ sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
 from lectures import plotting, datasets
 from lectures.plotting import INK, COOL, WARM, CRASH, despine, annotate_box
 from lectures.gaussianization import gaussianize_1d
-from lectures.measures import mutual_information_xy
+from lectures.measures import mutual_information_xy, linfoot_r, cocrash_fraction
 plotting.set_style("notes")
 import numpy as np, matplotlib.pyplot as plt
-import itertools
+from scipy.stats import pearsonr
+import einx                      # linear algebra with the axes spelled out
+from jaxtyping import Float      # shape annotations: Float[Array, "n_days"]
+
+Array = np.ndarray
+LN2 = np.log(2)
 ```
 
-*Do-the-job track · Job B of 3.*
+*Apply-the-tool track · Job B.*
 
-::: {.callout-note appearance="simple" icon=false}
-**See the data first** — [From Raw Prices to a Clean
-Panel](../../data/01-downloading-and-parsing.qmd) shows where this 14-stock basket
-comes from and how prices became the log-returns we load here.
-:::
+A risk manager ranks pairs of stocks by correlation and quietly assumes that
+number *is* how much they move together.  It is not: correlation sees only the
+straight line through a cloud of paired returns, and on returns the dangerous part
+— the heavy joint tail, where both names crash together — lives off that line.
+This lab builds the honest ranking.  We Gaussianize each stock's returns one at a
+time (reshape them into a standard bell curve), then read off the **mutual
+information** — a measure of how much knowing one return tells you about the other,
+counting curves and tails, not just the straight line.  Putting that back on the
+correlation scale turns "what the straight line misses" into a single number per
+pair.  We grade the tool on a toy whose answer is known by hand, watch it catch a
+fat tail that a stylized pair hides from Pearson, then run the same routine on the
+full basket without changing a line of it — only the **data** grows up under it.
 
-Take the real 14-stock basket, Gaussianize each marginal, and rank every pair by
-mutual information.  The deliverable is an **MI ranking** that catches dependence
-correlation alone would miss.
+**What you will produce:** a ranked dependence book for the 14-stock basket that
+flags the pairs carrying the most *non-Gaussian* (tail-driven) dependence — the
+kind of joint behaviour correlation simply cannot capture — and passes them on.
 
 ---
 
-## 1 · Load and Gaussianize the Marginals
+## 🧪 Rung 1 · Toy — Known Answer
+
+Start where the truth is not in doubt.  For a pair of returns drawn from a
+two-dimensional bell curve (a bivariate Gaussian) with correlation $\rho$, the
+mutual information has an exact formula:
+
+$$
+I(X;Y) \;=\; -\tfrac{1}{2}\ln\!\bigl(1-\rho^2\bigr) \quad\text{[nats]}.
+$$
+
+`datasets.correlated_returns(rho=...)` draws exactly that pair, so we can hand the
+estimator a series whose information content we already know and grade its answer.
 
 ```{python}
-R = datasets.load_returns()
-META = datasets.load_basket_meta()
-label = dict(zip(META["ticker"], META["label"]))
-tickers = list(R.columns)
+def gaussian_mi_truth(rho: float) -> float:
+    """Closed-form MI of a bivariate-Gaussian pair: I = -½·ln(1 - ρ²)  [nats]."""
+    return -0.5 * np.log(1.0 - rho**2)   # I(X;Y) = -½·ln(1 - ρ²)   [nats]
 
-G = {t: gaussianize_1d(R[t].to_numpy()) for t in tickers}   # normal scores
-print(f"{len(R)} days × {len(tickers)} stocks, marginals Gaussianized")
-print("example — JPM normal scores: mean "
-      f"{G['JPM'].mean():+.2f}, std {G['JPM'].std():.2f}")
+
+# a Gaussian pair with known ρ = 0.60 — the answer is in closed form
+x_toy: Float[Array, "n"]
+y_toy: Float[Array, "n"]
+x_toy, y_toy = datasets.correlated_returns(n=4000, rho=0.6, seed=0)
+
+print(f"x, y: {x_toy.shape}   built with ρ = 0.60")
+print(f"closed-form  I(X;Y) = -½·ln(1 - ρ²) = {gaussian_mi_truth(0.60):.3f} nats")
 ```
 
-## 2 · Rank Every Pair by Mutual Information
+**The estimator — Gaussianize each return series, then count the shared bits.**
+This is the deliverable's engine, written **once** here and reused unchanged on
+every rung above.  `gaussianize_1d` reshapes each return series into a standard
+bell curve using only the order of its values (its ranks).  This strips away
+everything about the single stock's own shape and leaves only the **copula** — the
+pure pattern of *how the two move together*, with each stock's individual quirks
+removed.  Then `mutual_information_xy` reads the shared information off a 2-D
+histogram (a grid of counts) of those reshaped scores.  A raw histogram reads a
+little too high just because of its bins, so we subtract a **shuffle floor**: the
+same estimate after we scramble the pairing so the two are independent, where the
+true shared information is zero.
 
 ```{python}
+def copula_mi(x: Float[Array, "n"], y: Float[Array, "n"], *, bins: int = 16) -> float:
+    """Gaussianized (copula) mutual information of a pair, in nats.
+
+    gaussianize_1d : xᵢ ↦ Φ⁻¹((rank xᵢ − ½)/n)   — margins → 𝒩(0,1), copula kept
+    MI             : I(g(x); g(y)) over a bins×bins histogram of the normal scores
+    """
+    gx: Float[Array, "n"] = gaussianize_1d(x)        # normal scores — copula only
+    gy: Float[Array, "n"] = gaussianize_1d(y)
+    return mutual_information_xy(gx, gy, bins=bins)   # shared information [nats]
+
+
+def copula_mi_debiased(
+    x: Float[Array, "n"], y: Float[Array, "n"], *, bins: int = 16, n_shuffle: int = 20, seed: int = 0
+) -> tuple[float, float, float]:
+    """copula_mi minus its independent-shuffle floor (the histogram's MI bias)."""
+    raw = copula_mi(x, y, bins=bins)
+
+    # floor: the same estimate when y is permuted (true MI = 0), averaged over shuffles
+    rng = np.random.default_rng(seed)
+    floor = np.mean([copula_mi(x, rng.permutation(y), bins=bins) for _ in range(n_shuffle)])
+
+    return raw, floor, max(0.0, raw - floor)   # Î_debiased = max(0, raw − floor)   [nats]
+
+
+raw, floor, mi = copula_mi_debiased(x_toy, y_toy)
+print(f"raw copula MI        {raw:.3f} nats")
+print(f"shuffle floor        {floor:.3f} nats   (independent → true MI is 0)")
+print(f"debiased MI          {mi:.3f} nats   vs known {gaussian_mi_truth(0.60):.3f}")
+```
+
+The debiased estimate lands on the exact formula.  Mutual information is measured
+in bits or nats, which is awkward to compare against a correlation.  So we rescale
+it with **Linfoot's R**, $R=\sqrt{1-e^{-2I}}$, which always falls between 0 and 1.
+For a Gaussian pair it returns exactly $|\rho|$, so on a plain straight-line pair
+the estimator's shared information, read on the correlation scale, *is* Pearson.
+Sweep $\rho$ and check the whole curve:
+
+```{python}
+rhos: Float[Array, "n_rho"] = np.array([0.2, 0.4, 0.6, 0.8, 0.9])
+
+print(f"{'ρ':>5}{'truth I':>10}{'debiased':>10}{'Linfoot R':>11}{'Pearson':>10}")
+print("-" * 46)
+for rho in rhos:
+    xr: Float[Array, "n"]
+    yr: Float[Array, "n"]
+    xr, yr = datasets.correlated_returns(n=4000, rho=rho, seed=0)
+
+    _, _, mi_hat = copula_mi_debiased(xr, yr)   # debiased copula MI for this ρ
+    print(f"{rho:>5.1f}{gaussian_mi_truth(rho):>10.3f}{mi_hat:>10.3f}"
+          f"{linfoot_r(mi_hat):>11.3f}{pearsonr(xr, yr)[0]:>10.3f}")
+```
+
+```{python}
+#| label: fig-toy-known-compute
+# Gaussianize the ρ=0.6 toy: margins → 𝒩(0,1), copula (the tilt) kept
+gx: Float[Array, "n"] = gaussianize_1d(x_toy)
+gy: Float[Array, "n"] = gaussianize_1d(y_toy)
+
+# the closed-form curve I(ρ) = -½·ln(1 - ρ²) on a fine ρ grid
+grid: Float[Array, "n_grid"] = np.linspace(0.05, 0.95, 100)
+truth_curve: Float[Array, "n_grid"] = np.array([gaussian_mi_truth(r) for r in grid])
+
+# the debiased estimate at each swept ρ — should land on that curve
+mi_hat: Float[Array, "n_rho"] = np.array(
+    [copula_mi_debiased(*datasets.correlated_returns(4000, r, 0))[2] for r in rhos]
+)
+
+# R − |ρ| on a Gaussian pair: the flat baseline the real data is read against
+gauss_gap: Float[Array, "n_rho"] = np.array([linfoot_r(m) - r for m, r in zip(mi_hat, rhos)])
+```
+
+```{python}
+#| label: fig-toy-known
+#| fig-cap: "The estimator graded against the known answer. Left: the ρ=0.6 toy pair after Gaussianizing each return series — a standard-normal cloud whose tilt is the copula (the shared pattern). Centre: across the ρ sweep, the debiased copula-MI estimate (markers) tracks the closed-form -½·ln(1-ρ²) curve (line). Right: rescaled to the correlation scale, the gap Linfoot R − |Pearson| is a small, FLAT offset (~-0.02) across all ρ — the Gaussian baseline. A real pair is non-Gaussian when it sits above this line, not merely when the gap is positive."
+fig, (ax0, ax1, ax2) = plt.subplots(1, 3, figsize=(14.0, 4.2))
+
+ax0.scatter(gx, gy, s=9, c=COOL, alpha=0.35, edgecolors="none")
+ax0.set_xlabel("Gaussianized x"); ax0.set_ylabel("Gaussianized y")
+ax0.set_title("ρ=0.6 toy — margins normal, copula kept", fontsize=10.5); despine(ax0)
+
+ax1.plot(grid, truth_curve, color=INK, lw=2, label="closed form  -½·ln(1-ρ²)")
+ax1.scatter(rhos, mi_hat, s=46, c=CRASH, zorder=5, label="debiased copula MI")
+ax1.set_xlabel("ρ"); ax1.set_ylabel("mutual information (nats)")
+ax1.set_title("estimator recovers the known MI", fontsize=10.5)
+ax1.legend(fontsize=8.5, frameon=False, loc="upper left"); despine(ax1)
+
+ax2.axhline(0, color=INK, lw=0.8)
+ax2.scatter(rhos, gauss_gap, s=46, c=WARM, zorder=5)
+ax2.plot(rhos, gauss_gap, color=WARM, lw=1.2)
+ax2.set_xlabel("ρ"); ax2.set_ylabel("Linfoot R − |Pearson|")
+ax2.set_title("the Gaussian baseline — flat, ≈ -0.02", fontsize=10.5)
+ax2.set_ylim(-0.1, 0.1); despine(ax2)
+fig.tight_layout(); plt.show()
+```
+
+The known answer holds across the sweep: debiased copula MI recovers
+$-\tfrac12\ln(1-\rho^2)$, and on the correlation scale it reproduces Pearson.  One
+honest detail to carry up the ladder (right panel): with this number of histogram
+bins the rescaled MI sits a hair **below** $|\rho|$ — a small, *flat* offset (around
+$-0.02$) that holds across the whole $\rho$ sweep.  That flat line is the
+**Gaussian baseline** for the gap we will read on real data: a pair is non-Gaussian
+not when its `R − |ρ|` is positive, but when it sits *above* this baseline.  The
+toy sits on it; the next rung pushes off it.
+
+```{python}
+GAUSS_GAP = float(np.median(gauss_gap))    # the flat Gaussian R − |ρ| offset (≈ -0.02)
+print(f"Gaussian baseline gap  R − |ρ| = {GAUSS_GAP:+.3f}   (subtract this on real data)")
+```
+
+---
+
+## 🎭 Rung 2 · Toy-Real — A Stylized Market
+
+Plain Gaussian pairs never happen in markets.  What *does* is a **heavy joint
+tail**: two names that drift together on calm days and crash together on the bad
+ones, far more often than a Gaussian would allow.  `datasets.tail_dependent_pair()`
+is that stylization — a shared Student-$t$ factor plus $t$ noise — so each stock
+has fat tails (extreme days are common) and the two crash together hard on their
+worst days.  *What we are looking for:* a number that catches this shared crashing
+even though correlation does not.  We keep the **exact** `copula_mi` estimator and
+feed it this pair next to its closest Gaussian cousin (`correlated_returns` at the
+*same* Pearson $\rho$), so the only difference between the two is the tail.
+
+```{python}
+a: Float[Array, "n"]
+b: Float[Array, "n"]
+a, b = datasets.tail_dependent_pair(n=4000, seed=0)        # fat-tailed, co-crashing
+rho_tail = pearsonr(a, b)[0]
+
+ag: Float[Array, "n"]
+bg: Float[Array, "n"]
+ag, bg = datasets.correlated_returns(n=4000, rho=rho_tail, seed=1)   # Gaussian twin, same ρ
+
+print(f"tail pair Pearson ρ = {rho_tail:+.3f}   (Gaussian twin matched to it)\n")
+# MI rescaled to Linfoot R ∈ [0,1], = |ρ| for a Gaussian, so it lines up with the others
+print(f"{'':<14}{'Pearson':>9}{'info R':>10}{'co-crash':>10}")
+print("-" * 44)
+for name, (x, y) in [("tail pair", (a, b)), ("Gaussian twin", (ag, bg))]:
+    _, _, mi = copula_mi_debiased(x, y)              # debiased copula MI   [nats]
+    rho = pearsonr(x, y)[0]
+    cc = cocrash_fraction(x, y, q=0.05)              # P(y in lower 5% | x in lower 5% tail)
+    # info R = linfoot_r(MI): the shared information put on the correlation scale
+    print(f"{name:<14}{rho:>+9.3f}{linfoot_r(mi):>10.3f}{cc:>10.0%}")
+```
+
+The two pairs carry the **same Pearson** by construction, and at this histogram
+resolution their info R (the shared information on the correlation scale) is nearly
+the same too — so the `R − |ρ|` gap *alone* will not separate them.  That is itself
+the lesson: a 16-bin histogram is at its resolution limit on a heavy tail riding a
+strong diagonal, and cannot resolve the extra corner mass on top of it.  What *does*
+separate them is the **co-crash fraction** — the share of the tail pair's worst-5%
+days on which the partner also crashes (so both fall together) runs well above the
+Gaussian twin's, the joint-lower-tail signature a Gaussian structurally cannot
+produce.  The information lens needs *room* to see a
+tail; it gets that room at the **moderate** correlations where most real pairs
+live, which is exactly where the basket's gap will light up.
+
+```{python}
+#| label: fig-styl-tail
+#| fig-cap: "The stylized market, raw and Gaussianized. Left: the fat-tailed pair (red) reaches far into the lower-left joint tail (both names crashing at once) that the Pearson-matched Gaussian twin (blue) never visits — same correlation, very different tail. Right: after Gaussianizing each return series the tail pair keeps extra mass packed into the diagonal corners (the co-crash) while the twin is a plain ellipse. That corner mass is the non-Gaussian dependence; at strong ρ the histogram MI barely resolves it, but the co-crash fraction reads it cleanly — and at the moderate ρ of real cross-sector pairs, MI reads it too."
+fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(11.5, 4.6))
+
+ax0.scatter(ag, bg, s=10, c=COOL, alpha=0.35, edgecolors="none", label="Gaussian twin")
+ax0.scatter(a, b, s=10, c=CRASH, alpha=0.40, edgecolors="none", label="tail pair")
+ax0.set_xlabel("asset 1 (standardized)"); ax0.set_ylabel("asset 2 (standardized)")
+ax0.set_title(f"same Pearson ρ ≈ {rho_tail:.2f}, different tail", fontsize=11)
+ax0.legend(fontsize=9, frameon=False, loc="upper left"); despine(ax0)
+
+ax1.scatter(gaussianize_1d(a), gaussianize_1d(b), s=10, c=CRASH, alpha=0.40,
+            edgecolors="none")
+ax1.set_xlabel("Gaussianized asset 1"); ax1.set_ylabel("Gaussianized asset 2")
+ax1.set_title("Gaussianized — mass packed into the corners", fontsize=11); despine(ax1)
+fig.tight_layout(); plt.show()
+```
+
+The estimator did not change — only the data did.  The toy taught us the estimator
+*recovers* dependence; the stylized market taught us *where* the extra signal it
+adds over correlation shows up clearly — at moderate, not extreme, coupling, which
+is exactly the range where the real book's cross-sector pairs live.  Now read it
+across that book.
+
+---
+
+## 📈 Rung 3 · Real — The Full Basket
+
+Now the real data.  We **reload** the prepared returns — there is no cleaning
+here; the prices → log-returns pipeline lives in
+[the data primer](../../data/01-downloading-and-parsing.qmd) — display a corner of
+the table, and run the *same* `copula_mi` estimator on every one of the
+$\binom{14}{2}=91$ stock pairs.  *What we are looking for:* for each pair, how much
+information they share (info R, on the correlation scale) and how far that exceeds
+what their plain correlation would predict — the **excess** that flags hidden,
+tail-driven co-movement.
+
+```{python}
+R = datasets.load_returns()                       # prepared 14-name daily panel
+META = datasets.load_basket_meta()
+label  = dict(zip(META["ticker"], META["label"]))
+sector = dict(zip(META["ticker"], META["sector"]))
+tickers = list(R.columns)
+print(f"{len(R)} trading days × {len(tickers)} stocks   "
+      f"({R.index.min().date()} → {R.index.max().date()})")
+R.iloc[:3, :6].round(4)
+```
+
+::: {.callout-note icon=false}
+## Where This Data Comes From
+The panel, its sectors, and the co-crash structure these pairs ride on are laid
+bare in the data primer —
+[From Raw Prices to a Clean Panel](../../data/01-downloading-and-parsing.qmd) and
+[Co-Movement & Co-Crashes](../../data/04-co-movement-and-co-crashes.qmd).  This
+lab reloads that panel and never re-derives it.
+:::
+
+Gaussianizing a stock only depends on the order of its own returns, so we
+Gaussianize each name **once** and reuse the scores for every pair it appears in.
+Then we run the unchanged estimator over all pairs, recording Pearson, the shared
+information as info R, and the `info R − |Pearson|` gap (above the Gaussian
+baseline) that flags non-Gaussian dependence:
+
+```{python}
+import itertools
+
+# Gaussianize each name once (xᵢ ↦ Φ⁻¹((rank xᵢ − ½)/n)); reuse the scores for every pair
+G: dict[str, Float[Array, "n_days"]] = {t: gaussianize_1d(R[t].to_numpy()) for t in tickers}
+floor = copula_mi(np.random.default_rng(0).permutation(G["JPM"]), G["BAC"])  # one shared floor
+
 rows = []
 for u, v in itertools.combinations(tickers, 2):
-    mi = mutual_information_xy(G[u], G[v], bins=16)
-    rho = np.corrcoef(R[u], R[v])[0, 1]
-    rows.append((f"{u}/{v}", rho, mi))
-rows.sort(key=lambda r: r[2], reverse=True)
+    ru: Float[Array, "n_days"] = R[u].to_numpy()
+    rv: Float[Array, "n_days"] = R[v].to_numpy()
+    rho = pearsonr(ru, rv)[0]
 
-print(f"{'pair':<10}{'Pearson':>9}{'MI (nats)':>11}")
-print("-" * 30)
-for pair, rho, mi in rows[:10]:
-    print(f"{pair:<10}{rho:>+9.2f}{mi:>11.3f}")
+    mi = max(0.0, mutual_information_xy(G[u], G[v], bins=16) - floor)   # Î = max(0, raw − floor)  [nats]
+
+    # non-Gaussian excess: how far Linfoot R clears |ρ| ABOVE the flat Gaussian baseline
+    gap = (linfoot_r(mi) - abs(rho)) - GAUSS_GAP   # excess = (R − |ρ|) − baseline
+
+    rows.append(dict(pair=f"{u}/{v}", pearson=rho, mi=mi, linfoot=linfoot_r(mi),
+                     gap=gap, same_sector=(sector[u] == sector[v])))
+rows.sort(key=lambda r: r["mi"], reverse=True)                          # rank by information
+
+print(f"{len(rows)} pairs ranked by copula MI  —  top of the book:")
+# info R = linfoot_r(MI): MI on the [0,1] correlation scale (= |ρ| for a Gaussian)
+print(f"(ranking by raw MI and by info R is identical — info R is monotone in MI)\n")
+print(f"{'pair':<11s}{'Pearson':>9s}{'info R':>9s}{'excess':>8s}  sector")
+print("-" * 43)
+for r in rows[:10]:
+    print(f"{r['pair']:<11s}{r['pearson']:>+9.3f}{r['linfoot']:>9.3f}"
+          f"{r['gap']:>+8.3f}  {'same' if r['same_sector'] else 'cross'}")
+```
+
+```{python}
+#| label: fig-jobB-mi-vs-corr-compute
+# one (|ρ|, info R, excess) triple per pair, lined up for the scatter
+# info R = linfoot_r(MI): the shared information on the correlation scale (= |ρ| for a Gaussian)
+rho_arr: Float[Array, "n_pairs"] = np.array([abs(r["pearson"]) for r in rows])
+infoR_arr: Float[Array, "n_pairs"] = np.array([r["linfoot"] for r in rows])
+gap_arr: Float[Array, "n_pairs"] = np.array([r["gap"] for r in rows])
+
+above: Float[Array, "n_pairs"] = gap_arr > np.quantile(gap_arr, 0.80)   # the 20% most non-Gaussian
+
+# the Gaussian baseline, now on the Linfoot scale: R = |ρ| (the 45° straight line)
+grid: Float[Array, "n_grid"] = np.linspace(0.0, rho_arr.max() + 0.02, 100)
+baseline: Float[Array, "n_grid"] = grid                          # R = |ρ| for a Gaussian pair
 ```
 
 ```{python}
 #| label: fig-jobB-mi-vs-corr
-#| fig-cap: "MI vs Pearson across all basket pairs. Points above the trend share more information than their correlation implies — nonlinear / tail co-movement."
-rho = np.array([r[1] for r in rows])
-mi = np.array([r[2] for r in rows])
-fig, ax = plt.subplots(figsize=(7, 4.4))
-ax.scatter(np.abs(rho), mi, s=28, c=COOL, alpha=0.7, edgecolors="none")
-ax.set_xlabel("|Pearson correlation|"); ax.set_ylabel("mutual information (nats)")
-ax.set_title("Information shared vs linear correlation", fontsize=12)
-despine(ax)
-fig.tight_layout()
-plt.show()
+#| fig-cap: "Every basket pair: shared information (MI rescaled to Linfoot R ∈ [0,1], = |ρ| for a Gaussian, so it is comparable to correlation) against |Pearson|. The grey line is the Gaussian baseline R = |ρ| — where a pair would sit if its dependence were purely linear. Points on the line are well described by correlation; points lifted ABOVE it (red) share more information than their correlation implies — non-Gaussian, tail-driven co-movement (two names that move together more than correlation alone would predict). The same-sector groups (blue) sit high on the line; the largest vertical gaps belong to weaker cross-sector pairs, the diversification illusions the deliverable ranks out."
+fig, ax = plt.subplots(figsize=(7.4, 4.8))
+ax.plot(grid, baseline, color=INK, lw=1.6, ls="-",
+        label="Gaussian baseline  R = |ρ|")
+ax.scatter(rho_arr[~above], infoR_arr[~above], s=30, c=COOL, alpha=0.7,
+           edgecolors="none", label="on the line (linear)")
+ax.scatter(rho_arr[above], infoR_arr[above], s=44, c=CRASH, alpha=0.9,
+           edgecolors="none", label="above (non-Gaussian tail)")
+ax.set_xlabel("|Pearson correlation|"); ax.set_ylabel("info R  (MI on the correlation scale)")
+ax.set_title("Information shared vs the straight line", fontsize=12)
+ax.legend(fontsize=9, frameon=False, loc="upper left"); despine(ax)
+fig.tight_layout(); plt.show()
 ```
 
-::: {.callout-tip}
-## The Deliverable
-The MI ranking, plus the names that sit *above* the MI-vs-correlation trend: those
-pairs carry dependence beyond the straight line — the candidates for a tail-risk
-or non-linear study.
-:::
+Read it two ways.  Ranked by shared information, the top of the book is the
+**same-sector groups** — the banks (JPM/BAC, BAC/C) and the energy pair (XOM/CVX).
+For these the `excess` (info R over |ρ|, above the Gaussian baseline) is near zero:
+their dependence is strong *and* essentially a straight line, so correlation
+already tells their story.  The excess is the interesting column elsewhere, and the
+surprise is that it does *not* simply follow how strong a pair is.  The largest
+values cluster on weaker, **cross-sector** pairs — banks against utilities,
+staples, and tech (BAC/KO, C/GOOG, C/MSFT) — that look like good diversifiers by
+correlation yet share *more* information than a Gaussian at the same $\rho$ ever
+could.  In plain terms: correlation says these pairs barely move together, but they
+do crash together.  (One same-sector outlier, C/GS, rides the same effect — Citi's
+tail drags even its sector peers down with it.)  Those are the pairs the deliverable
+surfaces.
 
 ---
 
-## Your Turn
+## 💰 Rung 4 · Application — The Gaussianized Measure Book
 
-- Subtract the independent-shuffle MI floor from each pair to get a debiased MI.
-- Pick the most "above-trend" pair and scatter its normal scores: can you see the
-  non-linearity the correlation missed?
+The deliverable is the finished book: every pair ranked by shared information, with
+the non-Gaussian `excess` read down the *whole* table — not just the top — to flag
+the pairs whose joint behaviour correlation understates.  *The key number is the
+excess:* a positive value means the pair shares more information than its
+correlation lets on, so it is more coupled in a crash than it looks.  Those are the
+tail-coupled names a Gaussian risk model would wave through as safe diversifiers.
 
-Next: turn the map around and *generate* — [Job C, scenarios](lab-jobC-scenarios.qmd).
+```{python}
+by_mi = rows                                          # already ranked by copula MI
+by_gap = sorted(rows, key=lambda r: r["gap"], reverse=True)[:8]   # most non-Gaussian
+
+print("THE GAUSSIANIZED MEASURE BOOK  —  14-stock basket, 91 pairs\n")
+# info R = linfoot_r(MI): MI on the [0,1] correlation scale (= |ρ| for a Gaussian),
+# so it sits directly next to Pearson; ranking by info R matches ranking by raw MI
+print("strongest couplings (rank by copula MI)  —  dependence, however shaped")
+print(f"{'pair':<11s}{'Pearson':>9s}{'info R':>9s}  sector")
+print("-" * 37)
+for r in by_mi[:6]:
+    print(f"{r['pair']:<11s}{r['pearson']:>+9.3f}{r['linfoot']:>9.3f}"
+          f"  {'same' if r['same_sector'] else 'cross'}")
+
+print(f"\nmost NON-GAUSSIAN (rank by excess over the Gaussian baseline)  →  tail watchlist")
+print(f"{'pair':<11s}{'Pearson':>9s}{'info R':>8s}{'excess':>8s}  sector")
+print("-" * 45)
+for r in by_gap:
+    print(f"{r['pair']:<11s}{r['pearson']:>+9.3f}{r['linfoot']:>8.3f}"
+          f"{r['gap']:>+8.3f}  {'same' if r['same_sector'] else 'cross'}")
+```
+
+**How to read the book.**  Each pair is seen through two numbers on one scale, and
+the discipline is to read them *together*.  Rank by shared information to find the
+genuinely strongest couplings — the same-sector groups top the list, with info R
+and Pearson in agreement, because their dependence is a straight line and strong.
+Then read the `excess` down the whole book: a positive value means the pair shares
+*more* information than a Gaussian at the same $\rho$ could — the
+**non-Gaussian, tail-driven** co-movement correlation cannot encode.  The surprise
+is that the largest values cluster on weaker **cross-sector** pairs (banks against
+utilities, staples, and tech) that look like diversifiers in correlation yet get
+dragged down together in a crash.  Those are the diversification illusions — pairs
+you would trust to spread your risk that in fact fail you exactly when it matters —
+and the watchlist this book exists to surface.
+
+```{python}
+#| label: fig-book
+#| fig-cap: "The finished measure book. Each bar is a pair's non-Gaussian excess — info R (MI on the correlation scale) over |Pearson|, above the flat Gaussian baseline — for the twelve most non-Gaussian pairs. Cross-sector pairs (red) dominate the top: the diversification illusions that couple only in the tail (move together only in a crash), where a correlation-driven risk model is blind. The strong same-sector pairs sit far down this list — their dependence already shows up in their correlation."
+flagged = sorted(rows, key=lambda r: r["gap"], reverse=True)[:12]
+top = flagged[::-1]
+fig, ax = plt.subplots(figsize=(7.8, 4.4))
+colors = [COOL if r["same_sector"] else CRASH for r in top]
+ax.barh([r["pair"] for r in top], [r["gap"] for r in top], color=colors)
+ax.set_xlabel("non-Gaussian excess  (info R − |Pearson|, above baseline)")
+ax.set_title("The Gaussianized measure book → tail watchlist", fontsize=12)
+annotate_box(ax, 0.58, 0.18, "cross-sector\n(illusory diversification)",
+             va="bottom", fontsize=9)
+despine(ax); fig.tight_layout(); plt.show()
+```
+
+That is the Gaussianized measure book: one ranked table that separates *how
+strong* a pair's dependence is (shared information, as info R) from *how much of it
+correlation misses* (the non-Gaussian `excess`), turning "what is the dependence
+structure of our book?" into a concrete tail watchlist.  The flagged cross-sector
+pairs are exactly the candidates to feed to
+[Job C · Scenarios](lab-jobC-scenarios.qmd), where the Gaussianization runs
+*backward* to generate the very co-crashes these gaps fingerprint — the joint tail
+a Gaussian simulation would never produce.

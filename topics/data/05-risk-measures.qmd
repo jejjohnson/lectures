@@ -10,16 +10,24 @@ sys.path.insert(0, str(pathlib.Path.cwd() / "src"))
 from lectures import plotting, datasets
 from lectures.plotting import INK, COOL, WARM, CRASH, BAND, despine
 plotting.set_style("notes")
-import numpy as np, pandas as pd, matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.stats import norm
+import einx                      # linear algebra with the axes spelled out
+from jaxtyping import Float      # shape annotations: Float[Array, "n_days"]
+
+Array = np.ndarray
 R = datasets.load_returns()
 meta = datasets.load_basket_meta().set_index("ticker")
 BANKS = ["JPM", "BAC", "C", "WFC", "GS"]
 ```
 
 Two questions run through the rest of the course.  *How bad is a bad day?* —
-answered by **Value at Risk**.  *How much of a name's move is just "the market"?*
-— answered by the **market factor** and **beta**.  Both are read straight off the
-basket here, so the later [VaR](../uncertainty/labs/lab-jobB-portfolio-var.qmd) and
+answered by **Value at Risk** and **Expected Shortfall**.  *How much of a name's
+move is just "the market"?* — answered by the **market factor** and **beta**.  Both
+are read straight off the basket here, so the later
+[VaR](../uncertainty/labs/lab-jobB-portfolio-var.qmd) and
 [beta-neutral](../fairness/labs/lab-jobC-beta-neutral.qmd) labs rest on data you've
 already seen.
 
@@ -27,23 +35,36 @@ already seen.
 
 ## 1 · Value at Risk: a Quantile of the Loss
 
-**Value at Risk (VaR)** at the 5% level is simply the 5th-percentile return: a loss
-you expect to *exceed* on only 1 day in 20.  It is the left-tail cutoff from the
+**Value at Risk (VaR)** turns *how bad is a bad day?* into one number.  At
+confidence level $\alpha$ it is the loss you breach only with probability $\alpha$ —
+minus the $\alpha$-quantile of the return distribution:
+
+$$
+\mathrm{VaR}_\alpha \;=\; -\,Q_\alpha(r), \qquad \mathbb{P}\!\left(r \le Q_\alpha(r)\right) = \alpha .
+$$
+
+At $\alpha = 5\%$ that is just the 5th-percentile return, flipped to a positive loss:
+a level you expect to exceed on **1 day in 20**.  It is the left-tail cutoff from the
 crashes page, now given a number.
 
 ```{python}
 #| label: fig-var
 #| fig-cap: "JPM return histogram with the 5% VaR cutoff (the calm-day peak is clipped so the tail stays legible). The shaded region to the cutoff's left is the worst 5% of days; the cutoff itself, about -3.2%, is the daily 5% VaR — the loss exceeded roughly once every 20 trading days."
-r = R["JPM"].to_numpy()
-var5 = np.quantile(r, 0.05)
+def var_historical(returns: Float[Array, "n_days"], α: float) -> float:
+    """Historical VaR — minus the α-quantile of the returns.   VaRα = −Qα(r)."""
+    return -np.quantile(returns, α)              # a positive loss number
+
+r: Float[Array, "n_days"] = R["JPM"].to_numpy()
+var_5 = var_historical(r, 0.05)                  # VaR₅ ≈ 3.2%  →  exceeded 1 day in 20
 peak_days = int(np.histogram(r, bins=70)[0].max())
+
 fig, ax = plt.subplots(figsize=(8.6, 4.2))
 ax.hist(r, bins=70, color=BAND, alpha=0.85)
-ax.axvspan(r.min(), var5, color=CRASH, alpha=0.18, label="worst 5% of days")
-ax.axvline(var5, color=CRASH, lw=2)
+ax.axvspan(r.min(), -var_5, color=CRASH, alpha=0.18, label="worst 5% of days")
+ax.axvline(-var_5, color=CRASH, lw=2)            # cutoff sits at the α-quantile, −VaR₅
 ax.set_ylim(0, 300)        # cap so the tail + cutoff read; the calm-day peak,
                            # far taller, is clipped and annotated instead
-ax.annotate(f"5% VaR = {var5:.1%}", (var5, 250),
+ax.annotate(f"5% VaR = {var_5:.1%}", (-var_5, 250),
             textcoords="offset points", xytext=(-10, 0), ha="right",
             fontsize=10, color=INK)
 ax.annotate(f"↑ calm-day peak ≈ {peak_days:,} days", (0.004, 293),
@@ -57,11 +78,172 @@ fig.tight_layout(); plt.show()
 ::: {.callout-note icon=false}
 ## VaR Is Not the Worst Case
 VaR is the *threshold* of the tail, not its depth.  Days beyond it (the shaded
-region) can be far worse — which is exactly why fat tails matter and why the
-[uncertainty](../uncertainty/index.qmd) chapter stress-tests it.
+region) can be far worse.  *How much* worse is **Expected Shortfall** (§3); whether
+the threshold itself can even be trusted is the **historical-vs-Gaussian** question
+(§2).  Both are why fat tails matter and why the
+[uncertainty](../uncertainty/index.qmd) chapter stress-tests this number.
 :::
 
-## 2 · Diversification, in One Number
+## 2 · Two Ways to Read the Tail: Historical vs Gaussian
+
+The quantile above made **no assumption** about the shape of returns — it sorted the
+days and read off the 5th percentile.  That is **historical VaR**.  The alternative
+is to *assume* a shape: model returns as $r \sim \mathcal N(\mu, \sigma^2)$ and read
+the quantile straight off the formula,
+
+$$
+\mathrm{VaR}^{\mathcal N}_\alpha \;=\; -\big(\mu + z_\alpha\,\sigma\big), \qquad z_\alpha = \Phi^{-1}(\alpha),
+$$
+
+where $\Phi^{-1}$ is the inverse standard-normal CDF ($z_{0.05} = -1.64$,
+$z_{0.01} = -2.33$).  Two numbers — a mean and a standard deviation — and you are
+done.  The catch is that returns are **not** Gaussian (the [fat-tails
+page](02-returns-and-volatility.qmd)), so the two methods disagree exactly where it
+matters.
+
+```{python}
+#| label: fig-hist-vs-gauss
+#| fig-cap: "Historical vs Gaussian VaR for JPM at the 5% and 1% levels. Historical (red) reads the empirical quantile; Gaussian (blue) plugs the sample mean and std into −(μ + zα·σ). At 5% the Gaussian is slightly the more conservative — fat tails also make the calm-day peak taller, pulling the 5th percentile inward. At 1% the fat tail dominates and the Gaussian *understates* the loss (5.4% vs 6.6%). The deeper the level, the more the bell curve lies."
+def var_gaussian(returns: Float[Array, "n_days"], α: float) -> float:
+    """Parametric VaR under r ~ 𝒩(μ, σ²).   VaRα = −(μ + zα·σ),  zα = Φ⁻¹(α)."""
+    μ, σ = returns.mean(), returns.std()
+    z_α = norm.ppf(α)                            # Φ⁻¹(α):  z₀.₀₅ = −1.64,  z₀.₀₁ = −2.33
+    return -(μ + z_α * σ)
+
+levels = [0.05, 0.01]
+hist_var = [var_historical(r, α) for α in levels]    # sort-and-read   (fat tails kept)
+gauss_var = [var_gaussian(r, α) for α in levels]     # −(μ + zα·σ)     (tails assumed thin)
+print("JPM daily VaR     historical   Gaussian")
+for α, h, g in zip(levels, hist_var, gauss_var):
+    print(f"  {int(α * 100):>2}% level     {h:7.2%}    {g:7.2%}")
+
+x_levels = np.arange(len(levels)); bar_w = 0.38
+fig, ax = plt.subplots(figsize=(7.6, 4.0))
+ax.bar(x_levels - bar_w / 2, np.array(hist_var) * 100, bar_w, color=CRASH,
+       label="historical (empirical quantile)")
+ax.bar(x_levels + bar_w / 2, np.array(gauss_var) * 100, bar_w, color=COOL,
+       label=r"Gaussian  $-(\mu + z\,\sigma)$")
+for i in range(len(levels)):
+    ax.text(x_levels[i] - bar_w / 2, hist_var[i] * 100 + 0.08, f"{hist_var[i]:.1%}",
+            ha="center", fontsize=9, color=CRASH)
+    ax.text(x_levels[i] + bar_w / 2, gauss_var[i] * 100 + 0.08, f"{gauss_var[i]:.1%}",
+            ha="center", fontsize=9, color=COOL)
+ax.set_xticks(x_levels); ax.set_xticklabels(["5% VaR", "1% VaR"])
+ax.set_ylabel("daily VaR (%)")
+ax.set_title("Fat tails: the Gaussian holds at 5%, breaks at 1%", fontsize=12)
+ax.legend(fontsize=9, frameon=False, loc="upper left"); despine(ax)
+fig.tight_layout(); plt.show()
+```
+
+The disagreement has a direction, and it flips with depth.  At 5% the Gaussian VaR is
+actually a touch *larger* — fat tails are also *peaked*, and that tall calm-day centre
+pulls the 5th percentile inward.  But go deeper, to 1%, and the tail bites: JPM's
+historical 1% VaR is **6.6%**, the Gaussian says **5.4%** — it understates the loss by
+a fifth.  And the worst single day in the sample, a **23%** drop, is more than *four
+times* the Gaussian's 1% VaR — a day the bell curve rates a once-in-the-age-of-the-
+universe event.  The deeper into the tail you look, the more the Gaussian lies, and
+that gap is the whole reason the [uncertainty](../uncertainty/index.qmd) chapter's
+Gaussian Monte-Carlo produces tails that are too thin.
+
+## 3 · Beyond the Threshold: Expected Shortfall
+
+VaR names the *edge* of the tail and says nothing about how bad the breach is.
+**Expected Shortfall** (ES, also called **CVaR**) answers that: the average loss on
+the days you *do* breach VaR,
+
+$$
+\mathrm{ES}_\alpha \;=\; \mathbb{E}\!\left[\,-r \;\mid\; -r \ge \mathrm{VaR}_\alpha\,\right]
+\;=\; -\frac{1}{\alpha}\int_0^\alpha Q_u(r)\,\mathrm{d}u .
+$$
+
+It is the centre of mass of the shaded tail, not its edge — so it always sits deeper
+than VaR.
+
+```{python}
+#| label: fig-es
+#| fig-cap: "Expected Shortfall for JPM. The shaded region is the worst 5% of days (loss beyond the 5% VaR). VaR (red) is the *edge* of that region; ES (dark dashed) is its *centre of mass* — the average loss once you are in it, here 5.5% against a 3.2% VaR. How far ES sits beyond VaR is a direct read on tail thickness."
+def expected_shortfall(returns: Float[Array, "n_days"], α: float) -> float:
+    """Average loss among the worst α of days.   ESα = E[−r | r ≤ Qα(r)]."""
+    q_α = np.quantile(returns, α)                # the α-quantile return (negative)
+    breaches: Float[Array, "n_breaches"] = returns[returns <= q_α]   # the breach days
+    return -breaches.mean()                      # positive loss, deeper than VaRα
+
+α = 0.05
+var_5 = var_historical(r, α)                     # the tail's edge
+es_5 = expected_shortfall(r, α)                  # the tail's centre of mass
+print(f"JPM  5% VaR = {var_5:.1%}    5% ES = {es_5:.1%}    (ES/VaR = {es_5 / var_5:.2f})")
+
+loss: Float[Array, "n_days"] = -r                # losses are positive, so the tail is on the right
+fig, ax = plt.subplots(figsize=(8.6, 4.0))
+ax.hist(loss, bins=70, color=BAND, alpha=0.85)
+ax.axvspan(var_5, loss.max(), color=CRASH, alpha=0.15, label="worst 5% of days")
+ax.axvline(var_5, color=CRASH, lw=2, label=f"5% VaR = {var_5:.1%}")
+ax.axvline(es_5, color=INK, lw=2, ls="--", label=f"5% ES = {es_5:.1%}")
+ax.set_ylim(0, 300)                              # clip the calm-day peak
+ax.set_xlabel("JPM daily loss  (−return)"); ax.set_ylabel("days")
+ax.set_title("ES is the average loss beyond VaR", fontsize=12)
+ax.legend(fontsize=9, frameon=False, loc="upper right"); despine(ax)
+fig.tight_layout(); plt.show()
+```
+
+For JPM the 5% VaR is 3.2% but the 5% ES is **5.5%** — when a worst-5% day arrives,
+the *typical* such day loses well over half again the threshold.  ES is also the
+better-behaved measure: it is **coherent**, and in particular **subadditive**, so
+combining two books can never raise it — diversification provably helps ES, which is
+*not* guaranteed for plain VaR.  That is why Basel market-risk rules moved from VaR to
+ES, and why the [stress-scenario](../uncertainty/labs/lab-jobA-stress-scenarios.qmd)
+lab targets the *depth* of the tail, not just its edge.
+
+## 4 · From Weights to a Portfolio Return
+
+A **portfolio** is a weight vector $w$ — how much of each name you hold — and its
+daily return is the weighted sum across the names, $r_{p,t} = \sum_a R_{t,a}\,w_a$.
+The two books this course leans on are deliberately plain: an **equal-weight book**
+puts $1/14$ in every name; a **banks-only book** puts $1/5$ in each of the five banks
+and nothing elsewhere.  Built once here, they become arrays everything downstream
+reads off.
+
+```{python}
+#| label: fig-port-build
+#| fig-cap: "The two portfolio return series, built from explicit weights. Left: the weight vectors — equal-weight spreads 1/14 across all names, banks-only concentrates 1/5 in the five banks. Right: the resulting daily return series (first ~250 days). The equal-weight book is visibly calmer; the banks book swings wider because its holdings co-move."
+R_mat: Float[Array, "n_days n_assets"] = R.to_numpy()
+n_assets = R.shape[1]
+
+w_eq: Float[Array, "n_assets"] = np.full(n_assets, 1.0 / n_assets)       # 1/14 in every name
+w_bank: Float[Array, "n_assets"] = np.array(                            # 1/5 in each bank,
+    [1.0 / len(BANKS) if t in BANKS else 0.0 for t in R.columns])       # 0 elsewhere
+
+# rₚ,ₜ = Σₐ Rₜ,ₐ · wₐ   — contract the asset axis to get one return per day
+port_eq: Float[Array, "n_days"] = einx.dot("day asset, asset -> day", R_mat, w_eq)
+port_bank: Float[Array, "n_days"] = einx.dot("day asset, asset -> day", R_mat, w_bank)
+
+fig, (axw, axr) = plt.subplots(1, 2, figsize=(9.4, 3.8),
+                               gridspec_kw={"width_ratios": [1, 1.5]})
+order = list(R.columns)
+axw.barh(order, w_eq, color=COOL, alpha=0.6, label="equal-weight")
+axw.barh(order, w_bank, color=CRASH, alpha=0.75, label="banks-only")
+axw.set_xlabel("weight"); axw.set_title("the weight vectors", fontsize=11)
+axw.invert_yaxis(); axw.legend(fontsize=8, frameon=False, loc="lower right")
+despine(axw)
+axr.plot(port_eq[:250], color=COOL, lw=1.0, label="equal-weight")
+axr.plot(port_bank[:250], color=CRASH, lw=1.0, alpha=0.8, label="banks-only")
+axr.axhline(0, color=INK, lw=0.6)
+axr.set_xlabel("trading day"); axr.set_ylabel("portfolio return")
+axr.set_title("the return series", fontsize=11)
+axr.legend(fontsize=8, frameon=False); despine(axr)
+fig.tight_layout(); plt.show()
+```
+
+::: {.callout-note icon=false}
+## A Portfolio Is Just a Weighted Sum
+`einx.dot("day asset, asset -> day", R, w)` spells out the one contraction at work:
+sum each day's returns across the **asset** axis, weighted by `w`.  Equal-weight
+averages all 14 columns; banks-only zeroes the ten non-bank weights first.  Both are
+plain `Float[Array, "n_days"]` of daily returns — exactly the object VaR, ES, and beta
+are computed from below, and exactly what the labs reload.
+:::
+
+## 5 · Diversification, in One Number
 
 Spread the bet across all 14 names (equal weight) and the VaR shrinks: independent
 wobbles partly cancel.  But spread it across the five **banks** only and you get
@@ -70,40 +252,48 @@ safer than a single bank.
 
 ```{python}
 #| label: fig-port-var
-#| fig-cap: "5% daily VaR for single names vs portfolios. The diversified 14-name portfolio cuts the tail to about -2.0%; a banks-only portfolio stays near -3.2% — no better than holding JPM alone — because the banks fall together. Diversification only helps where co-movement is low."
-mkt = R.mean(axis=1)                       # equal-weight all 14
-bankport = R[BANKS].mean(axis=1)
-items = {
-    "JPM (single)": R["JPM"], "BAC (single)": R["BAC"],
-    "Banks portfolio": bankport, "All-14 portfolio": mkt,
+#| fig-cap: "5% daily VaR for single names vs portfolios. The diversified 14-name portfolio cuts the tail to about 2.0%; a banks-only portfolio stays near 3.2% — no better than holding JPM alone — because the banks fall together. Diversification only helps where co-movement is low."
+books: dict[str, Float[Array, "n_days"]] = {
+    "JPM (single)": R["JPM"].to_numpy(),
+    "BAC (single)": R["BAC"].to_numpy(),
+    "Banks portfolio": port_bank,
+    "All-14 portfolio": port_eq,
 }
-vals = {k: np.quantile(v, 0.05) * 100 for k, v in items.items()}
+var5_by_book = {name: var_historical(book, 0.05) for name, book in books.items()}   # reuse §1's VaR
 colors = [COOL, COOL, CRASH, plotting.PALETTE["green"]]
 fig, ax = plt.subplots(figsize=(8.4, 3.8))
-ax.barh(list(vals.keys()), list(vals.values()), color=colors)
+ax.barh(list(var5_by_book), [v * 100 for v in var5_by_book.values()], color=colors)
 ax.set_xlabel("5% daily VaR (%)")
 ax.set_title("Diversification helps — unless everything co-crashes", fontsize=12)
 despine(ax); fig.tight_layout(); plt.show()
 ```
 
-## 3 · The Market Factor and Beta
+## 6 · The Market Factor and Beta
 
 Most of any stock's daily move is just the **market** moving.  Proxy the market by
-the equal-weight average return, then **beta** is the slope of a stock's return
-regressed on it: $\beta = \mathrm{cov}(r, m) / \mathrm{var}(m)$.  $\beta > 1$ means
-the name amplifies the market; $\beta < 1$ means it dampens it.
+the equal-weight book, then **beta** is the slope of a stock's return regressed on it,
+$\beta = \mathrm{cov}(r, m) / \mathrm{var}(m)$.  $\beta > 1$ means the name amplifies
+the market; $\beta < 1$ means it dampens it.
 
 ```{python}
 #| label: fig-beta-scatter
 #| fig-cap: "JPM return vs the equal-weight market factor, with the regression line. The slope is JPM's beta, about 1.42: a 1% market day moves JPM ~1.4% on average. The tight scatter shows how much of JPM is simply 'the market'."
-m = mkt.to_numpy()
-y = R["JPM"].to_numpy()
-beta = np.cov(y, m)[0, 1] / np.var(m)
-xs = np.linspace(m.min(), m.max(), 100)
+def market_beta(r: Float[Array, "n_days"], m: Float[Array, "n_days"]) -> float:
+    """Slope of r regressed on the market m.   β = Cov(r, m) / Var(m)."""
+    r_c, m_c = r - r.mean(), m - m.mean()        # centre both series
+    cov_rm = np.mean(r_c * m_c)                  # Cov(r,m) = ⟨(r−r̄)(m−m̄)⟩
+    var_m = np.mean(m_c ** 2)                    # Var(m)   = ⟨(m−m̄)²⟩
+    return cov_rm / var_m
+
+market: Float[Array, "n_days"] = port_eq         # the equal-weight book proxies the market
+y: Float[Array, "n_days"] = R["JPM"].to_numpy()
+β = market_beta(y, market)
+
+grid = np.linspace(market.min(), market.max(), 100)
+intercept = y.mean() - β * market.mean()         # line passes through (m̄, ȳ)
 fig, ax = plt.subplots(figsize=(7.2, 4.4))
-ax.scatter(m, y, s=9, c=COOL, alpha=0.35, edgecolors="none")
-ax.plot(xs, beta * xs + (y.mean() - beta * m.mean()), color=CRASH, lw=2.4,
-        label=f"beta = {beta:.2f}")
+ax.scatter(market, y, s=9, c=COOL, alpha=0.35, edgecolors="none")
+ax.plot(grid, β * grid + intercept, color=CRASH, lw=2.4, label=f"beta = {β:.2f}")
 ax.axhline(0, color=INK, lw=0.6); ax.axvline(0, color=INK, lw=0.6)
 ax.set_xlabel("market factor return (equal-weight)")
 ax.set_ylabel("JPM return")
@@ -112,13 +302,52 @@ ax.legend(fontsize=9, frameon=False); despine(ax)
 fig.tight_layout(); plt.show()
 ```
 
+That scatter is a **regression**, and writing it out makes beta one term in a bigger
+statement — the **single-factor (market) model**:
+
+$$
+r \;=\; \underbrace{\alpha}_{\text{skill}} \;+\; \underbrace{\beta\,m}_{\text{market}} \;+\; \underbrace{\varepsilon}_{\text{idiosyncratic}} .
+$$
+
+$\beta$ is the market-exposure slope; $\alpha$ is the average return left once the
+market is stripped out (near zero for a single stock); $\varepsilon$ is the
+name-specific wobble.  Because $m$ and $\varepsilon$ are uncorrelated, taking
+variances splits the risk cleanly in two:
+
+$$
+\underbrace{\mathrm{var}(r)}_{\text{total}} \;=\; \underbrace{\beta^2\,\mathrm{var}(m)}_{\text{systematic}} \;+\; \underbrace{\mathrm{var}(\varepsilon)}_{\text{idiosyncratic}}, \qquad R^2 = \frac{\beta^2\,\mathrm{var}(m)}{\mathrm{var}(r)} .
+$$
+
+$R^2$ is the fraction of a name that simply *is* the market.
+
+```{python}
+#| label: tbl-factor-model
+α_skill = y.mean() - β * market.mean()                  # α: average return net of the market
+ε: Float[Array, "n_days"] = y - (α_skill + β * market)  # residual = the idiosyncratic part
+r2 = 1 - ε.var() / y.var()                              # R² = systematic share of variance
+σ_sys = β * market.std() * np.sqrt(252)                 # √(β²·Var(m)) annualised  [systematic]
+σ_idio = ε.std() * np.sqrt(252)                         # √(Var(ε))    annualised  [idiosyncratic]
+print("JPM  =  α  +  β·market  +  ε")
+print(f"  β              = {β:.2f}")
+print(f"  α (annualised) = {α_skill * 252:+.1%}")
+print(f"  R²             = {r2:.2f}   ({r2:.0%} of JPM's variance is the market)")
+print(f"  systematic vol = {σ_sys:.0%} / yr")
+print(f"  idiosyncratic  = {σ_idio:.0%} / yr")
+print(f"  total vol      = {y.std() * np.sqrt(252):.0%} / yr")
+```
+
+For JPM, $R^2 \approx 0.74$: nearly three-quarters of its daily variance is just the
+market, leaving an idiosyncratic vol of ~19% a year inside a ~37% total.  The
+systematic part is precisely what a hedge can remove — which is what **beta-neutral**
+(below) means.
+
 Compute it for the whole basket and the sector story returns once more: banks
 amplify the market (high beta), utilities and staples cushion it (low beta).
 
 ```{python}
 #| label: fig-beta-bars
 #| fig-cap: "Market beta by name. Banks (red) lead at 1.3–1.85; defensive utilities and staples (green) sit near 0.45–0.5. Beta and volatility tell the same ranking from two angles."
-betas = (pd.Series({t: np.cov(R[t], mkt)[0, 1] / np.var(mkt) for t in R.columns})
+betas = (pd.Series({t: market_beta(R[t].to_numpy(), market) for t in R.columns})   # reuse the helper
          .sort_values())
 colors = [CRASH if meta.loc[t, "sector"] == "Banks"
           else plotting.PALETTE["green"]
@@ -136,9 +365,68 @@ fig.tight_layout(); plt.show()
 ::: {.callout-tip}
 ## The Bridge to Fairness
 "Beta-neutral" means a strategy whose returns don't load on the market factor —
-$\beta \approx 0$.  That is *identical* to "fair": a prediction that doesn't load
-on a protected attribute.  The [fairness](../fairness/index.qmd) module makes this
-exact, swapping the market factor for `sex`.
+$\beta \approx 0$, i.e. the systematic term is hedged away and only $\alpha + \varepsilon$
+remains.  That is *identical* to "fair": a prediction that doesn't load on a protected
+attribute.  The [fairness](../fairness/index.qmd) module makes this exact, swapping the
+market factor for `sex`.
+:::
+
+---
+
+## What the Labs Reload From Here
+
+The uncertainty VaR labs do not rebuild any of this.  They reload the prepared panel,
+pick weights, and form the **portfolio loss** — VaR is a quantile of that loss, ES its
+average beyond that quantile.  The cell below is the whole handoff: weights →
+portfolio return → loss = −return, displayed with its shape, head, and the 1% / 5% VaR
+cutoffs marked.  Copy it into a lab and you are exactly where the labs start.
+
+```{python}
+#| label: fig-loss-target
+#| fig-cap: "The portfolio loss target the uncertainty labs reload. Loss = −return, so the right tail is the bad days. The equal-weight book's loss histogram is shown with its 5% VaR (≈ 2.0%, exceeded 1 day in 20) and deeper 1% VaR (≈ 4.0%, 1 day in 100) marked. VaR and ES are just tail summaries of this one series."
+# --- the lab contract: reload prepared returns, choose weights, form the loss ---
+R = datasets.load_returns()                              # prepared 14-name daily panel
+R_mat: Float[Array, "n_days n_assets"] = R.to_numpy()
+w_eq: Float[Array, "n_assets"] = np.full(R.shape[1], 1.0 / R.shape[1])   # equal-weight default
+
+port: Float[Array, "n_days"] = einx.dot("day asset, asset -> day", R_mat, w_eq)   # rₚ = Σₐ Rₐ·wₐ
+loss: Float[Array, "n_days"] = -port                     # LOSS = −return  →  the VaR/ES target
+
+# VaR = a quantile of the LOSS (right tail);  ES = its mean beyond the 5% VaR
+var_5, var_1 = np.quantile(loss, [0.95, 0.99])           # 5% VaR = 95th pct, 1% VaR = 99th pct
+es_5 = loss[loss >= var_5].mean()                        # ES₅ = E[loss | loss ≥ VaR₅]
+print(f"equal-weight loss series: shape={loss.shape}, mean={loss.mean():+.4f}")
+print(f"first 3 days: {np.round(loss[:3], 4)}")
+print(f"\nequal-weight  5% VaR = {var_5:+.4f}   1% VaR = {var_1:+.4f}   5% ES = {es_5:+.4f}")
+
+fig, ax = plt.subplots(figsize=(8.6, 4.0))
+ax.hist(loss, bins=70, color=BAND, alpha=0.85)
+ax.axvspan(var_5, loss.max(), color=CRASH, alpha=0.15, label="worst 5% of days")
+ax.axvline(var_5, color=CRASH, lw=2)
+ax.axvline(var_1, color=INK, lw=2, ls="--")
+ax.set_ylim(0, 300)                                      # clip the calm-day peak
+ax.annotate(f"5% VaR = {var_5:.1%}", (var_5, 255), fontsize=9, color=CRASH,
+            ha="left", xytext=(6, 0), textcoords="offset points")
+ax.annotate(f"1% VaR = {var_1:.1%}", (var_1, 200), fontsize=9, color=INK,
+            ha="left", xytext=(6, 0), textcoords="offset points")
+ax.set_xlabel("equal-weight portfolio loss  (−return)"); ax.set_ylabel("days")
+ax.set_title("The loss target — VaR is a right-tail quantile of it", fontsize=12)
+ax.legend(fontsize=9, frameon=False, loc="upper right"); despine(ax)
+fig.tight_layout(); plt.show()
+```
+
+::: {.callout-note icon=false}
+## The Lab Contract
+The uncertainty VaR labs — [Job B · Portfolio
+VaR](../uncertainty/labs/lab-jobB-portfolio-var.qmd), [Tool 1 · the independent
+trap](../uncertainty/labs/lab-tool1-independent-fail.qmd), and [Tool 2 · Gaussian
+MC](../uncertainty/labs/lab-tool2-gaussian-mc.qmd) — **reload this portfolio loss
+target and do not re-derive it.**  They call `datasets.load_returns()`, form
+`loss = -einx.dot("day asset, asset -> day", R, w)`, and study its tail with different
+generators; the cleaning, log-returns, and weighting all live here.  The portfolio
+**weights are a documented choice** — equal-weight (`w_eq`) is the default; a lab may
+swap in a banks-heavy or custom book, but it states the weights and inherits the same
+loss-is-a-quantile contract.
 :::
 
 ---
