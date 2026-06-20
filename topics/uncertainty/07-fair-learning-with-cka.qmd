@@ -373,6 +373,16 @@ ensemble on the real data next.
 
 ## Real Example — Income Predictions That Leak Sex
 
+The toy showed the mechanism; here is the stake.  We predict whether a person earns
+**over \$50k** from US-Census features — age, education, hours, occupation — the kind
+of screening model a bank or lender might actually deploy.  The fairness requirement
+is concrete: the prediction must not depend on **sex**.  The obvious fix — drop `sex`
+from the inputs — is *not enough*, and that is exactly what makes the problem hard:
+`occupation` and `marital` status are **proxies** that let the network reconstruct
+sex and reproduce the real-world income gap through the back door.  We need the CKA
+penalty to sever that leak, and the probabilistic ensemble to quote what the
+neutrality costs.
+
 Now the real panel, with the full recipe: a **deep ensemble of probabilistic
 classifiers**, each carrying the CKA penalty.  We **reload** the prepared US-Census
 income data — the ACS decode, the `income_high` target, and the protected `sex` are

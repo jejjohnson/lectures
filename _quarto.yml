@@ -199,4 +199,5 @@ format:
     toc: true
     code-fold: true # executable cells start collapsed behind a "Code" button
     code-tools: true
+    code-line-numbers: true # line numbers on every code cell (notes + labs)
     fig-align: center
