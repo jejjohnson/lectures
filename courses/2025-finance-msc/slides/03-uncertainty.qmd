@@ -558,6 +558,55 @@ Eight shocks (red).  The Gaussian head **balloons everywhere** to cover them; th
 Student-t band stays **tight and honest** and lets the shocks be outliers.
 *Default Gaussian; reach for the t when the tails are fat.*
 
+## The Data — From Toy Curve to a Real Tape
+
+Forget the synthetic curve.  The rest of Act 2 runs on **one real series**: JPM's
+daily return $r_t = P_t / P_{t-1} - 1$.
+
+. . .
+
+**Shape:** a single vector $r \in \mathbb{R}^{T}$, about $T \approx 4{,}500$ trading
+days (2008 → today) — one number per day, and that is the *entire* dataset.
+
+. . .
+
+**The map — and why it's hard:**
+
+$$\underbrace{r_{t-1},\, r_{t-2},\, \dots}_{\text{the past}}
+\;\longmapsto\;
+\underbrace{\hat\sigma_t}_{\text{tomorrow's spread}}
+\;\Longrightarrow\;
+\text{band } \big[\,{-}2\hat\sigma_t,\ +2\hat\sigma_t\,\big]$$
+
+The target $\sigma_t$ is **never observed** — we see only the return $r_t$, one noisy
+draw from it.  We must learn a distribution's *width* from single samples.
+
+## The Real Test — How Big Is Tomorrow's Move?
+
+Try the naive risk limit first: **one fixed band**, $\pm 2\sigma$ over the whole
+history.  Watch where it breaks.
+
+```{python}
+#| echo: false
+#| fig-width: 11
+#| fig-height: 3.0
+r = R["JPM"].to_numpy(); dates = R.index
+const = r.std()                                   # one fixed ±2σ band — the naive risk limit
+fig, ax = plt.subplots(figsize=(11, 3.0))
+ax.fill_between(dates, -2 * const, 2 * const, color=CRASH, alpha=0.15,
+                label="±2σ  (one constant band)")
+ax.plot(dates, r, c=INK, lw=0.5, alpha=0.85)
+mark_event(ax, pd.Timestamp("2008-09-15"), "Lehman")
+mark_event(ax, pd.Timestamp("2020-03-16"), "COVID")
+ax.set_ylim(-0.18, 0.18); ax.set_ylabel("JPM daily return")
+ax.legend(loc="lower left", fontsize=11, frameon=False); despine(ax)
+fig.tight_layout(); plt.show()
+```
+
+Returns **cluster**: quiet years barely scratch the band, crises blow clean through
+it.  One fixed width is too loose in the calm, too tight in the crash — it breaks
+*exactly* when it matters.  **The spread itself has to be forecast.**
+
 ## Aleatoric Is Volatility
 
 Market noise — **volatility** — clusters, so it is *predictable*: forecast
@@ -586,6 +635,35 @@ fig.tight_layout(); plt.show()
 
 The band widens exactly when it must.  But did it keep its promise?  That
 question has a name —
+
+## What a "95% Band" Actually Promises
+
+A 95% band is not a vibe — it is a **frequency promise**: across *all* days, the
+truth falls outside exactly **1 in 20**.
+
+. . .
+
+The catch: a band can keep that promise *on average* and still be a lie.
+
+```{python}
+#| echo: false
+#| fig-width: 11
+#| fig-height: 2.4
+rngc = np.random.default_rng(1); n = 240
+spread = np.where(rngc.random(n) < 0.05)[0]                      # 5% misses, anywhere in time
+clustered = np.r_[40:46, 150:156]                               # 5% misses, all bunched in two storms
+fig, axes = plt.subplots(2, 1, figsize=(11, 2.4), sharex=True)
+for ax, miss, name, col in [(axes[0], spread, "calibrated — misses fall anywhere", GREEN),
+                            (axes[1], clustered, "miscalibrated — misses bunch in the storms", CRASH)]:
+    ax.vlines(miss, 0, 1, color=col, lw=1.1)
+    ax.set_yticks([]); ax.set_title(f"both cover 95%  ·  {name}", fontsize=12, loc="left")
+    despine(ax); ax.spines["left"].set_visible(False)
+axes[1].set_xlabel("day")
+fig.tight_layout(); plt.show()
+```
+
+Same 95% coverage, opposite honesty.  **Don't trust the headline — look at *when*
+the misses land.**  Bunched misses mean the band failed exactly when you needed it.
 
 ## Calibration — Keeping the 95% Promise
 

@@ -168,12 +168,22 @@ Hold that thought: it returns as **calibration** below.
 
 ## Aleatoric Is Volatility
 
-The NLL net is the general-purpose learner of noise.  In markets the noise
-has a name — **volatility** — and a famous one-line domain forecaster,
-because volatility **clusters**: turbulent days follow turbulent days (the
-same fact the [windows page](../dependence/04-windows-and-blocks.qmd) found
-as 0.75 bits of memory in $|r_t|$).  EWMA — the RiskMetrics estimator — is
-"predict the noise" distilled to a single recursion:
+Make the problem concrete before the method.  A trading desk holds a position in
+one bank — JPM — and every morning must quote a band tomorrow's return should stay
+inside: a risk limit, the same broken-promise band from the chapter's opening.  The
+data is fifteen years of daily returns, and its defining feature is that **the noise
+is not constant** — long calm stretches where moves are tiny, punctuated by crises
+where they explode.  A single fixed band is wrong in both regimes: too wide to be
+useful in the calm, too narrow to survive the storm.  So the *width itself* must be
+forecast, day by day — which is exactly aleatoric uncertainty, $\sigma(x)$, in
+market clothing.
+
+The NLL net is the general-purpose learner of that noise.  In markets it has a
+name — **volatility** — and a famous one-line domain forecaster, because
+volatility **clusters**: turbulent days follow turbulent days (the same fact the
+[windows page](../dependence/04-windows-and-blocks.qmd) found as 0.75 bits of
+memory in $|r_t|$).  EWMA — the RiskMetrics estimator — is "predict the noise"
+distilled to a single recursion:
 
 $$
 \sigma_t^2 = \lambda\,\sigma_{t-1}^2 + (1-\lambda)\,r_{t-1}^2,
